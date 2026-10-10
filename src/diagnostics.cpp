@@ -1,0 +1,812 @@
+#include "wfg/diagnostics.hpp"
+
+#include <algorithm>
+#include <array>
+#include <charconv>
+#include <cstdio>
+#include <cstdlib>
+#include <ctime>
+#include <cstring>
+#include <fstream>
+#include <limits>
+#include <system_error>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
+namespace wfg {
+namespace {
+constexpr std::size_t MaxSummaryBytes = 16 * 1024;
+constexpr std::size_t MaxEventBytes = 4096;
+
+Error DiagnosticError(std::string_view operation = "diagnostic_io", std::optional<std::uint32_t> native_code = std::nullopt) {
+  return {ErrorCode::DiagnosticFailure, Stage::runtime_observation, operation, native_code, std::nullopt};
+}
+
+std::string_view StageName(Stage stage) {
+  switch (stage) {
+    case Stage::configuration: return "configuration";
+    case Stage::package_discovery: return "package_discovery";
+    case Stage::activation: return "activation";
+    case Stage::process_identity: return "process_identity";
+    case Stage::debug_attach: return "debug_attach";
+    case Stage::dependencies: return "dependencies";
+    case Stage::build_validation: return "build_validation";
+    case Stage::pre_factory_guard: return "pre_factory_guard";
+    case Stage::import_transaction: return "import_transaction";
+    case Stage::detach: return "detach";
+    case Stage::runtime_observation: return "runtime_observation";
+  }
+  return "unknown";
+}
+
+std::string_view OperationName(std::string_view operation) {
+  if (operation.empty() || operation.size() > 64 || operation == "invalid_operation") return "redacted";
+  for (const auto ch : operation) {
+    const bool valid = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+                       (ch >= '0' && ch <= '9') || ch == '_';
+    if (!valid) return "redacted";
+  }
+  return operation;
+}
+
+std::string UtcNow() {
+  const auto now = std::chrono::system_clock::now();
+  const auto time = std::chrono::system_clock::to_time_t(now);
+  std::tm utc{};
+#ifdef _WIN32
+  gmtime_s(&utc, &time);
+#else
+  gmtime_r(&time, &utc);
+#endif
+  std::array<char, 32> text{};
+  const auto count = std::strftime(text.data(), text.size(), "%Y-%m-%dT%H:%M:%SZ", &utc);
+  return std::string(text.data(), count);
+}
+
+std::string_view CodeFor(ErrorCode code, std::string_view operation) {
+  switch (code) {
+    case ErrorCode::ConfigurationInvalid: return "WFG-E-CONFIG_INVALID";
+    case ErrorCode::MalformedImage:
+    case ErrorCode::UnsupportedBuild:
+    case ErrorCode::UnexpectedImports: return "WFG-E-BUILD_UNSUPPORTED";
+    case ErrorCode::DllConflict: return "WFG-E-DLL_CONFLICT";
+    case ErrorCode::UntrustedInterposer: return "WFG-E-INTERPOSER_UNTRUSTED";
+    case ErrorCode::AccessDenied: return "WFG-E-ATTACH_DENIED";
+    case ErrorCode::StartupTooLate: return "WFG-E-STARTUP_TOO_LATE";
+    case ErrorCode::MutationFailure:
+      if (operation == "IatVerify" || operation == "VerifyIat" || operation == "IAT_VERIFY") return "WFG-E-IAT_VERIFY";
+      if (operation == "ProtectionRestore" || operation == "RestoreProtection" || operation == "PROTECTION_RESTORE") return "WFG-E-PROTECTION_RESTORE";
+      if (operation == "RollbackAbort" || operation == "AbortAfterRollbackFailure" || operation == "ROLLBACK_ABORT") return "WFG-E-ROLLBACK_ABORT";
+      return "WFG-E-IAT_WRITE";
+    case ErrorCode::UnsupportedObservation: return "WFG-W-OBSERVATION_UNAVAILABLE";
+    case ErrorCode::DiagnosticFailure: return "WFG-E-DIAGNOSTIC_IO";
+    default: return "WFG-E-LAUNCH_FAILED";
+  }
+}
+
+std::string_view ActionFor(std::string_view code) {
+  if (code == "WFG-E-CONFIG_INVALID") return "Correct or remove FrameGenFix.toml and retry.";
+  if (code == "WFG-E-BUILD_UNSUPPORTED") return "Use a supported game build; no imports were changed.";
+  if (code == "WFG-E-DLL_CONFLICT") return "Remove conflicting local modifications and retry.";
+  if (code == "WFG-E-INTERPOSER_UNTRUSTED") return "Restore the verified signed interposer and retry.";
+  if (code == "WFG-E-ATTACH_DENIED") return "Close the game and retry from the current user session.";
+  if (code == "WFG-E-STARTUP_TOO_LATE") return "Close the game and launch this tool before the game.";
+  if (code == "WFG-E-IAT_VERIFY") return "The import update could not be verified; the transaction was rolled back.";
+  if (code == "WFG-E-PROTECTION_RESTORE") return "Memory protections could not be restored; inspect the recorded startup result.";
+  if (code == "WFG-E-ROLLBACK_ABORT") return "Startup was aborted after rollback could not be verified.";
+  if (code == "WFG-W-OBSERVATION_UNAVAILABLE") return "Some optional runtime observations were unavailable; this does not indicate rejection.";
+  if (code == "WFG-E-DIAGNOSTIC_IO") return "Diagnostics could not be saved; use the console result.";
+  if (code == "WFG-E-IAT_WRITE") return "The import update failed; the transaction was rolled back.";
+  return "Retry once; if the problem continues, collect a local support bundle.";
+}
+
+class JsonWriter {
+public:
+  explicit JsonWriter(std::size_t limit) : limit_(limit) { output_.reserve(std::min<std::size_t>(limit, 4096)); }
+  bool Raw(std::string_view value) {
+    if (value.size() > limit_ - std::min(limit_, output_.size())) return false;
+    output_.append(value);
+    return true;
+  }
+  bool String(std::string_view value) {
+    if (!Raw("\"")) return false;
+    for (const unsigned char ch : value) {
+      if (ch == '"') { if (!Raw("\\\"")) return false; }
+      else if (ch == '\\') { if (!Raw("\\\\")) return false; }
+      else if (ch == '\b') { if (!Raw("\\b")) return false; }
+      else if (ch == '\f') { if (!Raw("\\f")) return false; }
+      else if (ch == '\n') { if (!Raw("\\n")) return false; }
+      else if (ch == '\r') { if (!Raw("\\r")) return false; }
+      else if (ch == '\t') { if (!Raw("\\t")) return false; }
+      else if (ch < 0x20) {
+        constexpr char Hex[] = "0123456789abcdef";
+        const std::array<char, 6> escaped{'\\', 'u', '0', '0', Hex[(ch >> 4) & 0xf], Hex[ch & 0xf]};
+        if (!Raw(std::string_view(escaped.data(), escaped.size()))) return false;
+      } else {
+        const char byte = static_cast<char>(ch);
+        if (!Raw(std::string_view(&byte, 1))) return false;
+      }
+    }
+    return Raw("\"");
+  }
+  bool Number(std::uint64_t value) {
+    std::array<char, 32> text{};
+    const auto result = std::to_chars(text.data(), text.data() + text.size(), value);
+    return result.ec == std::errc{} && Raw(std::string_view(text.data(), static_cast<std::size_t>(result.ptr - text.data())));
+  }
+  bool Boolean(bool value) { return Raw(value ? "true" : "false"); }
+  bool Null() { return Raw("null"); }
+  [[nodiscard]] std::string Take() && { return std::move(output_); }
+private:
+  std::size_t limit_;
+  std::string output_;
+};
+
+std::string SafeObservationValue(std::string_view value) {
+  if (value.find_first_of("/\\:%@$~") != std::string_view::npos) return "redacted";
+  std::string safe;
+  safe.reserve(std::min<std::size_t>(value.size(), 96));
+  for (const unsigned char ch : value) {
+    if (safe.size() == 96) break;
+    if (ch < 0x20 || ch == 0x7f) return "redacted";
+    safe.push_back(static_cast<char>(ch));
+  }
+  return safe;
+}
+
+std::string SafeTag(std::string_view value) {
+  if (value.empty() || value.size() > 64) return "unknown";
+  for (const auto ch : value) {
+    const bool valid = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+                       (ch >= '0' && ch <= '9') || ch == '_' || ch == '-' || ch == '.';
+    if (!valid) return "redacted";
+  }
+  return std::string(value);
+}
+
+std::string_view AvailabilityName(Availability availability) {
+  switch (availability) {
+    case Availability::Observed: return "observed";
+    case Availability::NotObserved: return "not_observed";
+    case Availability::UnsupportedLayout: return "unsupported_layout";
+    case Availability::ReadFailed: return "read_failed";
+  }
+  return "unknown";
+}
+
+std::string_view LogLevelName(LogLevel level) {
+  switch (level) {
+    case LogLevel::Error: return "error";
+    case LogLevel::Info: return "info";
+    case LogLevel::Debug: return "debug";
+  }
+  return "error";
+}
+
+std::string_view OriginName(ConfigOrigin origin) {
+  switch (origin) {
+    case ConfigOrigin::Default: return "default";
+    case ConfigOrigin::File: return "file";
+    case ConfigOrigin::CommandLine: return "command_line";
+  }
+  return "unknown";
+}
+
+std::string_view OutcomeName(RunOutcome outcome) {
+  switch (outcome) {
+    case RunOutcome::NotStarted: return "not_started";
+    case RunOutcome::Applied: return "applied";
+    case RunOutcome::RoutingAlreadyPresent: return "routing_already_present";
+    case RunOutcome::Refused: return "refused";
+    case RunOutcome::RolledBack: return "rolled_back";
+    case RunOutcome::StartupAborted: return "startup_aborted";
+    case RunOutcome::Failed: return "failed";
+  }
+  return "unknown";
+}
+
+std::string_view HookName(HookState state) {
+  switch (state) {
+    case HookState::Unknown: return "unknown";
+    case HookState::Applied: return "applied";
+    case HookState::RoutingAlreadyPresent: return "routing_already_present";
+    case HookState::Refused: return "refused";
+    case HookState::RolledBack: return "rolled_back";
+    case HookState::StartupAborted: return "startup_aborted";
+  }
+  return "unknown";
+}
+
+std::string_view FgName(FrameGenerationState state, bool has_decoded_rejection) {
+  switch (state) {
+    case FrameGenerationState::Unknown: return "unknown";
+    case FrameGenerationState::ActivityNotObserved: return "activity_not_observed";
+    case FrameGenerationState::ActivityObserved: return "activity_observed";
+    case FrameGenerationState::Rejected: return has_decoded_rejection ? "rejected" : "unknown";
+  }
+  return "unknown";
+}
+
+std::string_view EventLevelName(EventLevel level) {
+  switch (level) {
+    case EventLevel::Failure: return "error";
+    case EventLevel::Information: return "info";
+    case EventLevel::DebugDetail: return "debug";
+    case EventLevel::CriticalWarning: return "critical_warning";
+  }
+  return "error";
+}
+
+std::string_view EventCodeName(EventCode code, bool decoded_rejection) {
+  switch (code) {
+    case EventCode::Failure: return "WFG-E-LAUNCH_FAILED";
+    case EventCode::Initialization: return "INITIALIZATION";
+    case EventCode::StageCompleted: return "STAGE_COMPLETED";
+    case EventCode::StateChanged: return "STATE_CHANGED";
+    case EventCode::DependencyObserved: return "DEPENDENCY_OBSERVED";
+    case EventCode::ObservationUnavailable: return "WFG-W-OBSERVATION_UNAVAILABLE";
+    case EventCode::FgActivityNotObserved: return "WFG-W-FG_ACTIVITY_NOT_OBSERVED";
+    case EventCode::FgRejected: return decoded_rejection ? "WFG-W-FG_REJECTED" : "WFG-W-FG_ACTIVITY_NOT_OBSERVED";
+    case EventCode::MutationStep: return "MUTATION_STEP";
+  }
+  return "UNKNOWN";
+}
+
+std::string_view FieldKeyName(DiagnosticFieldKey key) {
+  switch (key) {
+    case DiagnosticFieldKey::PackageVersion: return "package_version";
+    case DiagnosticFieldKey::ExecutableVersion: return "executable_version";
+    case DiagnosticFieldKey::InterposerVersion: return "interposer_version";
+    case DiagnosticFieldKey::InterposerSignature: return "interposer_signature";
+    case DiagnosticFieldKey::ImportCount: return "import_count";
+    case DiagnosticFieldKey::FactoryState: return "factory_state";
+    case DiagnosticFieldKey::AdapterName: return "adapter_name";
+    case DiagnosticFieldKey::FgActivity: return "fg_activity";
+    case DiagnosticFieldKey::DecodedRejectionCode: return "decoded_rejection_code";
+    case DiagnosticFieldKey::ElapsedMilliseconds: return "elapsed_ms";
+  }
+  return "unknown";
+}
+
+std::string_view FieldSourceName(DiagnosticFieldSource source) {
+  switch (source) {
+    case DiagnosticFieldSource::Launcher: return "launcher";
+    case DiagnosticFieldSource::PackageManifest: return "package_manifest";
+    case DiagnosticFieldSource::VersionResource: return "version_resource";
+    case DiagnosticFieldSource::Authenticode: return "authenticode";
+    case DiagnosticFieldSource::PeInspection: return "pe_inspection";
+    case DiagnosticFieldSource::FactoryGuard: return "factory_guard";
+    case DiagnosticFieldSource::DxgiObservation: return "dxgi_observation";
+    case DiagnosticFieldSource::RuntimeObservation: return "runtime_observation";
+  }
+  return "unknown";
+}
+
+template <class T, class WriteValue>
+bool WriteObserved(JsonWriter& writer, const Observed<T>& observed, WriteValue write_value) {
+  if (!writer.Raw("{\"availability\":" ) || !writer.String(AvailabilityName(observed.availability)) ||
+      !writer.Raw(",\"source\":" ) || !writer.String(SafeTag(observed.source)) ||
+      !writer.Raw(",\"reason\":" ) || !writer.String(SafeTag(observed.reason)) || !writer.Raw(",\"value\":")) return false;
+  if (observed.availability == Availability::Observed && observed.value) {
+    if (!write_value(*observed.value)) return false;
+  } else if (!writer.Null()) return false;
+  return writer.Raw("}");
+}
+
+bool WriteStringValue(JsonWriter& writer, const std::string& value) {
+  return writer.String(SafeObservationValue(value));
+}
+
+bool WriteBuild(JsonWriter& writer, const BuildIdentity& build) {
+  return writer.Raw("{\"version\":" ) && writer.String(SafeObservationValue(build.version)) &&
+         writer.Raw(",\"channel\":" ) && writer.String(SafeTag(build.channel)) &&
+         writer.Raw(",\"build_type\":" ) && writer.String(SafeTag(build.build_type)) &&
+         writer.Raw(",\"commit\":" ) && writer.String(build.commit.empty() ? std::string{} : SafeTag(build.commit)) &&
+         writer.Raw(",\"dirty\":" ) && writer.Boolean(build.dirty) &&
+         writer.Raw(",\"archive\":" ) && writer.Boolean(build.archive) &&
+         writer.Raw(",\"diagnostic_schema\":" ) && writer.Number(build.diagnostic_schema) &&
+         writer.Raw(",\"input_digest\":" ) && writer.String(SafeTag(build.input_digest)) && writer.Raw("}");
+}
+
+bool WriteFailure(JsonWriter& writer, const FailureInfo& failure, std::uint64_t elapsed_ms) {
+  bool valid_utc = failure.time_utc.size() == 20;
+  if (valid_utc) {
+    for (std::size_t index = 0; index < failure.time_utc.size(); ++index) {
+      const auto character = failure.time_utc[index];
+      if (index == 4 || index == 7) valid_utc = valid_utc && character == '-';
+      else if (index == 10) valid_utc = valid_utc && character == 'T';
+      else if (index == 13 || index == 16) valid_utc = valid_utc && character == ':';
+      else if (index == 19) valid_utc = valid_utc && character == 'Z';
+      else valid_utc = valid_utc && character >= '0' && character <= '9';
+    }
+  }
+  return writer.Raw("{\"code\":" ) && writer.String(SafeTag(failure.code)) &&
+         writer.Raw(",\"stage\":" ) && writer.String(StageName(failure.stage)) &&
+         writer.Raw(",\"operation\":" ) && writer.String(OperationName(failure.operation)) &&
+         writer.Raw(",\"time_utc\":" ) && writer.String(valid_utc ? std::string_view(failure.time_utc) : "unknown") &&
+         writer.Raw(",\"elapsed_ms\":" ) && writer.Number(failure.elapsed_ms ? failure.elapsed_ms : elapsed_ms) &&
+         writer.Raw(",\"raw_code\":" ) && (failure.raw_code ? writer.Number(*failure.raw_code) : writer.Null()) &&
+         writer.Raw(",\"vendor_code\":" ) && (failure.vendor_code ? writer.Number(*failure.vendor_code) : writer.Null()) &&
+         writer.Raw(",\"action\":" ) && writer.String(ActionFor(failure.code)) && writer.Raw("}");
+}
+
+bool IsVisible(const EffectiveConfig& config, EventLevel level) {
+  if (level == EventLevel::Failure || level == EventLevel::CriticalWarning) return true;
+  if (level == EventLevel::Information) return config.log_level != LogLevel::Error;
+  return config.log_level == LogLevel::Debug;
+}
+
+bool HasDecodedRejection(const DiagnosticEvent& event) {
+  for (const auto& field : event.fields) {
+    if (field.key == DiagnosticFieldKey::DecodedRejectionCode && std::holds_alternative<std::uint64_t>(field.value)) return true;
+  }
+  return false;
+}
+
+bool WriteEventJson(JsonWriter& writer, const DiagnosticEvent& event) {
+  if (event.fields.size() > 8) return false;
+  if (!writer.Raw("{\"level\":" ) || !writer.String(EventLevelName(event.level)) ||
+      !writer.Raw(",\"code\":" ) || !writer.String(EventCodeName(event.code, HasDecodedRejection(event))) ||
+      !writer.Raw(",\"stage\":" ) || !writer.String(StageName(event.stage)) ||
+      !writer.Raw(",\"operation\":" ) || !writer.String(OperationName(event.operation)) || !writer.Raw(",\"fields\":[")) return false;
+  for (std::size_t index = 0; index < event.fields.size(); ++index) {
+    if (index && !writer.Raw(",")) return false;
+    const auto& field = event.fields[index];
+    if (!writer.Raw("{\"key\":" ) || !writer.String(FieldKeyName(field.key)) ||
+        !writer.Raw(",\"source\":" ) || !writer.String(FieldSourceName(field.source)) || !writer.Raw(",\"value\":")) return false;
+    if (const auto* boolean = std::get_if<bool>(&field.value)) {
+      if (!writer.Boolean(*boolean)) return false;
+    } else if (const auto* integer = std::get_if<std::uint64_t>(&field.value)) {
+      if (!writer.Number(*integer)) return false;
+    } else if (!writer.String(SafeObservationValue(std::get<std::string_view>(field.value)))) return false;
+    if (!writer.Raw("}")) return false;
+  }
+  return writer.Raw("]}");
+}
+
+std::uint32_t NativeError(const std::error_code& error) {
+  if (error.value() < 0 || static_cast<std::uint64_t>(error.value()) > std::numeric_limits<std::uint32_t>::max()) return 0;
+  return static_cast<std::uint32_t>(error.value());
+}
+
+Error FileError(std::string_view operation, const std::error_code& error) {
+  return DiagnosticError(operation, error ? std::optional<std::uint32_t>(NativeError(error)) : std::nullopt);
+}
+
+Result<Unit> ValidateStoragePath(const std::filesystem::path& path, bool file) {
+  std::error_code error;
+  const auto absolute = std::filesystem::absolute(path, error).lexically_normal();
+  if (error) return FileError("storage_path", error);
+  auto current = absolute.root_path();
+  for (const auto& component : absolute.relative_path()) {
+    current /= component;
+#ifdef _WIN32
+    const auto attributes = GetFileAttributesW(current.c_str());
+    if (attributes == INVALID_FILE_ATTRIBUTES) {
+      const auto native = GetLastError();
+      if (native == ERROR_FILE_NOT_FOUND || native == ERROR_PATH_NOT_FOUND) continue;
+      return DiagnosticError("storage_attributes", native);
+    }
+    if (attributes & FILE_ATTRIBUTE_REPARSE_POINT) return DiagnosticError("storage_reparse_refused");
+#endif
+    const auto status = std::filesystem::symlink_status(current, error);
+    if (error == std::errc::no_such_file_or_directory) { error.clear(); continue; }
+    if (error) return FileError("storage_status", error);
+    if (!std::filesystem::exists(status)) continue;
+    if (std::filesystem::is_symlink(status)) return DiagnosticError("storage_symlink_refused");
+    if (current != absolute || !file) {
+      if (!std::filesystem::is_directory(status)) return DiagnosticError("storage_directory_refused");
+    } else {
+      if (!std::filesystem::is_regular_file(status)) return DiagnosticError("storage_file_refused");
+      const auto links = std::filesystem::hard_link_count(current, error);
+      if (error) return FileError("storage_links", error);
+      if (links != 1) return DiagnosticError("storage_links_refused");
+    }
+  }
+  return Unit{};
+}
+
+class TemporarySummary {
+public:
+  explicit TemporarySummary(std::filesystem::path path) : path_(std::move(path)) {}
+  ~TemporarySummary() {
+    std::error_code error;
+    std::filesystem::remove(path_, error);
+  }
+private:
+  std::filesystem::path path_;
+};
+
+#ifdef _WIN32
+class StorageHandle {
+public:
+  explicit StorageHandle(HANDLE handle) : handle_(handle) {}
+  ~StorageHandle() { if (handle_ != INVALID_HANDLE_VALUE) CloseHandle(handle_); }
+  StorageHandle(const StorageHandle&) = delete;
+  StorageHandle& operator=(const StorageHandle&) = delete;
+  HANDLE get() const noexcept { return handle_; }
+private:
+  HANDLE handle_;
+};
+
+Result<Unit> WriteStorageBytes(HANDLE handle, std::string_view text) {
+  if (text.size() > std::numeric_limits<DWORD>::max()) return DiagnosticError("storage_too_large");
+  DWORD written = 0;
+  if (!WriteFile(handle, text.data(), static_cast<DWORD>(text.size()), &written, nullptr)) return DiagnosticError("storage_write", GetLastError());
+  if (written != text.size()) return DiagnosticError("storage_short_write");
+  return Unit{};
+}
+#endif
+
+std::filesystem::path EventPath(const std::filesystem::path& directory, std::uint32_t index) {
+  if (index == 0) return directory / "events.jsonl";
+  return directory / ("events." + std::to_string(index) + ".jsonl");
+}
+
+template <std::size_t N>
+void CopyFixed(std::array<char, N>& destination, std::uint8_t& length, std::string_view source, std::size_t maximum) noexcept {
+  const auto count = std::min({source.size(), maximum, N});
+  if (count) std::memcpy(destination.data(), source.data(), count);
+  length = static_cast<std::uint8_t>(count);
+}
+
+}
+
+const BuildIdentity& EmbeddedBuildIdentity() noexcept { return kEmbeddedBuildIdentity; }
+
+FailureInfo ExplainFailure(const Error& error) {
+  const auto operation = error.operation.view();
+  const auto code = CodeFor(error.code, operation);
+  return {std::string(code), error.stage, std::string(OperationName(operation)), UtcNow(), 0,
+          error.native_code, std::nullopt, std::string(ActionFor(code))};
+}
+
+Result<std::string> SerializeSummary(const DiagnosticRecord& record) {
+  JsonWriter writer(MaxSummaryBytes);
+  const auto& config = record.effective_config;
+  if (!writer.Raw("{\"schema_version\":" ) || !writer.Number(config.schema_version) ||
+      !writer.Raw(",\"build\":" ) || !WriteBuild(writer, record.build) ||
+      !writer.Raw(",\"configuration\":{\"log_level\":" ) || !writer.String(LogLevelName(config.log_level)) ||
+      !writer.Raw(",\"file_logging\":" ) || !writer.Boolean(config.file_logging) ||
+      !writer.Raw(",\"max_file_mib\":" ) || !writer.Number(config.max_file_mib) ||
+      !writer.Raw(",\"retained_files\":" ) || !writer.Number(config.retained_files) ||
+      !writer.Raw(",\"runtime_observation\":" ) || !writer.Boolean(config.runtime_observation) ||
+      !writer.Raw(",\"sample_interval_ms\":" ) || !writer.Number(config.sample_interval_ms) ||
+      !writer.Raw(",\"observation_seconds\":" ) || !writer.Number(config.observation_seconds) ||
+      !writer.Raw(",\"origins\":{")) return DiagnosticError("summary_prefix");
+
+  constexpr std::array<std::string_view, 8> OriginKeys{
+      "schema_version", "logging.level", "logging.file_logging", "logging.max_file_mib", "logging.retained_files",
+      "diagnostics.runtime_observation", "diagnostics.sample_interval_ms", "diagnostics.observation_seconds"};
+  bool first_origin = true;
+  for (const auto key : OriginKeys) {
+    const auto found = config.origins.find(key);
+    if (found == config.origins.end()) continue;
+    if (!first_origin && !writer.Raw(",")) return DiagnosticError("summary_origin_separator");
+    first_origin = false;
+    if (!writer.String(key) || !writer.Raw(":") || !writer.String(OriginName(found->second))) return DiagnosticError("summary_origin_value");
+  }
+  if (!writer.Raw("},\"warnings\":[")) return DiagnosticError("summary_warning_prefix");
+  const auto warning_count = std::min<std::size_t>(config.warnings.size(), 8);
+  for (std::size_t index = 0; index < warning_count; ++index) {
+    if ((index && !writer.Raw(",")) || !writer.String(SafeTag(config.warnings[index]))) return DiagnosticError("summary_warning_value");
+  }
+  if (!writer.Raw("]},\"game\":{\"package\":" ) ||
+      !WriteObserved(writer, record.game_package, [&](const auto& value) { return WriteStringValue(writer, value); }) ||
+      !writer.Raw(",\"version\":" ) || !WriteObserved(writer, record.game_version, [&](const auto& value) { return WriteStringValue(writer, value); }) ||
+      !writer.Raw(",\"executable_timestamp\":" ) || !WriteObserved(writer, record.executable_timestamp, [&](auto value) { return writer.Number(value); }) ||
+      !writer.Raw("}")) return DiagnosticError("summary_game");
+  if (!writer.Raw(",\"environment\":{\"os\":" ) || !WriteObserved(writer, record.environment.os, [&](const auto& value) { return WriteStringValue(writer, value); }) ||
+      !writer.Raw(",\"gpu\":" ) || !WriteObserved(writer, record.environment.gpu, [&](const auto& value) { return WriteStringValue(writer, value); }) ||
+      !writer.Raw(",\"driver\":" ) || !WriteObserved(writer, record.environment.driver, [&](const auto& value) { return WriteStringValue(writer, value); }) ||
+      !writer.Raw(",\"selected_adapter\":" ) || !WriteObserved(writer, record.environment.selected_adapter, [&](const auto& value) { return WriteStringValue(writer, value); }) ||
+      !writer.Raw(",\"hags_configured\":" ) || !WriteObserved(writer, record.environment.hags_configured, [&](bool value) { return writer.Boolean(value); }) ||
+      !writer.Raw(",\"hags_active\":" ) || !WriteObserved(writer, record.environment.hags_active, [&](bool value) { return writer.Boolean(value); }) ||
+      !writer.Raw("}")) return DiagnosticError("summary_environment");
+  if (!writer.Raw(",\"dependencies\":{\"interposer_version\":" ) || !WriteObserved(writer, record.interposer_version, [&](const auto& value) { return WriteStringValue(writer, value); }) ||
+      !writer.Raw(",\"interposer_sha256\":" ) || !WriteObserved(writer, record.interposer_sha256, [&](const auto& value) { return writer.String(SafeTag(value)); }) ||
+      !writer.Raw(",\"interposer_signature_valid\":" ) || !WriteObserved(writer, record.interposer_signature_valid, [&](bool value) { return writer.Boolean(value); }) ||
+      !writer.Raw(",\"loaded_plugin\":" ) || !WriteObserved(writer, record.loaded_plugin, [&](bool value) { return writer.Boolean(value); }) ||
+      !writer.Raw("}")) return DiagnosticError("summary_dependencies");
+  if (!writer.Raw(",\"hook_state\":" ) || !writer.String(HookName(record.hook_state))) return DiagnosticError("summary_hook_state");
+  if (!writer.Raw(",\"frame_generation\":" ) || !writer.String(FgName(record.frame_generation, record.decoded_rejection_code.has_value()))) return DiagnosticError("summary_frame_generation");
+  if (!writer.Raw(",\"decoded_rejection_code\":" ) ||
+      !(record.frame_generation == FrameGenerationState::Rejected && record.decoded_rejection_code ? writer.Number(*record.decoded_rejection_code) : writer.Null())) return DiagnosticError("summary_decoded_rejection");
+  if (!writer.Raw(",\"warning_codes\":[")) return DiagnosticError("summary_warning_codes");
+
+  bool first_warning = true;
+  if (record.frame_generation == FrameGenerationState::Unknown) {
+    if (!writer.String("WFG-W-OBSERVATION_UNAVAILABLE")) return DiagnosticError("summary_unavailable_warning");
+    first_warning = false;
+  } else if (record.frame_generation == FrameGenerationState::ActivityNotObserved) {
+    if (!writer.String("WFG-W-FG_ACTIVITY_NOT_OBSERVED")) return DiagnosticError("summary_activity_warning");
+    first_warning = false;
+  } else if (record.frame_generation == FrameGenerationState::Rejected && record.decoded_rejection_code) {
+    if (!writer.String("WFG-W-FG_REJECTED")) return DiagnosticError("summary_rejected_warning");
+    first_warning = false;
+  }
+  if (record.failure && record.failure->code == "WFG-W-OBSERVATION_UNAVAILABLE") {
+    if (!first_warning && !writer.Raw(",")) return DiagnosticError("summary_warning_separator");
+    if (!writer.String(record.failure->code)) return DiagnosticError("summary_failure_warning");
+  }
+  if (!writer.Raw("],\"outcome\":" ) || !writer.String(OutcomeName(record.outcome)) ||
+      !writer.Raw(",\"elapsed_ms\":" ) || !writer.Number(record.elapsed_ms) ||
+      !writer.Raw(",\"failure\":" ) || !(record.failure ? WriteFailure(writer, *record.failure, record.elapsed_ms) : writer.Null()) || !writer.Raw("}")) {
+    return DiagnosticError("summary_tail");
+  }
+  return std::move(writer).Take();
+}
+
+FileLogStorage::FileLogStorage(std::filesystem::path directory) : directory_(std::move(directory)) {}
+
+const std::filesystem::path& FileLogStorage::directory() const noexcept { return directory_; }
+
+Result<Unit> FileLogStorage::AppendEvent(std::string_view json_line, std::uint32_t max_file_mib, std::uint32_t retained_files) {
+  const auto size_limit = static_cast<std::uintmax_t>(std::clamp(max_file_mib, 1U, 8U)) * 1024U * 1024U;
+  const auto retained = std::clamp(retained_files, 1U, 10U);
+  if (json_line.size() + 1 > size_limit) return DiagnosticError("event_too_large");
+  const auto directory_check = ValidateStoragePath(directory_, false);
+  if (!IsOk(directory_check)) return Failure(directory_check);
+  std::error_code error;
+  std::filesystem::create_directories(directory_, error);
+  if (error) return FileError("storage_directory", error);
+  for (std::uint32_t index = 0; index < 10; ++index) {
+    const auto checked = ValidateStoragePath(EventPath(directory_, index), true);
+    if (!IsOk(checked)) return Failure(checked);
+  }
+  for (std::uint32_t index = retained; index < 10; ++index) {
+    std::filesystem::remove(EventPath(directory_, index), error);
+    if (error) return FileError("storage_prune", error);
+  }
+  for (std::uint32_t index = 0; index < retained; ++index) {
+    const auto path = EventPath(directory_, index);
+    if (!std::filesystem::exists(path, error)) {
+      if (error) return FileError("storage_stat", error);
+      continue;
+    }
+    const auto size = std::filesystem::file_size(path, error);
+    if (error) return FileError("storage_stat", error);
+    if (size > size_limit) {
+      std::filesystem::remove(path, error);
+      if (error) return FileError("storage_prune", error);
+    }
+  }
+  const auto current = EventPath(directory_, 0);
+  const bool exists = std::filesystem::exists(current, error);
+  if (error) return FileError("storage_stat", error);
+  std::uintmax_t current_size = 0;
+  if (exists) {
+    current_size = std::filesystem::file_size(current, error);
+    if (error) return FileError("storage_stat", error);
+  }
+  if (current_size + json_line.size() + 1 > size_limit) {
+    if (retained == 1) {
+      std::filesystem::remove(current, error);
+      if (error) return FileError("storage_rotate", error);
+    } else {
+      for (std::uint32_t index = retained - 1; index > 0; --index) {
+        const auto from = EventPath(directory_, index - 1);
+        const auto to = EventPath(directory_, index);
+        error.clear();
+        std::filesystem::remove(to, error);
+        if (error) return FileError("storage_rotate", error);
+        error.clear();
+        if (std::filesystem::exists(from, error)) {
+          if (error) return FileError("storage_rotate", error);
+          std::filesystem::rename(from, to, error);
+          if (error) return FileError("storage_rotate", error);
+        } else if (error) return FileError("storage_rotate", error);
+      }
+    }
+  }
+#ifdef _WIN32
+  StorageHandle output(CreateFileW(current.c_str(), FILE_APPEND_DATA | FILE_READ_ATTRIBUTES, FILE_SHARE_READ, nullptr, OPEN_ALWAYS,
+                                  FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+  if (output.get() == INVALID_HANDLE_VALUE) return DiagnosticError("storage_open", GetLastError());
+  BY_HANDLE_FILE_INFORMATION information{};
+  if (!GetFileInformationByHandle(output.get(), &information)) return DiagnosticError("storage_file_info", GetLastError());
+  if ((information.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)) || information.nNumberOfLinks != 1) return DiagnosticError("storage_file_refused");
+  const auto written = WriteStorageBytes(output.get(), json_line);
+  if (!IsOk(written)) return Failure(written);
+  const auto newline = WriteStorageBytes(output.get(), "\n");
+  if (!IsOk(newline)) return Failure(newline);
+  if (!FlushFileBuffers(output.get())) return DiagnosticError("storage_flush", GetLastError());
+#else
+  std::ofstream output(current, std::ios::binary | std::ios::app);
+  if (!output) return DiagnosticError("storage_open");
+  output.write(json_line.data(), static_cast<std::streamsize>(json_line.size()));
+  output.put('\n');
+  output.flush();
+  if (!output) return DiagnosticError("storage_write");
+#endif
+  return Unit{};
+}
+
+Result<Unit> FileLogStorage::WriteSummaryAtomically(std::string_view json) {
+  if (json.size() > MaxSummaryBytes) return DiagnosticError("summary_too_large");
+  const auto directory_check = ValidateStoragePath(directory_, false);
+  if (!IsOk(directory_check)) return Failure(directory_check);
+  std::error_code error;
+  std::filesystem::create_directories(directory_, error);
+  if (error) return FileError("summary_directory", error);
+  const auto temporary = directory_ / "last-run.json.tmp";
+  const auto destination = directory_ / "last-run.json";
+  for (const auto& path : {temporary, destination}) {
+    const auto checked = ValidateStoragePath(path, true);
+    if (!IsOk(checked)) return Failure(checked);
+  }
+#ifdef _WIN32
+  const auto handle = CreateFileW(temporary.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+  if (handle == INVALID_HANDLE_VALUE) return DiagnosticError("summary_open", GetLastError());
+  TemporarySummary cleanup(temporary);
+  {
+    StorageHandle output(handle);
+    const auto written = WriteStorageBytes(output.get(), json);
+    if (!IsOk(written)) return Failure(written);
+    if (!FlushFileBuffers(output.get())) return DiagnosticError("summary_flush", GetLastError());
+  }
+#else
+  if (std::filesystem::exists(temporary, error)) return DiagnosticError("summary_temporary_exists");
+  if (error) return FileError("summary_temporary_status", error);
+  TemporarySummary cleanup(temporary);
+  {
+    std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
+    if (!output) return DiagnosticError("summary_open");
+    output.write(json.data(), static_cast<std::streamsize>(json.size()));
+    output.flush();
+    if (!output) return DiagnosticError("summary_write");
+  }
+#endif
+#ifdef _WIN32
+  if (!MoveFileExW(temporary.c_str(), destination.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+    return DiagnosticError("summary_replace", GetLastError());
+  }
+#else
+  std::filesystem::rename(temporary, destination, error);
+  if (error) return FileError("summary_replace", error);
+#endif
+  return Unit{};
+}
+
+void FileLogStorage::WriteConsoleLine(std::string_view text) {
+  static_cast<void>(std::fwrite(text.data(), 1, text.size(), stderr));
+  if (text.empty() || text.back() != '\n') static_cast<void>(std::fwrite("\n", 1, 1, stderr));
+}
+
+Result<std::filesystem::path> LocalAppDataDiagnosticsDirectory() {
+#ifdef _WIN32
+  std::array<wchar_t, 32768> buffer{};
+  const auto length = GetEnvironmentVariableW(L"LOCALAPPDATA", buffer.data(), static_cast<DWORD>(buffer.size()));
+  if (length == 0 || length >= buffer.size()) return DiagnosticError("local_app_data_unavailable");
+  const std::filesystem::path root(std::wstring_view(buffer.data(), length));
+#else
+  const auto* value = std::getenv("LOCALAPPDATA");
+  if (!value || *value == '\0') return DiagnosticError("local_app_data_unavailable");
+  const std::filesystem::path root(value);
+#endif
+  if (!root.is_absolute()) return DiagnosticError("local_app_data_relative");
+  return root / "WitcherFG" / "diagnostics";
+}
+
+RunLogger::RunLogger(const EffectiveConfig& config, ILogStorage& storage) noexcept : config_(config), storage_(storage) {}
+
+Result<Unit> RunLogger::Emit(const DiagnosticEvent& event) {
+  if (mutation_active_) return StoreDeferred(event);
+  if (!IsVisible(config_, event.level)) return Unit{};
+  return WriteEvent(event);
+}
+
+Result<Unit> RunLogger::DeferMutationEvent(const DiagnosticEvent& event) noexcept {
+  mutation_active_ = true;
+  return StoreDeferred(event);
+}
+
+Result<Unit> RunLogger::StoreDeferred(const DiagnosticEvent& event) noexcept {
+  if (deferred_count_ >= deferred_.size() || event.fields.size() > MaxDeferredFields) return DiagnosticError();
+  auto& stored = deferred_[deferred_count_++];
+  stored.level = event.level;
+  stored.code = event.code;
+  stored.stage = event.stage;
+  CopyFixed(stored.operation.bytes, stored.operation.length, event.operation, MaxOperationBytes);
+  stored.field_count = static_cast<std::uint8_t>(event.fields.size());
+  for (std::size_t index = 0; index < event.fields.size(); ++index) {
+    const auto& field = event.fields[index];
+    auto& target = stored.fields[index];
+    target.key = field.key;
+    target.source = field.source;
+    if (const auto* boolean = std::get_if<bool>(&field.value)) {
+      target.is_text = false;
+      target.is_integer = false;
+      target.boolean_value = *boolean;
+      target.integer_value = 0;
+    } else if (const auto* integer = std::get_if<std::uint64_t>(&field.value)) {
+      target.is_text = false;
+      target.is_integer = true;
+      target.boolean_value = false;
+      target.integer_value = *integer;
+    } else {
+      target.is_text = true;
+      target.is_integer = false;
+      target.boolean_value = false;
+      target.integer_value = 0;
+      CopyFixed(target.text.bytes, target.text.length, std::get<std::string_view>(field.value), MaxFieldBytes);
+    }
+  }
+  return Unit{};
+}
+
+Result<Unit> RunLogger::WriteEvent(const DiagnosticEvent& event) {
+  JsonWriter writer(MaxEventBytes);
+  if (!WriteEventJson(writer, event)) return DiagnosticError("event_too_large");
+  auto line = std::move(writer).Take();
+  if (!config_.file_logging) {
+    storage_.WriteConsoleLine(line);
+    return Unit{};
+  }
+  auto result = storage_.AppendEvent(line, std::clamp(config_.max_file_mib, 1U, 8U), std::clamp(config_.retained_files, 1U, 10U));
+  if (!IsOk(result)) storage_.WriteConsoleLine(line);
+  return result;
+}
+
+Result<Unit> RunLogger::FlushDeferred() {
+  Error first_error{};
+  bool failed = false;
+  for (std::size_t index = 0; index < deferred_count_; ++index) {
+    auto& stored = deferred_[index];
+    std::array<DiagnosticField, MaxDeferredFields> fields{};
+    std::array<std::string_view, MaxDeferredFields> text_values{};
+    for (std::size_t field_index = 0; field_index < stored.field_count; ++field_index) {
+      const auto& saved = stored.fields[field_index];
+      fields[field_index].key = saved.key;
+      fields[field_index].source = saved.source;
+      if (saved.is_text) {
+        text_values[field_index] = std::string_view(saved.text.bytes.data(), saved.text.length);
+        fields[field_index].value = text_values[field_index];
+      } else if (saved.is_integer) {
+        fields[field_index].value = saved.integer_value;
+      } else {
+        fields[field_index].value = saved.boolean_value;
+      }
+    }
+    DiagnosticEvent event{stored.level, stored.code, stored.stage,
+                          std::string_view(stored.operation.bytes.data(), stored.operation.length),
+                          std::span<const DiagnosticField>(fields.data(), stored.field_count)};
+    if (!IsVisible(config_, event.level)) continue;
+    auto result = WriteEvent(event);
+    if (!IsOk(result) && !failed) {
+      first_error = Failure(result);
+      failed = true;
+    }
+  }
+  deferred_count_ = 0;
+  mutation_active_ = false;
+  if (failed) return first_error;
+  return Unit{};
+}
+
+Result<Unit> RunLogger::Finish(const DiagnosticRecord& record) {
+  if (record.safety == SafetyDisposition::Unverified) return DiagnosticError();
+  const auto flushed = FlushDeferred();
+  const auto summary = SerializeSummary(record);
+  if (!IsOk(summary)) {
+    if (!IsOk(flushed)) return Failure(flushed);
+    return Failure(summary);
+  }
+  const auto& json = Value(summary);
+  Result<Unit> summary_result = Unit{};
+  if (config_.file_logging) {
+    summary_result = storage_.WriteSummaryAtomically(json);
+    if (!IsOk(summary_result)) storage_.WriteConsoleLine(json);
+  } else {
+    storage_.WriteConsoleLine(json);
+  }
+  if (!IsOk(flushed)) return Failure(flushed);
+  return summary_result;
+}
+
+}
