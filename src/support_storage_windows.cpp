@@ -73,13 +73,57 @@ NativeHandle RelativeOpen(HANDLE directory, std::wstring_view name, ACCESS_MASK 
 
 struct WindowsSupportStorage::State {
   std::filesystem::path root, completed;
+#ifdef WFG_SUPPORT_TESTING
+  WindowsSupportStorage* test_owner{};
+#endif
 #ifdef _WIN32
   std::vector<NativeHandle> directories;
   std::map<std::uint64_t, std::vector<SourceFile>> sources;
   std::uint64_t next_token{1};
   bool pinned{};
+  bool locality_refused{};
+  std::wstring local_volume_root;
   HANDLE root_directory{INVALID_HANDLE_VALUE}, diagnostics_directory{INVALID_HANDLE_VALUE}, support_directory{INVALID_HANDLE_VALUE};
-  bool DirectoriesValid() const {
+  Error RootStorageError(std::string_view operation) const {
+    return StorageError(locality_refused ? "SupportLocalStorageRequired" : operation);
+  }
+  std::optional<std::wstring> LocalVolumeRoot() {
+    const auto refuse = [&]() -> std::optional<std::wstring> {
+      locality_refused = true; SetLastError(ERROR_NOT_SUPPORTED); return std::nullopt;
+    };
+    locality_refused = false;
+    const auto drive = root.root_name().native();
+    if (!root.is_absolute() || drive.size() != 2 || drive[1] != L':' ||
+        !((drive[0] >= L'A' && drive[0] <= L'Z') || (drive[0] >= L'a' && drive[0] <= L'z'))) return refuse();
+    for (const auto& part : root.relative_path()) if (part == L".." || part == L"." || part.empty()) return refuse();
+    const auto drive_root = drive + L"\\";
+#ifdef WFG_SUPPORT_TESTING
+    ++test_owner->locality_probe_count;
+    const auto type = test_owner->drive_type_override ? *test_owner->drive_type_override : GetDriveTypeW(drive_root.c_str());
+#else
+    const auto type = GetDriveTypeW(drive_root.c_str());
+#endif
+    if (type != DRIVE_FIXED) return refuse();
+    std::wstring device;
+#ifdef WFG_SUPPORT_TESTING
+    if (test_owner->device_target_override) device = *test_owner->device_target_override;
+    else
+#endif
+    {
+      std::array<wchar_t,512> targets{};
+      const auto count = QueryDosDeviceW(drive.c_str(),targets.data(),static_cast<DWORD>(targets.size()));
+      if (count == 0 || count >= targets.size()) return refuse();
+      device = targets.data();
+    }
+    constexpr std::wstring_view prefix = L"\\Device\\HarddiskVolume";
+    if (!device.starts_with(prefix) || device.size() == prefix.size() ||
+        !std::all_of(device.begin() + prefix.size(),device.end(),[](wchar_t digit) { return digit >= L'0' && digit <= L'9'; })) return refuse();
+    // Open the captured physical volume, rather than following the drive alias
+    // again after classification. Caller-supplied device namespaces are refused.
+    return std::wstring(L"\\\\?\\GLOBALROOT") + device + L"\\";
+  }
+  bool DirectoriesValid() {
+    if (!pinned || !PinRoot()) return false;
     for (const auto& handle : directories) {
       BY_HANDLE_FILE_INFORMATION info{};
       if (!GetFileInformationByHandle(handle.get(),&info) || (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0 ||
@@ -88,12 +132,23 @@ struct WindowsSupportStorage::State {
     return true;
   }
   bool PinRoot() {
-    if (pinned) return true;
-    if (root.empty() || !root.is_absolute() || root.has_root_name() == false) return false;
+    const auto volume = LocalVolumeRoot();
+    if (!volume) return false;
+    if (pinned) {
+      if (*volume != local_volume_root) { locality_refused = true; SetLastError(ERROR_NOT_SUPPORTED); return false; }
+      return true;
+    }
+    local_volume_root = *volume;
     auto current = root.root_path();
     auto pin = [&](const std::filesystem::path& path, bool create) {
+#ifdef WFG_SUPPORT_TESTING
+      if (directories.empty()) {
+        ++test_owner->root_open_attempts;
+        if (test_owner->fail_before_root_open) return false;
+      }
+#endif
       NativeHandle handle = directories.empty() ?
-          NativeHandle(CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY, FILE_SHARE_READ | FILE_SHARE_WRITE,
+          NativeHandle(CreateFileW(local_volume_root.c_str(), FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY, FILE_SHARE_READ | FILE_SHARE_WRITE,
               nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr)) :
           RelativeOpen(directories.back().get(),path.filename().wstring(),FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY |
               ((path == root.parent_path() || path == root) ? FILE_ADD_SUBDIRECTORY : 0U),FILE_SHARE_READ | FILE_SHARE_WRITE,create ? 3U : 1U,true);
@@ -149,7 +204,7 @@ struct WindowsSupportStorage::State {
   }
   Result<SupportReadHandle> Open(bool events) {
     bool missing{};
-    if (!PinChild(L"diagnostics", false, missing)) return StorageError("PinDiagnosticsDirectory");
+    if (!PinChild(L"diagnostics", false, missing)) return RootStorageError("PinDiagnosticsDirectory");
     if (missing) return SupportReadHandle{};
     if (!ExpectedFiles()) return StorageError("UnexpectedDiagnosticFile");
     std::vector<SourceFile> files;
@@ -168,7 +223,7 @@ struct WindowsSupportStorage::State {
     sources.emplace(token, std::move(files)); return SupportReadHandle{token, true, false};
   }
   Result<SupportRead> Read(const SupportReadHandle& handle, std::size_t maximum, bool events) {
-    if (!DirectoriesValid() || !handle.regular || handle.reparse || maximum > 10U * 1024U * 1024U) return StorageError("ReadSupportSource");
+    if (!DirectoriesValid() || !handle.regular || handle.reparse || maximum > 10U * 1024U * 1024U) return RootStorageError("ReadSupportSource");
     auto found = sources.find(handle.identity);
     if (found == sources.end()) return StorageError("ReadSupportSource");
     auto files = std::move(found->second); sources.erase(found);
@@ -203,23 +258,38 @@ struct WindowsSupportStorage::State {
       complete_lines += static_cast<std::size_t>(std::count(bytes.begin(), bytes.end(), std::byte{'\n'}));
       result.bytes.insert(result.bytes.begin(), bytes.begin(), bytes.end());
     }
-    if (!DirectoriesValid()) return StorageError("SupportDirectoryChanged");
+    if (!DirectoriesValid()) return RootStorageError("SupportDirectoryChanged");
     return result;
   }
 #endif
 };
 
 WindowsSupportStorage::WindowsSupportStorage() : state_(std::make_unique<State>()) {
+#ifdef WFG_SUPPORT_TESTING
+  state_->test_owner = this;
+#endif
 #ifdef _WIN32
   PWSTR path{};
-  if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, KF_FLAG_DEFAULT, nullptr, &path))) {
+  constexpr auto folder_flags = KF_FLAG_DONT_VERIFY;
+#ifdef WFG_SUPPORT_TESTING
+  known_folder_flags = folder_flags;
+#endif
+  if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, folder_flags, nullptr, &path))) {
     state_->root = std::filesystem::path(path) / L"WitcherFG";
     CoTaskMemFree(path);
   }
 #endif
 }
 #ifdef WFG_SUPPORT_TESTING
-WindowsSupportStorage::WindowsSupportStorage(std::filesystem::path root) : state_(std::make_unique<State>()) { state_->root = std::move(root); }
+WindowsSupportStorage::WindowsSupportStorage(std::filesystem::path root) : state_(std::make_unique<State>()) { state_->root = std::move(root); state_->test_owner = this; }
+Result<Unit> WindowsSupportStorage::ValidateLocalRootForTest() {
+#ifdef _WIN32
+  if (!state_->LocalVolumeRoot()) return state_->RootStorageError("SupportLocalStorageRequired");
+  return Unit{};
+#else
+  return StorageError("WindowsSupportUnavailable");
+#endif
+}
 #endif
 WindowsSupportStorage::~WindowsSupportStorage() = default;
 Result<SupportReadHandle> WindowsSupportStorage::OpenSanitizedSummary() {
@@ -254,7 +324,7 @@ Result<std::filesystem::path> WindowsSupportStorage::CommitArchiveAtomically(std
 #ifdef _WIN32
   state_->completed.clear();
   bool missing{};
-  if (archive.empty() || archive.size() > 11U * 1024U * 1024U || !state_->PinChild(L"support", true, missing)) return StorageError("PinSupportDirectory");
+  if (archive.empty() || archive.size() > 11U * 1024U * 1024U || !state_->PinChild(L"support", true, missing)) return state_->RootStorageError("PinSupportDirectory");
   GUID id{};
   if (FAILED(CoCreateGuid(&id))) return StorageError("NameSupportArchive");
   wchar_t identifier[40]{};

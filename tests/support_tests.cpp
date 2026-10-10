@@ -13,6 +13,7 @@
 #include <windows.h>
 #include <winioctl.h>
 #include <sddl.h>
+#include <shlobj.h>
 #endif
 
 namespace {
@@ -55,10 +56,10 @@ public:
     CHECK(wfg::IsOk(logger.Finish(record)));
     CHECK(producer.summary == REQUIRE_OK(wfg::SerializeSummary(record)));
   }
-  wfg::Result<wfg::SupportReadHandle> OpenSanitizedSummary() override { return missing ? wfg::SupportReadHandle{} : wfg::SupportReadHandle{7, true, reparse}; }
-  wfg::Result<wfg::SupportRead> ReadSanitizedSummary(const wfg::SupportReadHandle&, std::size_t) override { ++reads; return wfg::SupportRead{Encode(producer.summary), replacement ? 8U : 7U, true, false}; }
-  wfg::Result<wfg::SupportReadHandle> OpenRecentEvents() override { return producer.events.empty() ? wfg::SupportReadHandle{} : wfg::SupportReadHandle{9, true, false}; }
-  wfg::Result<wfg::SupportRead> ReadRecentEvents(const wfg::SupportReadHandle&, std::size_t) override { return wfg::SupportRead{Encode(producer.events), 9, true, false}; }
+  wfg::Result<wfg::SupportReadHandle> OpenSanitizedSummary() override { if (open_error) return *open_error; return missing ? wfg::SupportReadHandle{} : wfg::SupportReadHandle{7, true, reparse}; }
+  wfg::Result<wfg::SupportRead> ReadSanitizedSummary(const wfg::SupportReadHandle&, std::size_t) override { ++reads; if (summary_read_error) return *summary_read_error; return wfg::SupportRead{Encode(producer.summary), replacement ? 8U : 7U, true, false}; }
+  wfg::Result<wfg::SupportReadHandle> OpenRecentEvents() override { if (event_open_error) return *event_open_error; return producer.events.empty() ? wfg::SupportReadHandle{} : wfg::SupportReadHandle{9, true, false}; }
+  wfg::Result<wfg::SupportRead> ReadRecentEvents(const wfg::SupportReadHandle&, std::size_t) override { if (event_read_error) return *event_read_error; return wfg::SupportRead{Encode(producer.events), 9, true, false}; }
   wfg::Result<std::filesystem::path> CommitArchiveAtomically(std::span<const std::byte> bytes) override {
     if (fail_write) return SupportError();
     archive.assign(reinterpret_cast<const char*>(bytes.data()), bytes.size());
@@ -75,6 +76,7 @@ public:
   std::filesystem::path output;
   unsigned reads{}, commits{};
   bool reparse{}, replacement{}, fail_write{}, missing{};
+  std::optional<wfg::Error> open_error, summary_read_error, event_open_error, event_read_error;
 };
 void Replace(std::string& text, std::string_view old_value, std::string_view new_value) {
   const auto position = text.find(old_value); CHECK(position != std::string::npos); text.replace(position, old_value.size(), new_value);
@@ -135,6 +137,37 @@ TEST("support.reparse_and_identity_replacement_refuse_before_commit") {
 TEST("support.metadata_secret_tokens_are_not_exported") {
   SupportFixture fixture; auto inputs = Inputs(); inputs.metadata.build_id = "PRIVATE_SECRET"; inputs.metadata.package_version = "PRIVATE_SECRET";
   REQUIRE_OK(wfg::CollectSupport(inputs, fixture)); CHECK(fixture.archive.find("PRIVATE_SECRET") == std::string::npos);
+}
+TEST("support.unrecognized_storage_failures_keep_normalized_collector_operations") {
+  const std::array<std::string_view,4> operations{"OpenSanitizedSummary","ReadSanitizedSummary","OpenRecentEvents","ReadRecentEvents"};
+  for (unsigned boundary = 0; boundary < 4; ++boundary) for (unsigned scenario = 0; scenario < 4; ++scenario) {
+    SupportFixture fixture;
+    const std::array slots{&fixture.open_error,&fixture.summary_read_error,&fixture.event_open_error,&fixture.event_read_error};
+    auto& error = *slots[boundary];
+    error = wfg::Error{wfg::ErrorCode::SupportBundleFailure,wfg::Stage::Support,"SupportLocalStorageRequired",50U,{}};
+    if (scenario == 0) error->operation = "PRIVATE_SECRET";
+    if (scenario == 1) error->native_code = 0U;
+    if (scenario == 2) error->code = wfg::ErrorCode::AccessDenied;
+    if (scenario == 3) error->stage = wfg::Stage::activation;
+    const auto failure_result = wfg::CollectSupport(Inputs(),fixture);
+    REQUIRE_ERROR(failure_result,wfg::ErrorCode::SupportBundleFailure);
+    CHECK(wfg::Failure(failure_result).operation.view() == operations[boundary]);
+    CHECK(!wfg::Failure(failure_result).native_code);
+    CHECK(fixture.commits == 0);
+  }
+}
+TEST("support.recognized_locality_refusal_survives_all_collector_read_boundaries") {
+  for (unsigned boundary = 0; boundary < 4; ++boundary) {
+    SupportFixture fixture;
+    const std::array slots{&fixture.open_error,&fixture.summary_read_error,&fixture.event_open_error,&fixture.event_read_error};
+    *slots[boundary] = wfg::Error{wfg::ErrorCode::SupportBundleFailure,wfg::Stage::Support,"SupportLocalStorageRequired",50U,999U};
+    const auto failure_result = wfg::CollectSupport(Inputs(),fixture);
+    REQUIRE_ERROR(failure_result,wfg::ErrorCode::SupportBundleFailure);
+    CHECK(wfg::Failure(failure_result).operation.view() == "SupportLocalStorageRequired");
+    CHECK(wfg::Failure(failure_result).native_code == 50U);
+    CHECK(!wfg::Failure(failure_result).affected_slot);
+    CHECK(fixture.commits == 0);
+  }
 }
 TEST("support.unknown_operation_tokens_are_redacted_from_typed_and_persisted_records") {
   for (unsigned scenario = 0; scenario < 4; ++scenario) {
@@ -283,6 +316,99 @@ TEST("support.native_missing_logs_and_fixed_directory_output") {
   const auto bundle = wfg::Value(result);
   CHECK(bundle.local_output.parent_path() == fixture.root / L"support");
   CHECK(fixture.ZipCount() == 1);
+}
+namespace {
+void RefusesBeforeRootOpen(wfg::WindowsSupportStorage& storage) {
+  storage.fail_before_root_open = true;
+  const auto summary = storage.OpenSanitizedSummary();
+  REQUIRE_ERROR(summary,wfg::ErrorCode::SupportBundleFailure);
+  CHECK(wfg::Failure(summary).operation.view() == "SupportLocalStorageRequired");
+  CHECK(wfg::Failure(summary).native_code == ERROR_NOT_SUPPORTED);
+  CHECK(storage.root_open_attempts == 0);
+  REQUIRE_ERROR(storage.OpenRecentEvents(),wfg::ErrorCode::SupportBundleFailure);
+  CHECK(storage.root_open_attempts == 0);
+  REQUIRE_ERROR(storage.CommitArchiveAtomically(Encode("test")),wfg::ErrorCode::SupportBundleFailure);
+  CHECK(storage.root_open_attempts == 0);
+  CHECK(storage.CompletedArchiveLocation().empty());
+  const auto collected = wfg::CollectSupport(Inputs(),storage);
+  REQUIRE_ERROR(collected,wfg::ErrorCode::SupportBundleFailure);
+  CHECK(wfg::Failure(collected).operation.view() == "SupportLocalStorageRequired");
+  CHECK(wfg::Failure(collected).native_code == ERROR_NOT_SUPPORTED);
+  CHECK(storage.root_open_attempts == 0);
+}
+}
+TEST("support.native_unc_roots_refuse_before_root_or_locality_io") {
+  for (const auto* root : {L"\\\\wfg-test-no-network\\share\\WitcherFG",L"\\\\localhost\\C$\\WitcherFG"}) {
+    wfg::WindowsSupportStorage storage(root);
+    RefusesBeforeRootOpen(storage);
+    CHECK(storage.locality_probe_count == 0);
+  }
+}
+TEST("support.native_device_namespace_roots_refuse_before_root_or_locality_io") {
+  for (const auto* root : {L"\\\\?\\C:\\WitcherFG",L"\\\\.\\C:\\WitcherFG",L"\\\\?\\UNC\\wfg-test-no-network\\share\\WitcherFG",L"\\\\?\\GLOBALROOT\\Device\\HarddiskVolume1\\WitcherFG"}) {
+    wfg::WindowsSupportStorage storage(root);
+    RefusesBeforeRootOpen(storage);
+    CHECK(storage.locality_probe_count == 0);
+  }
+}
+TEST("support.native_mapped_remote_drive_classification_refuses_without_drive_mapping") {
+  NativeFixture fixture;
+  wfg::WindowsSupportStorage storage(fixture.root);
+  storage.drive_type_override = DRIVE_REMOTE;
+  RefusesBeforeRootOpen(storage);
+  CHECK(fixture.ZipCount() == 0);
+}
+TEST("support.native_unproven_drive_classifications_refuse_before_root_open") {
+  NativeFixture fixture;
+  for (const auto type : {DRIVE_UNKNOWN,DRIVE_NO_ROOT_DIR,DRIVE_REMOVABLE,DRIVE_CDROM,DRIVE_RAMDISK}) {
+    wfg::WindowsSupportStorage storage(fixture.root);
+    storage.drive_type_override = type;
+    RefusesBeforeRootOpen(storage);
+    CHECK(fixture.ZipCount() == 0);
+  }
+}
+TEST("support.native_remote_or_alias_device_targets_refuse_before_root_open") {
+  NativeFixture fixture;
+  for (const auto* device : {L"\\Device\\Mup\\wfg-test-no-network\\share",L"\\Device\\LanmanRedirector\\wfg-test-no-network\\share",L"\\??\\UNC\\wfg-test-no-network\\share",L"\\??\\C:\\alias",L"\\Device\\HarddiskVolume1\\redirect"}) {
+    wfg::WindowsSupportStorage storage(fixture.root);
+    storage.drive_type_override = DRIVE_FIXED;
+    storage.device_target_override = device;
+    RefusesBeforeRootOpen(storage);
+    CHECK(fixture.ZipCount() == 0);
+  }
+}
+TEST("support.native_fixed_physical_volume_collection_still_succeeds") {
+  NativeFixture fixture; fixture.Produce();
+  wfg::WindowsSupportStorage storage(fixture.root);
+  const auto bundle = REQUIRE_OK(wfg::CollectSupport(Inputs(),storage));
+  CHECK(storage.locality_probe_count > 0);
+  CHECK(storage.root_open_attempts == 1);
+  CHECK(bundle.local_output.parent_path() == fixture.root / L"support");
+  CHECK(fixture.ZipCount() == 1);
+}
+TEST("support.native_default_constructor_resolves_local_folder_without_verification_or_root_io") {
+  wfg::WindowsSupportStorage storage;
+  CHECK((storage.known_folder_flags & KF_FLAG_DONT_VERIFY) != 0);
+  REQUIRE_OK(storage.ValidateLocalRootForTest());
+  CHECK(storage.locality_probe_count > 0);
+  CHECK(storage.root_open_attempts == 0);
+  CHECK(storage.CompletedArchiveLocation().empty());
+}
+TEST("support.native_drive_alias_change_after_pin_refuses_without_host_mapping_changes") {
+  for (bool remote : {false,true}) {
+    NativeFixture fixture; fixture.Produce();
+    wfg::WindowsSupportStorage storage(fixture.root);
+    const auto handle = REQUIRE_OK(storage.OpenSanitizedSummary());
+    if (remote) storage.drive_type_override = DRIVE_REMOTE;
+    else storage.device_target_override = L"\\Device\\HarddiskVolume99999999";
+    const auto read = storage.ReadSanitizedSummary(handle,16U * 1024U);
+    REQUIRE_ERROR(read,wfg::ErrorCode::SupportBundleFailure);
+    CHECK(wfg::Failure(read).operation.view() == "SupportLocalStorageRequired");
+    REQUIRE_ERROR(storage.CommitArchiveAtomically(Encode("test")),wfg::ErrorCode::SupportBundleFailure);
+    CHECK(storage.root_open_attempts == 1);
+    CHECK(storage.CompletedArchiveLocation().empty());
+    CHECK(fixture.ZipCount() == 0);
+  }
 }
 TEST("support.native_hardlinks_refuse_source_without_output") {
   NativeFixture fixture; fixture.Produce();

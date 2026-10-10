@@ -14,6 +14,13 @@ public:
   explicit WindowsSupportStorage(std::filesystem::path disposable_root);
   bool fail_before_write{};
   bool fail_before_rename{};
+  std::optional<std::uint32_t> drive_type_override;
+  std::optional<std::wstring> device_target_override;
+  bool fail_before_root_open{};
+  std::size_t root_open_attempts{};
+  std::size_t locality_probe_count{};
+  std::uint32_t known_folder_flags{};
+  Result<Unit> ValidateLocalRootForTest();
 #endif
   Result<SupportReadHandle> OpenSanitizedSummary() override;
   Result<SupportRead> ReadSanitizedSummary(const SupportReadHandle&, std::size_t) override;

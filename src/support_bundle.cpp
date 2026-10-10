@@ -20,6 +20,15 @@ constexpr std::size_t MaximumEventLogBytes = MaximumRecords * 4096U + MaximumRec
 Error Fail(std::string_view operation) {
   return {ErrorCode::SupportBundleFailure, Stage::Support, operation, std::nullopt, std::nullopt};
 }
+Error StorageReadFailure(const Error& error, std::string_view operation) {
+  // Preserve only the recognized local-storage refusal; other storage errors
+  // keep the existing normalization rather than forwarding arbitrary details.
+  constexpr std::uint32_t WindowsNotSupported = 50U;  // ERROR_NOT_SUPPORTED.
+  if (error.code == ErrorCode::SupportBundleFailure && error.stage == Stage::Support &&
+      error.operation.view() == "SupportLocalStorageRequired" && error.native_code == WindowsNotSupported)
+    return {ErrorCode::SupportBundleFailure,Stage::Support,"SupportLocalStorageRequired",WindowsNotSupported,std::nullopt};
+  return Fail(operation);
+}
 
 bool IsSafeName(std::string_view name) {
   if (name.empty() || name.size() > 96 || name.front() == '/' || name.back() == '/') return false;
@@ -466,11 +475,12 @@ Result<Unit> WriteStoreArchive(std::span<const BundleEntry> entries, ISupportSto
 
 Result<BundleEntry> ReadSummary(ISupportStorage& storage) {
   const auto handle=storage.OpenSanitizedSummary();
-  if (!IsOk(handle)) return Fail("OpenSanitizedSummary");
+  if (!IsOk(handle)) return StorageReadFailure(Failure(handle),"OpenSanitizedSummary");
   if (Value(handle).identity == 0 && !Value(handle).regular && !Value(handle).reparse) return BundleEntry{};
   if (!Value(handle).regular || Value(handle).reparse) return Fail("OpenSanitizedSummary");
   const auto read=storage.ReadSanitizedSummary(Value(handle),MaximumSummaryBytes);
-  if (!IsOk(read) || !Value(read).regular || Value(read).reparse || Value(read).identity != Value(handle).identity || Value(read).bytes.size() > MaximumSummaryBytes) return Fail("ReadSanitizedSummary");
+  if (!IsOk(read)) return StorageReadFailure(Failure(read),"ReadSanitizedSummary");
+  if (!Value(read).regular || Value(read).reparse || Value(read).identity != Value(handle).identity || Value(read).bytes.size() > MaximumSummaryBytes) return Fail("ReadSanitizedSummary");
   return SanitizeSummary(std::string_view(reinterpret_cast<const char*>(Value(read).bytes.data()),Value(read).bytes.size()));
 }
 }
@@ -504,11 +514,12 @@ Result<SupportBundle> CollectSupport(const SupportInputs& inputs, ISupportStorag
   if (!Value(summary).name.empty()) entries.push_back(std::get<BundleEntry>(std::move(summary)));
   bool truncated = inputs.runs.size() > MaximumRecords || inputs.events.size() > MaximumRecords - std::min(MaximumRecords,inputs.runs.size());
   const auto event_handle=storage.OpenRecentEvents();
-  if (!IsOk(event_handle)) return Fail("OpenRecentEvents");
+  if (!IsOk(event_handle)) return StorageReadFailure(Failure(event_handle),"OpenRecentEvents");
   if (Value(event_handle).identity != 0 || Value(event_handle).regular || Value(event_handle).reparse) {
     if (!Value(event_handle).regular || Value(event_handle).reparse) return Fail("OpenRecentEvents");
     const auto event_read=storage.ReadRecentEvents(Value(event_handle), MaximumEventLogBytes);
-    if (!IsOk(event_read) || !Value(event_read).regular || Value(event_read).reparse || Value(event_read).identity != Value(event_handle).identity) return Fail("ReadRecentEvents");
+    if (!IsOk(event_read)) return StorageReadFailure(Failure(event_read),"ReadRecentEvents");
+    if (!Value(event_read).regular || Value(event_read).reparse || Value(event_read).identity != Value(event_handle).identity) return Fail("ReadRecentEvents");
     truncated = truncated || Value(event_read).truncated;
     const auto& bytes = Value(event_read).bytes;
     std::string_view text(reinterpret_cast<const char*>(bytes.data()),bytes.size());
