@@ -49,6 +49,13 @@ TEST("configuration.defaults_are_exact") {
   CHECK(config.observation_seconds == 30);
 }
 
+TEST("configuration.hardlinked_config_is_refused_before_parsing") {
+  ConfigFixture fixture;
+  fixture.Write(ValidConfig);
+  std::filesystem::create_hard_link(fixture.path / "exe" / "FrameGenFix.toml", fixture.path / "alias.toml");
+  REQUIRE_ERROR(wfg::LoadConfiguration(fixture.path / "exe", {}), wfg::ErrorCode::ConfigurationInvalid);
+}
+
 TEST("configuration.missing_file_uses_executable_relative_defaults") {
   ConfigFixture fixture;
   std::ofstream hostile(fixture.path / "hostile" / "FrameGenFix.toml");

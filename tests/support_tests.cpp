@@ -410,6 +410,20 @@ TEST("support.native_drive_alias_change_after_pin_refuses_without_host_mapping_c
     CHECK(fixture.ZipCount() == 0);
   }
 }
+TEST("support.native_live_producer_lease_blocks_collection_then_releases") {
+  NativeFixture fixture; fixture.Produce();
+  {
+    wfg::FileLogStorage producer(fixture.root / L"diagnostics");
+    REQUIRE_OK(producer.AppendEvent("{}",2,5));
+    wfg::WindowsSupportStorage collector(fixture.root);
+    REQUIRE_ERROR(collector.OpenSanitizedSummary(),wfg::ErrorCode::SupportBundleFailure);
+    CHECK(fixture.ZipCount()==0);
+  }
+  wfg::WindowsSupportStorage collector(fixture.root);
+  REQUIRE_OK(collector.OpenSanitizedSummary());
+  wfg::FileLogStorage producer(fixture.root / L"diagnostics");
+  REQUIRE_ERROR(producer.AppendEvent("{}",2,5),wfg::ErrorCode::DiagnosticFailure);
+}
 TEST("support.native_hardlinks_refuse_source_without_output") {
   NativeFixture fixture; fixture.Produce();
   CHECK(CreateHardLinkW((fixture.root / L"diagnostics" / L"extra-link").c_str(),(fixture.root / L"diagnostics" / L"last-run.json").c_str(),nullptr));

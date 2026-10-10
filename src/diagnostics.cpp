@@ -1,4 +1,5 @@
 #include "wfg/diagnostics.hpp"
+#include "local_storage_windows.hpp"
 
 #include <algorithm>
 #include <array>
@@ -416,80 +417,6 @@ std::uint32_t NativeError(const std::error_code& error) {
   return static_cast<std::uint32_t>(error.value());
 }
 
-Error FileError(std::string_view operation, const std::error_code& error) {
-  return DiagnosticError(operation, error ? std::optional<std::uint32_t>(NativeError(error)) : std::nullopt);
-}
-
-Result<Unit> ValidateStoragePath(const std::filesystem::path& path, bool file) {
-  std::error_code error;
-  const auto absolute = std::filesystem::absolute(path, error).lexically_normal();
-  if (error) return FileError("storage_path", error);
-  auto current = absolute.root_path();
-  for (const auto& component : absolute.relative_path()) {
-    current /= component;
-#ifdef _WIN32
-    const auto attributes = GetFileAttributesW(current.c_str());
-    if (attributes == INVALID_FILE_ATTRIBUTES) {
-      const auto native = GetLastError();
-      if (native == ERROR_FILE_NOT_FOUND || native == ERROR_PATH_NOT_FOUND) continue;
-      return DiagnosticError("storage_attributes", native);
-    }
-    if (attributes & FILE_ATTRIBUTE_REPARSE_POINT) return DiagnosticError("storage_reparse_refused");
-#endif
-    const auto status = std::filesystem::symlink_status(current, error);
-    if (error == std::errc::no_such_file_or_directory) { error.clear(); continue; }
-    if (error) return FileError("storage_status", error);
-    if (!std::filesystem::exists(status)) continue;
-    if (std::filesystem::is_symlink(status)) return DiagnosticError("storage_symlink_refused");
-    if (current != absolute || !file) {
-      if (!std::filesystem::is_directory(status)) return DiagnosticError("storage_directory_refused");
-    } else {
-      if (!std::filesystem::is_regular_file(status)) return DiagnosticError("storage_file_refused");
-      const auto links = std::filesystem::hard_link_count(current, error);
-      if (error) return FileError("storage_links", error);
-      if (links != 1) return DiagnosticError("storage_links_refused");
-    }
-  }
-  return Unit{};
-}
-
-class TemporarySummary {
-public:
-  explicit TemporarySummary(std::filesystem::path path) : path_(std::move(path)) {}
-  ~TemporarySummary() {
-    std::error_code error;
-    std::filesystem::remove(path_, error);
-  }
-private:
-  std::filesystem::path path_;
-};
-
-#ifdef _WIN32
-class StorageHandle {
-public:
-  explicit StorageHandle(HANDLE handle) : handle_(handle) {}
-  ~StorageHandle() { if (handle_ != INVALID_HANDLE_VALUE) CloseHandle(handle_); }
-  StorageHandle(const StorageHandle&) = delete;
-  StorageHandle& operator=(const StorageHandle&) = delete;
-  HANDLE get() const noexcept { return handle_; }
-private:
-  HANDLE handle_;
-};
-
-Result<Unit> WriteStorageBytes(HANDLE handle, std::string_view text) {
-  if (text.size() > std::numeric_limits<DWORD>::max()) return DiagnosticError("storage_too_large");
-  DWORD written = 0;
-  if (!WriteFile(handle, text.data(), static_cast<DWORD>(text.size()), &written, nullptr)) return DiagnosticError("storage_write", GetLastError());
-  if (written != text.size()) return DiagnosticError("storage_short_write");
-  return Unit{};
-}
-#endif
-
-std::filesystem::path EventPath(const std::filesystem::path& directory, std::uint32_t index) {
-  if (index == 0) return directory / "events.jsonl";
-  return directory / ("events." + std::to_string(index) + ".jsonl");
-}
-
 template <std::size_t N>
 void CopyFixed(std::array<char, N>& destination, std::uint8_t& length, std::string_view source, std::size_t maximum) noexcept {
   const auto count = std::min({source.size(), maximum, N});
@@ -585,134 +512,82 @@ Result<std::string> SerializeSummary(const DiagnosticRecord& record) {
   return std::move(writer).Take();
 }
 
-FileLogStorage::FileLogStorage(std::filesystem::path directory) : directory_(std::move(directory)) {}
-
+struct FileLogStorage::State {
+  std::vector<local_storage::NativeHandle> pins;
+  std::optional<std::wstring> volume;
+  local_storage::DirectoryLease lease;
+  bool Ensure(const std::filesystem::path& path) {
+    const auto current = local_storage::LocalVolumeRoot(path);
+    if (!current || (volume && *current != *volume)) { SetLastError(ERROR_NOT_SUPPORTED); return false; }
+    if (pins.empty()) {
+      volume = current;
+      // Only the product root and diagnostics leaf may be created.
+      const auto tail = path.filename() == L"diagnostics" && path.parent_path().filename() == L"WitcherFG" ? 2U : 1U;
+      if (!local_storage::PinDirectories(path, *volume, tail, pins, true)) { pins.clear(); return false; }
+    }
+    if (!local_storage::DirectoriesValid(pins)) return false;
+    if(!lease.Acquire(pins.back().get()))return false;
+    return true;
+  }
+  HANDLE directory() const { return pins.back().get(); }
+};
+FileLogStorage::FileLogStorage(std::filesystem::path directory) : state_(std::make_unique<State>()), directory_(std::move(directory)) {}
+FileLogStorage::~FileLogStorage() = default;
 const std::filesystem::path& FileLogStorage::directory() const noexcept { return directory_; }
 
-Result<Unit> FileLogStorage::AppendEvent(std::string_view json_line, std::uint32_t max_file_mib, std::uint32_t retained_files) {
-  const auto size_limit = static_cast<std::uintmax_t>(std::clamp(max_file_mib, 1U, 8U)) * 1024U * 1024U;
-  const auto retained = std::clamp(retained_files, 1U, 10U);
-  if (json_line.size() + 1 > size_limit) return DiagnosticError("event_too_large");
-  const auto directory_check = ValidateStoragePath(directory_, false);
-  if (!IsOk(directory_check)) return Failure(directory_check);
-  std::error_code error;
-  std::filesystem::create_directories(directory_, error);
-  if (error) return FileError("storage_directory", error);
-  for (std::uint32_t index = 0; index < 10; ++index) {
-    const auto checked = ValidateStoragePath(EventPath(directory_, index), true);
-    if (!IsOk(checked)) return Failure(checked);
+Result<Unit> FileLogStorage::AppendEvent(std::string_view line, std::uint32_t max_file_mib, std::uint32_t retained_files) {
+  const auto limit = static_cast<std::uint64_t>(std::clamp(max_file_mib,1U,8U))*1024U*1024U;
+  const auto retained = std::clamp(retained_files,1U,10U);
+  if (line.size()+1 > limit) return DiagnosticError("event_too_large");
+  if (!state_->Ensure(directory_)) return DiagnosticError("storage_local_or_writer_refused",GetLastError());
+  auto writer=local_storage::RelativeOpen(state_->directory(),L"events.jsonl",FILE_APPEND_DATA|FILE_READ_ATTRIBUTES|DELETE,FILE_SHARE_READ,3);
+  if(!writer||!local_storage::RegularSingleLink(writer.get()))return DiagnosticError("storage_file_refused",GetLastError());
+  const auto name=[](unsigned i){return i ? L"events."+std::to_wstring(i)+L".jsonl" : std::wstring(L"events.jsonl");};
+  std::array<local_storage::NativeHandle,10> files;
+  std::array<BY_HANDLE_FILE_INFORMATION,10> info{};
+  if (!local_storage::RegularSingleLink(writer.get(), &info[0])) return DiagnosticError("storage_file_info",GetLastError());
+  for (unsigned i=1;i<10;++i) {
+    files[i]=local_storage::RelativeOpen(state_->directory(),name(i),FILE_READ_ATTRIBUTES|DELETE,FILE_SHARE_READ,1);
+    if (!files[i] && GetLastError()!=ERROR_FILE_NOT_FOUND) return DiagnosticError("storage_open",GetLastError());
+    if (files[i] && !local_storage::RegularSingleLink(files[i].get(),&info[i])) return DiagnosticError("storage_file_refused",GetLastError());
   }
-  for (std::uint32_t index = retained; index < 10; ++index) {
-    std::filesystem::remove(EventPath(directory_, index), error);
-    if (error) return FileError("storage_prune", error);
+  const auto size=[&](unsigned i){return (static_cast<std::uint64_t>(info[i].nFileSizeHigh)<<32U)|info[i].nFileSizeLow;};
+  for (unsigned i=1;i<10;++i) if(files[i]&&(i>=retained||size(i)>limit)) {
+    if(!local_storage::DeleteFileHandle(files[i].get()))return DiagnosticError("storage_prune",GetLastError()); files[i]={};
   }
-  for (std::uint32_t index = 0; index < retained; ++index) {
-    const auto path = EventPath(directory_, index);
-    if (!std::filesystem::exists(path, error)) {
-      if (error) return FileError("storage_stat", error);
-      continue;
-    }
-    const auto size = std::filesystem::file_size(path, error);
-    if (error) return FileError("storage_stat", error);
-    if (size > size_limit) {
-      std::filesystem::remove(path, error);
-      if (error) return FileError("storage_prune", error);
-    }
-  }
-  const auto current = EventPath(directory_, 0);
-  const bool exists = std::filesystem::exists(current, error);
-  if (error) return FileError("storage_stat", error);
-  std::uintmax_t current_size = 0;
-  if (exists) {
-    current_size = std::filesystem::file_size(current, error);
-    if (error) return FileError("storage_stat", error);
-  }
-  if (current_size + json_line.size() + 1 > size_limit) {
-    if (retained == 1) {
-      std::filesystem::remove(current, error);
-      if (error) return FileError("storage_rotate", error);
+  if (size(0)+line.size()+1 > limit) {
+    if(size(0)>limit||retained==1) {
+      if(!local_storage::DeleteFileHandle(writer.get()))return DiagnosticError("storage_rotate",GetLastError());
     } else {
-      for (std::uint32_t index = retained - 1; index > 0; --index) {
-        const auto from = EventPath(directory_, index - 1);
-        const auto to = EventPath(directory_, index);
-        error.clear();
-        std::filesystem::remove(to, error);
-        if (error) return FileError("storage_rotate", error);
-        error.clear();
-        if (std::filesystem::exists(from, error)) {
-          if (error) return FileError("storage_rotate", error);
-          std::filesystem::rename(from, to, error);
-          if (error) return FileError("storage_rotate", error);
-        } else if (error) return FileError("storage_rotate", error);
+      for(unsigned i=retained-1;i>0;--i) {
+        if(files[i]) {if(!local_storage::DeleteFileHandle(files[i].get()))return DiagnosticError("storage_rotate",GetLastError());files[i]={};}
+        HANDLE from = i==1 ? writer.get() : files[i-1].get();
+        if(from!=INVALID_HANDLE_VALUE&&!local_storage::RenameWithin(from,state_->directory(),name(i),false)) return DiagnosticError("storage_rotate",GetLastError());
+        if(i>1)files[i-1]={};
       }
     }
+    writer={};
+    writer=local_storage::RelativeOpen(state_->directory(),L"events.jsonl",FILE_APPEND_DATA|FILE_READ_ATTRIBUTES|DELETE,FILE_SHARE_READ,2);
+    if(!writer)return DiagnosticError("storage_open",GetLastError());
   }
-#ifdef _WIN32
-  StorageHandle output(CreateFileW(current.c_str(), FILE_APPEND_DATA | FILE_READ_ATTRIBUTES, FILE_SHARE_READ, nullptr, OPEN_ALWAYS,
-                                  FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
-  if (output.get() == INVALID_HANDLE_VALUE) return DiagnosticError("storage_open", GetLastError());
-  BY_HANDLE_FILE_INFORMATION information{};
-  if (!GetFileInformationByHandle(output.get(), &information)) return DiagnosticError("storage_file_info", GetLastError());
-  if ((information.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)) || information.nNumberOfLinks != 1) return DiagnosticError("storage_file_refused");
-  const auto written = WriteStorageBytes(output.get(), json_line);
-  if (!IsOk(written)) return Failure(written);
-  const auto newline = WriteStorageBytes(output.get(), "\n");
-  if (!IsOk(newline)) return Failure(newline);
-  if (!FlushFileBuffers(output.get())) return DiagnosticError("storage_flush", GetLastError());
-#else
-  std::ofstream output(current, std::ios::binary | std::ios::app);
-  if (!output) return DiagnosticError("storage_open");
-  output.write(json_line.data(), static_cast<std::streamsize>(json_line.size()));
-  output.put('\n');
-  output.flush();
-  if (!output) return DiagnosticError("storage_write");
-#endif
+  if(!local_storage::WriteBytes(writer.get(),line)||!local_storage::WriteBytes(writer.get(),"\n"))return DiagnosticError("storage_write",GetLastError());
   return Unit{};
 }
-
 Result<Unit> FileLogStorage::WriteSummaryAtomically(std::string_view json) {
-  if (json.size() > MaxSummaryBytes) return DiagnosticError("summary_too_large");
-  const auto directory_check = ValidateStoragePath(directory_, false);
-  if (!IsOk(directory_check)) return Failure(directory_check);
-  std::error_code error;
-  std::filesystem::create_directories(directory_, error);
-  if (error) return FileError("summary_directory", error);
-  const auto temporary = directory_ / "last-run.json.tmp";
-  const auto destination = directory_ / "last-run.json";
-  for (const auto& path : {temporary, destination}) {
-    const auto checked = ValidateStoragePath(path, true);
-    if (!IsOk(checked)) return Failure(checked);
-  }
-#ifdef _WIN32
-  const auto handle = CreateFileW(temporary.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
-  if (handle == INVALID_HANDLE_VALUE) return DiagnosticError("summary_open", GetLastError());
-  TemporarySummary cleanup(temporary);
-  {
-    StorageHandle output(handle);
-    const auto written = WriteStorageBytes(output.get(), json);
-    if (!IsOk(written)) return Failure(written);
-    if (!FlushFileBuffers(output.get())) return DiagnosticError("summary_flush", GetLastError());
-  }
-#else
-  if (std::filesystem::exists(temporary, error)) return DiagnosticError("summary_temporary_exists");
-  if (error) return FileError("summary_temporary_status", error);
-  TemporarySummary cleanup(temporary);
-  {
-    std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
-    if (!output) return DiagnosticError("summary_open");
-    output.write(json.data(), static_cast<std::streamsize>(json.size()));
-    output.flush();
-    if (!output) return DiagnosticError("summary_write");
-  }
-#endif
-#ifdef _WIN32
-  if (!MoveFileExW(temporary.c_str(), destination.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-    return DiagnosticError("summary_replace", GetLastError());
-  }
-#else
-  std::filesystem::rename(temporary, destination, error);
-  if (error) return FileError("summary_replace", error);
-#endif
+  if(json.size()>MaxSummaryBytes)return DiagnosticError("summary_too_large");
+  if(!state_->Ensure(directory_))return DiagnosticError("storage_local_or_writer_refused",GetLastError());
+  // Hold any existing destination against replacement/deletion while validating it.
+  auto destination=local_storage::RelativeOpen(state_->directory(),L"last-run.json",FILE_READ_ATTRIBUTES,FILE_SHARE_READ|FILE_SHARE_DELETE,1);
+  if(!destination&&GetLastError()!=ERROR_FILE_NOT_FOUND)return DiagnosticError("summary_destination",GetLastError());
+  if(destination&&!local_storage::RegularSingleLink(destination.get()))return DiagnosticError("storage_file_refused",GetLastError());
+  auto temporary=local_storage::RelativeOpen(state_->directory(),L"last-run.json.tmp",GENERIC_WRITE|DELETE|FILE_READ_ATTRIBUTES,0,2);
+  if(!temporary)return DiagnosticError("summary_open",GetLastError());
+  const auto fail=[&](){const auto error=GetLastError();local_storage::DeleteFileHandle(temporary.get());return DiagnosticError("summary_write",error);};
+  if(!local_storage::RegularSingleLink(temporary.get())||!local_storage::WriteBytes(temporary.get(),json)||!FlushFileBuffers(temporary.get()))return fail();
+  // Native rename replaces a directory entry, never follows the destination.
+  // An open destination prevents replacement on Windows even with delete sharing.
+  destination = {};
+  if(!state_->Ensure(directory_)||!local_storage::RenameWithin(temporary.get(),state_->directory(),L"last-run.json",true))return fail();
   return Unit{};
 }
 
@@ -722,18 +597,9 @@ void FileLogStorage::WriteConsoleLine(std::string_view text) {
 }
 
 Result<std::filesystem::path> LocalAppDataDiagnosticsDirectory() {
-#ifdef _WIN32
-  std::array<wchar_t, 32768> buffer{};
-  const auto length = GetEnvironmentVariableW(L"LOCALAPPDATA", buffer.data(), static_cast<DWORD>(buffer.size()));
-  if (length == 0 || length >= buffer.size()) return DiagnosticError("local_app_data_unavailable");
-  const std::filesystem::path root(std::wstring_view(buffer.data(), length));
-#else
-  const auto* value = std::getenv("LOCALAPPDATA");
-  if (!value || *value == '\0') return DiagnosticError("local_app_data_unavailable");
-  const std::filesystem::path root(value);
-#endif
-  if (!root.is_absolute()) return DiagnosticError("local_app_data_relative");
-  return root / "WitcherFG" / "diagnostics";
+  const auto root=local_storage::LocalAppDataCandidate();
+  if(!root)return DiagnosticError("local_app_data_unavailable");
+  return *root / L"WitcherFG" / L"diagnostics";
 }
 
 RunLogger::RunLogger(const EffectiveConfig& config, ILogStorage& storage) noexcept : config_(config), storage_(storage) {}

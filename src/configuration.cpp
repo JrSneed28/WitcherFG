@@ -1,4 +1,5 @@
 #include "wfg/configuration.hpp"
+#include "local_storage_windows.hpp"
 
 #include "../third_party/tomlplusplus/toml.hpp"
 
@@ -134,19 +135,23 @@ Result<CommandLine> ParseOptions(std::span<const std::string_view> arguments) {
 
 Result<EffectiveConfig> LoadConfiguration(const std::filesystem::path& exe_dir, const CommandLine& command_line) {
   auto config = DefaultConfiguration();
-  const auto config_path = exe_dir / "FrameGenFix.toml";
-  std::error_code file_error;
-  const auto file_status = std::filesystem::status(config_path, file_error);
-  if (file_error && file_error != std::errc::no_such_file_or_directory) return InvalidConfig("config_file_unavailable");
-  if (!file_error && std::filesystem::exists(file_status)) {
-    if (!std::filesystem::is_regular_file(file_status)) return InvalidConfig("config_file_not_regular");
-    const auto size = std::filesystem::file_size(config_path, file_error);
-    if (file_error || size > MaxConfigBytes) return InvalidConfig("config_file_too_large_or_unavailable");
-    std::ifstream input(config_path, std::ios::binary);
-    if (!input) return InvalidConfig("config_file_unavailable");
+  const auto volume = local_storage::LocalVolumeRoot(exe_dir);
+  if (!volume) return InvalidConfig("config_local_storage_required");
+  std::vector<local_storage::NativeHandle> pins;
+  if (!local_storage::PinDirectories(exe_dir, *volume, 0, pins)) return InvalidConfig("config_directory_unavailable");
+  auto input = local_storage::RelativeOpen(pins.back().get(), L"FrameGenFix.toml", GENERIC_READ, FILE_SHARE_READ, 1);
+  if (!input && GetLastError() != ERROR_FILE_NOT_FOUND) return InvalidConfig("config_file_unavailable");
+  if (input) {
+    BY_HANDLE_FILE_INFORMATION before{}, after{};
+    if (!local_storage::RegularSingleLink(input.get(), &before)) return InvalidConfig("config_file_not_regular");
+    const auto size = (static_cast<std::uint64_t>(before.nFileSizeHigh) << 32U) | before.nFileSizeLow;
+    if (size > MaxConfigBytes) return InvalidConfig("config_file_too_large_or_unavailable");
     std::string contents(static_cast<std::size_t>(size), '\0');
-    input.read(contents.data(), static_cast<std::streamsize>(contents.size()));
-    if (input.gcount() != static_cast<std::streamsize>(contents.size())) return InvalidConfig("config_file_read_failed");
+    DWORD read{};
+    if (!ReadFile(input.get(), contents.data(), static_cast<DWORD>(size), &read, nullptr) || read != size ||
+        !local_storage::RegularSingleLink(input.get(), &after) || !local_storage::Same(before, after) ||
+        local_storage::LocalVolumeRoot(exe_dir) != volume || !local_storage::DirectoriesValid(pins))
+      return InvalidConfig("config_file_read_failed");
     try {
       const auto document = toml::parse(contents);
       if (!ApplyFile(document, config)) return InvalidConfig("config_schema_invalid");

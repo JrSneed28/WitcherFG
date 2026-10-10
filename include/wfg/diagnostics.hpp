@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -88,11 +89,14 @@ public:
 class FileLogStorage final : public ILogStorage {
 public:
   explicit FileLogStorage(std::filesystem::path directory);
+  ~FileLogStorage() override;
   Result<Unit> AppendEvent(std::string_view json_line, std::uint32_t max_file_mib, std::uint32_t retained_files) override;
   Result<Unit> WriteSummaryAtomically(std::string_view json) override;
   void WriteConsoleLine(std::string_view text) override;
   [[nodiscard]] const std::filesystem::path& directory() const noexcept;
 private:
+  struct State;
+  std::unique_ptr<State> state_;
   std::filesystem::path directory_;
 };
 

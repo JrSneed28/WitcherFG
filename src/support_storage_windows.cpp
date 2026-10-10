@@ -1,4 +1,5 @@
 #include "wfg/support_storage_windows.hpp"
+#include "local_storage_windows.hpp"
 
 #include <algorithm>
 #include <array>
@@ -22,52 +23,16 @@ Error StorageError(std::string_view operation) {
 #endif
 }
 #ifdef _WIN32
-class NativeHandle {
-public:
-  explicit NativeHandle(HANDLE value = INVALID_HANDLE_VALUE) : value_(value) {}
-  ~NativeHandle() { if (value_ != INVALID_HANDLE_VALUE) CloseHandle(value_); }
-  NativeHandle(NativeHandle&& other) noexcept : value_(std::exchange(other.value_, INVALID_HANDLE_VALUE)) {}
-  NativeHandle& operator=(NativeHandle&& other) noexcept {
-    if (this != &other) { if (value_ != INVALID_HANDLE_VALUE) CloseHandle(value_); value_ = std::exchange(other.value_, INVALID_HANDLE_VALUE); }
-    return *this;
-  }
-  HANDLE get() const { return value_; }
-  explicit operator bool() const { return value_ != INVALID_HANDLE_VALUE; }
-private:
-  HANDLE value_;
-};
-bool Same(const BY_HANDLE_FILE_INFORMATION& first, const BY_HANDLE_FILE_INFORMATION& second) {
-  return first.dwVolumeSerialNumber == second.dwVolumeSerialNumber && first.nFileIndexHigh == second.nFileIndexHigh &&
-         first.nFileIndexLow == second.nFileIndexLow && first.nNumberOfLinks == second.nNumberOfLinks &&
-         first.nFileSizeHigh == second.nFileSizeHigh && first.nFileSizeLow == second.nFileSizeLow &&
-         first.ftLastWriteTime.dwHighDateTime == second.ftLastWriteTime.dwHighDateTime &&
-         first.ftLastWriteTime.dwLowDateTime == second.ftLastWriteTime.dwLowDateTime;
-}
+using local_storage::NativeHandle;
+using local_storage::RelativeOpen;
+using local_storage::Same;
 struct SourceFile {
   NativeHandle handle;
   BY_HANDLE_FILE_INFORMATION identity{};
   std::filesystem::path path;
   HANDLE directory{};
 };
-NativeHandle RelativeOpen(HANDLE directory, std::wstring_view name, ACCESS_MASK access, ULONG sharing, ULONG disposition, bool is_directory = false) {
-  using OpenFunction = NTSTATUS (NTAPI*)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PIO_STATUS_BLOCK, PLARGE_INTEGER, ULONG, ULONG, ULONG, ULONG, PVOID, ULONG);
-  using ErrorFunction = ULONG (WINAPI*)(NTSTATUS);
-  const auto module = GetModuleHandleW(L"ntdll.dll");
-  const auto open = reinterpret_cast<OpenFunction>(GetProcAddress(module,"NtCreateFile"));
-  const auto error = reinterpret_cast<ErrorFunction>(GetProcAddress(module,"RtlNtStatusToDosError"));
-  if (!open || !error || name.empty() || name.size() > 120) { SetLastError(ERROR_INVALID_PARAMETER); return NativeHandle{}; }
-  UNICODE_STRING text{};
-  text.Buffer = const_cast<PWSTR>(name.data());
-  text.Length = static_cast<USHORT>(name.size() * sizeof(wchar_t)); text.MaximumLength = text.Length;
-  OBJECT_ATTRIBUTES attributes{};
-  attributes.Length = sizeof(attributes); attributes.RootDirectory = directory; attributes.ObjectName = &text;
-  attributes.Attributes = 0x40U | 0x1000U;
-  IO_STATUS_BLOCK status{}; HANDLE handle{};
-  const auto result = open(&handle,access | SYNCHRONIZE,&attributes,&status,nullptr,FILE_ATTRIBUTE_NORMAL,sharing,disposition,
-      (is_directory ? 0x1U : 0x40U) | 0x20U | 0x00200000U,nullptr,0);
-  if (result < 0) { SetLastError(error(result)); return NativeHandle{}; }
-  return NativeHandle(handle);
-}
+
 #endif
 }
 
@@ -81,6 +46,7 @@ struct WindowsSupportStorage::State {
   std::map<std::uint64_t, std::vector<SourceFile>> sources;
   std::uint64_t next_token{1};
   bool pinned{};
+  local_storage::DirectoryLease diagnostics_lease;
   bool locality_refused{};
   std::wstring local_volume_root;
   HANDLE root_directory{INVALID_HANDLE_VALUE}, diagnostics_directory{INVALID_HANDLE_VALUE}, support_directory{INVALID_HANDLE_VALUE};
@@ -115,13 +81,11 @@ struct WindowsSupportStorage::State {
       if (count == 0 || count >= targets.size()) return refuse();
       device = targets.data();
     }
-    constexpr std::wstring_view prefix = L"\\Device\\HarddiskVolume";
-    if (!device.starts_with(prefix) || device.size() == prefix.size() ||
-        !std::all_of(device.begin() + prefix.size(),device.end(),[](wchar_t digit) { return digit >= L'0' && digit <= L'9'; })) return refuse();
-    // Open the captured physical volume, rather than following the drive alias
-    // again after classification. Caller-supplied device namespaces are refused.
-    return std::wstring(L"\\\\?\\GLOBALROOT") + device + L"\\";
+    const auto volume = local_storage::ClassifyLocalVolume(root,type,device);
+    if(!volume)return refuse();
+    return volume;
   }
+
   bool DirectoriesValid() {
     if (!pinned || !PinRoot()) return false;
     for (const auto& handle : directories) {
@@ -139,30 +103,11 @@ struct WindowsSupportStorage::State {
       return true;
     }
     local_volume_root = *volume;
-    auto current = root.root_path();
-    auto pin = [&](const std::filesystem::path& path, bool create) {
 #ifdef WFG_SUPPORT_TESTING
-      if (directories.empty()) {
-        ++test_owner->root_open_attempts;
-        if (test_owner->fail_before_root_open) return false;
-      }
+    ++test_owner->root_open_attempts;
+    if(test_owner->fail_before_root_open)return false;
 #endif
-      NativeHandle handle = directories.empty() ?
-          NativeHandle(CreateFileW(local_volume_root.c_str(), FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY, FILE_SHARE_READ | FILE_SHARE_WRITE,
-              nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr)) :
-          RelativeOpen(directories.back().get(),path.filename().wstring(),FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY |
-              ((path == root.parent_path() || path == root) ? FILE_ADD_SUBDIRECTORY : 0U),FILE_SHARE_READ | FILE_SHARE_WRITE,create ? 3U : 1U,true);
-      BY_HANDLE_FILE_INFORMATION info{};
-      if (!handle || !GetFileInformationByHandle(handle.get(), &info) ||
-          (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0 || (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) return false;
-      directories.push_back(std::move(handle)); return true;
-    };
-    if (!pin(current, false)) return false;
-    for (const auto& part : root.relative_path()) {
-      if (part == L".." || part == L"." || part.empty()) return false;
-      current /= part;
-      if (!pin(current, current == root)) return false;
-    }
+    if(!local_storage::PinDirectories(root,local_volume_root,1,directories))return false;
     root_directory = directories.back().get();
     pinned = true; return true;
   }
@@ -174,7 +119,10 @@ struct WindowsSupportStorage::State {
     BY_HANDLE_FILE_INFORMATION info{};
     if (!GetFileInformationByHandle(handle.get(), &info) || (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0 ||
         (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) return false;
-    if (name == L"diagnostics") diagnostics_directory = handle.get();
+    if (name == L"diagnostics") {
+      if(!diagnostics_lease.Acquire(handle.get()))return false;
+      diagnostics_directory = handle.get();
+    }
     if (name == L"support") support_directory = handle.get();
     directories.push_back(std::move(handle)); return DirectoriesValid();
   }
@@ -349,21 +297,7 @@ Result<std::filesystem::path> WindowsSupportStorage::CommitArchiveAtomically(std
   if (fail_before_rename) return fail();
 #endif
   if (!state_->DirectoriesValid()) return fail();
-  const auto name = destination.filename().wstring();
-  std::vector<std::byte> buffer(sizeof(FILE_RENAME_INFO) + name.size() * sizeof(wchar_t));
-  auto* rename = reinterpret_cast<FILE_RENAME_INFO*>(buffer.data());
-  rename->ReplaceIfExists = FALSE; rename->RootDirectory = state_->support_directory;
-  rename->FileNameLength = static_cast<DWORD>(name.size() * sizeof(wchar_t));
-  std::memcpy(rename->FileName, name.data(), rename->FileNameLength);
-  using RenameFunction = NTSTATUS (NTAPI*)(HANDLE, PIO_STATUS_BLOCK, PVOID, ULONG, FILE_INFORMATION_CLASS);
-  using ErrorFunction = ULONG (WINAPI*)(NTSTATUS);
-  const auto module = GetModuleHandleW(L"ntdll.dll");
-  const auto rename_file = reinterpret_cast<RenameFunction>(GetProcAddress(module,"NtSetInformationFile"));
-  const auto native_error = reinterpret_cast<ErrorFunction>(GetProcAddress(module,"RtlNtStatusToDosError"));
-  if (!rename_file || !native_error) return fail();
-  IO_STATUS_BLOCK status{};
-  const auto renamed = rename_file(file.get(),&status,rename,static_cast<ULONG>(buffer.size()),static_cast<FILE_INFORMATION_CLASS>(10));
-  if (renamed < 0) { SetLastError(native_error(renamed)); return fail(); }
+  if(!local_storage::RenameWithin(file.get(),state_->support_directory,destination.filename().wstring(),false))return fail();
   state_->completed = destination;
   return destination;
 #else

@@ -99,6 +99,14 @@ void* operator new(std::size_t size) {
   if (void* memory = std::malloc(size)) return memory;
   throw std::bad_alloc();
 }
+
+TEST("diagnostics.concurrent_producer_is_refused_for_writer_lifetime") {
+  StorageFixture fixture;
+  wfg::FileLogStorage first(fixture.path / "diagnostics");
+  wfg::FileLogStorage second(fixture.path / "diagnostics");
+  REQUIRE_OK(first.AppendEvent("{}", 2, 5));
+  REQUIRE_ERROR(second.AppendEvent("{}", 2, 5), wfg::ErrorCode::DiagnosticFailure);
+}
 void* operator new[](std::size_t size) {
   if (track_allocations.load(std::memory_order_relaxed)) tracked_allocation_count.fetch_add(1, std::memory_order_relaxed);
   if (void* memory = std::malloc(size)) return memory;
@@ -463,6 +471,7 @@ TEST("diagnostics.storage_failure_falls_back_without_replacing_run_failure") {
 TEST("diagnostics.file_storage_rotates_to_configured_limits") {
   const auto directory = std::filesystem::temp_directory_path() / "wfg-diagnostics-rotation-tests";
   std::filesystem::remove_all(directory);
+  {
   wfg::FileLogStorage storage(directory);
   const std::string line(700 * 1024, 'x');
   CHECK(wfg::IsOk(storage.AppendEvent(line, 1, 2)));
@@ -481,6 +490,7 @@ TEST("diagnostics.file_storage_rotates_to_configured_limits") {
   std::ifstream summary_file(directory / "last-run.json", std::ios::binary);
   CHECK(std::string(std::istreambuf_iterator<char>(summary_file), {}) == summary);
   summary_file.close();
+  }
   std::filesystem::remove_all(directory);
 }
 
@@ -488,7 +498,9 @@ TEST("diagnostics.summary_replacement_publishes_complete_new_content") {
   StorageFixture fixture;
   wfg::FileLogStorage storage(fixture.path / "diagnostics");
   CHECK(wfg::IsOk(storage.WriteSummaryAtomically("{\"run\":1}")));
-  CHECK(wfg::IsOk(storage.WriteSummaryAtomically("{\"run\":2,\"complete\":true}")));
+  const auto replacement = storage.WriteSummaryAtomically("{\"run\":2,\"complete\":true}");
+  if (!wfg::IsOk(replacement)) std::cout << "SUMMARY_NATIVE=" << wfg::Failure(replacement).native_code.value_or(0) << '\n';
+  CHECK(wfg::IsOk(replacement));
   CHECK(StorageFixture::Read(fixture.path / "diagnostics" / "last-run.json") == "{\"run\":2,\"complete\":true}");
   CHECK(!std::filesystem::exists(fixture.path / "diagnostics" / "last-run.json.tmp"));
 }
@@ -613,8 +625,11 @@ TEST("diagnostics.windows_localappdata_resolution_is_absolute_and_available") {
   const auto relative = wfg::LocalAppDataDiagnosticsDirectory();
   CHECK(_wputenv_s(L"LOCALAPPDATA", previous.c_str()) == 0);
   CHECK(wfg::IsOk(resolved));
-  if (wfg::IsOk(resolved)) CHECK(wfg::Value(resolved) == fixture.path / L"WitcherFG" / L"diagnostics");
-  CHECK(!wfg::IsOk(missing));
-  CHECK(!wfg::IsOk(relative));
+  REQUIRE_OK(missing);
+  REQUIRE_OK(relative);
+  CHECK(wfg::Value(resolved).is_absolute());
+  CHECK(wfg::Value(resolved) == wfg::Value(missing));
+  CHECK(wfg::Value(resolved) == wfg::Value(relative));
+  CHECK(wfg::Value(resolved) != fixture.path / L"WitcherFG" / L"diagnostics");
 }
 #endif
