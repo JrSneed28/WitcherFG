@@ -560,3 +560,22 @@ TEST("support.native_real_producer_zip_for_independent_python") {
   }
 }
 #endif
+
+TEST("support.malformed_optional_runtime_is_refused_and_absent_remains_accepted") {
+  SupportFixture old;REQUIRE_OK(wfg::CollectSupport(Inputs(),old));
+  SupportFixture malformed;malformed.producer.summary.pop_back();malformed.producer.summary+=",\"runtime_observation\":{\"samples\":\"PRIVATE_SECRET\"}}";
+  CHECK(!wfg::IsOk(wfg::CollectSupport(Inputs(),malformed)));CHECK(malformed.commits==0);
+}
+TEST("support.native_optional_runtime_producer_roundtrip_is_sanitized") {
+  NativeFixture fixture;auto record=Record();record.runtime_observation.emplace();auto& runtime=*record.runtime_observation;
+  runtime.latest.requested_mode={std::nullopt,wfg::Availability::UnsupportedLayout,"read_only_runtime","No independently validated SDK diagnostic layout."};
+  runtime.latest.frame_id={UINT64_MAX,wfg::Availability::Observed,"read_only_runtime",""};runtime.samples=1;runtime.duration_ms=5000;
+  {wfg::FileLogStorage storage(fixture.root/L"diagnostics");wfg::RunLogger logger(record.effective_config,storage);REQUIRE_OK(logger.Finish(record));}
+  auto summary=ReadFileText(fixture.root/L"diagnostics"/L"last-run.json");
+  const auto position=summary.find("\"runtime_observation\":{");CHECK(position!=std::string::npos);
+  summary.insert(position+23,"\"unsupported_private_field\":\"PRIVATE_SECRET\",");
+  {std::ofstream output(fixture.root/L"diagnostics"/L"last-run.json",std::ios::binary);output<<summary;}
+  wfg::WindowsSupportStorage collector(fixture.root);const auto bundle=REQUIRE_OK(wfg::CollectSupport(Inputs(),collector));
+  const auto zip=ReadFileText(bundle.local_output);CHECK(zip.find("diagnostic_layout_unavailable")!=std::string::npos);
+  CHECK(zip.find("18446744073709551615")!=std::string::npos);CHECK(zip.find("PRIVATE_SECRET")==std::string::npos);CHECK(zip.find("unsupported_private_field")==std::string::npos);
+}

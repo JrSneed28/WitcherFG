@@ -1,4 +1,5 @@
 #include "wfg/diagnostics.hpp"
+#include "observation_diagnostic_tags.hpp"
 #include "local_storage_windows.hpp"
 
 #include <algorithm>
@@ -435,6 +436,39 @@ FailureInfo ExplainFailure(const Error& error) {
           error.native_code, std::nullopt, std::string(ActionFor(code))};
 }
 
+namespace {
+template<class T,class WriteValue> bool RuntimeField(JsonWriter& writer,std::string_view key,const Observed<T>& field,WriteValue write_value) {
+  if(!writer.String(key)||!writer.Raw(":{\"availability\":")||!writer.String(AvailabilityName(field.availability))||
+     !writer.Raw(",\"source\":")||!writer.String(diagnostic_detail::ObservationSource(field.source))||
+     !writer.Raw(",\"reason\":")||!writer.String(diagnostic_detail::ObservationReason(field.reason))||!writer.Raw(",\"value\":"))return false;
+  if(field.availability==Availability::Observed&&field.value) {if(!write_value(*field.value))return false;}
+  else if(!writer.Null())return false;
+  return writer.Raw("}");
+}
+bool WriteRuntime(JsonWriter& writer,const RuntimeDiagnosticRecord& record) {
+  if(record.samples>121||record.duration_ms>122000)return false;
+  const auto& sample=record.latest;
+  if(!writer.Raw("{\"samples\":")||!writer.Number(record.samples)||!writer.Raw(",\"duration_ms\":")||!writer.Number(record.duration_ms)||
+     !writer.Raw(",\"cancelled\":")||!writer.Boolean(record.cancelled)||!writer.Raw(",\"process_lost\":")||!writer.Boolean(record.process_lost)||
+     !writer.Raw(",\"acquisition_overran\":")||!writer.Boolean(record.acquisition_overran)||!writer.Raw(",\"activity\":"))return false;
+  constexpr std::array names{"unknown","off_expected","rejection_observed","activity_observed","not_observed_in_window"};
+  const auto activity=static_cast<std::size_t>(record.activity);
+  if(activity>=names.size()||!writer.String(names[activity])||!writer.Raw(","))return false;
+  if(!RuntimeField(writer,"requested_mode",sample.requested_mode,[&](auto value){return (value==RequestedFgMode::On||value==RequestedFgMode::Off)&&writer.String(value==RequestedFgMode::On?"on":"off");}))return false;
+  if(!writer.Raw(",")||!RuntimeField(writer,"requested_count",sample.requested_count,[&](auto value){return writer.Number(value);}))return false;
+  if(!writer.Raw(",")||!RuntimeField(writer,"sdk_status",sample.sdk_status,[&](auto value){return writer.Number(value);}))return false;
+  if(!writer.Raw(",")||!RuntimeField(writer,"sdk_code",sample.sdk_code,[&](auto value){return writer.Number(value);}))return false;
+  if(!writer.Raw(",")||!RuntimeField(writer,"frame_id",sample.frame_id,[&](auto value){return writer.Number(value);}))return false;
+  if(!writer.Raw(",")||!RuntimeField(writer,"actual_presentations",sample.actual_presentations,[&](auto value){return writer.Number(value);}))return false;
+  if(!writer.Raw(",")||!RuntimeField(writer,"generation_active",sample.generation_active,[&](bool value){return writer.Boolean(value);}))return false;
+  if(!writer.Raw(",")||!RuntimeField(writer,"factory_created",sample.factory_created,[&](bool value){return writer.Boolean(value);}))return false;
+  if(!writer.Raw(",")||!RuntimeField(writer,"factory_proxy",sample.factory_proxy,[&](bool value){return writer.Boolean(value);}))return false;
+  if(!writer.Raw(",")||!RuntimeField(writer,"swap_chain_intercepted",sample.swap_chain_intercepted,[&](bool value){return writer.Boolean(value);}))return false;
+  if(!writer.Raw(",")||!RuntimeField(writer,"decoded_rejection",sample.decoded_rejection,[&](const SdkRejection& value){return writer.Number(value.code);}))return false;
+  if(!writer.Raw(",")||!RuntimeField(writer,"import_routing",record.import_routing,[&](auto value){return (value==Routing::Native||value==Routing::AlreadyPresent)&&writer.String(value==Routing::Native?"native":"already_present");}))return false;
+  return writer.Raw("}");
+}
+}
 Result<std::string> SerializeSummary(const DiagnosticRecord& record) {
   JsonWriter writer(MaxSummaryBytes);
   const auto& config = record.effective_config;
@@ -482,6 +516,7 @@ Result<std::string> SerializeSummary(const DiagnosticRecord& record) {
       !writer.Raw(",\"interposer_signature_valid\":" ) || !WriteObserved(writer, record.interposer_signature_valid, [&](bool value) { return writer.Boolean(value); }) ||
       !writer.Raw(",\"loaded_plugin\":" ) || !WriteObserved(writer, record.loaded_plugin, [&](bool value) { return writer.Boolean(value); }) ||
       !writer.Raw("}")) return DiagnosticError("summary_dependencies");
+  if(record.runtime_observation&&(!writer.Raw(",\"runtime_observation\":")||!WriteRuntime(writer,*record.runtime_observation)))return DiagnosticError("summary_runtime_observation");
   if (!writer.Raw(",\"hook_state\":" ) || !writer.String(HookName(record.hook_state))) return DiagnosticError("summary_hook_state");
   if (!writer.Raw(",\"frame_generation\":" ) || !writer.String(FgName(record.frame_generation, record.decoded_rejection_code.has_value()))) return DiagnosticError("summary_frame_generation");
   if (!writer.Raw(",\"decoded_rejection_code\":" ) ||

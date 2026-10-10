@@ -113,6 +113,8 @@ public:
   DeadlineWatchdog& operator=(const DeadlineWatchdog&) = delete;
   void Disarm();
 private:
+  struct State;
+  std::unique_ptr<State> state_;
   std::jthread thread_;
 };
 

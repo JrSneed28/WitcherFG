@@ -3,6 +3,7 @@
 #include "wfg/build_info.hpp"
 #include "wfg/configuration.hpp"
 #include "wfg/core.hpp"
+#include "wfg/runtime_observation.hpp"
 
 #include <array>
 #include <chrono>
@@ -58,6 +59,15 @@ struct FailureInfo {
   std::string action;
 };
 
+struct RuntimeDiagnosticRecord {
+  RuntimeSample latest;
+  Observed<Routing> import_routing;
+  std::uint32_t samples{};
+  std::uint64_t duration_ms{};
+  bool cancelled{}, process_lost{}, acquisition_overran{};
+  ActivityAssessment activity{ActivityAssessment::Unknown};
+};
+
 struct DiagnosticRecord {
   BuildIdentity build{kEmbeddedBuildIdentity};
   EffectiveConfig effective_config{DefaultConfiguration()};
@@ -75,6 +85,7 @@ struct DiagnosticRecord {
   RunOutcome outcome{RunOutcome::NotStarted};
   SafetyDisposition safety{SafetyDisposition::Unverified};
   std::uint64_t elapsed_ms{};
+  std::optional<RuntimeDiagnosticRecord> runtime_observation;
   std::optional<FailureInfo> failure;
 };
 

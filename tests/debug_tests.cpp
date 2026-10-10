@@ -1,4 +1,5 @@
 #include "support.hpp"
+#include "fixtures/worker_allocation_probe.hpp"
 #include "fixtures/verified_identity.hpp"
 #include "wfg/debug_session.hpp"
 
@@ -352,4 +353,36 @@ TEST("debug.watchdog_grace_is_measured_from_request_not_worker_wakeup") {
   CHECK(backend.Await(2));
   {std::lock_guard lock(backend.mutex_);CHECK(backend.deadlines[1]<=requested+std::chrono::seconds(2));}
   watchdog.Disarm();
+}
+
+TEST("debug.watchdog_worker_does_not_allocate_even_when_start_is_delayed") {
+  class FixedBackend final:public IWatchdogBackend {
+  public:
+    std::atomic<bool> entered{};
+    bool WaitUntil(Deadline,std::stop_token stop)override {
+      entered.store(true);
+      while(!stop.stop_requested())std::this_thread::yield();
+      return false;
+    }
+    void ExitHelper()noexcept override {}
+  } backend;
+  std::stop_source cancellation,external;
+  worker_allocation_probe::owner=std::this_thread::get_id();worker_allocation_probe::count=0;
+  worker_allocation_probe::enabled.store(true,std::memory_order_release);
+  {
+    DeadlineWatchdog watchdog({std::chrono::steady_clock::now()+std::chrono::seconds(60)},cancellation,backend,external.get_token());
+    while(!backend.entered.load())std::this_thread::yield();
+    watchdog.Disarm();
+  }
+  worker_allocation_probe::enabled.store(false,std::memory_order_release);
+  CHECK(worker_allocation_probe::count.load()==0);
+}
+
+TEST("debug.watchdog_already_requested_token_cancels_promptly") {
+  std::stop_source cancellation,external;external.request_stop();WatchdogFixture backend(cancellation);
+  const auto before=std::chrono::steady_clock::now();
+  DeadlineWatchdog watchdog({before+std::chrono::seconds(60)},cancellation,backend,external.get_token());
+  CHECK(backend.Await(2));CHECK(cancellation.stop_requested());
+  {std::lock_guard lock(backend.mutex_);CHECK(backend.deadlines[1]<before+std::chrono::seconds(3));}
+  watchdog.Disarm();CHECK(backend.exits==0);
 }

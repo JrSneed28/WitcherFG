@@ -439,6 +439,21 @@ IWatchdogBackend& SystemWatchdog() {
   return backend;
 }
 }
+struct DeadlineWatchdog::State {
+  using Clock=std::chrono::steady_clock;
+  static constexpr auto Unset=std::numeric_limits<Clock::rep>::max();
+  std::stop_source wake;
+  std::atomic<Clock::rep> requested_at{Unset};
+  struct Cancel {
+    State* state;
+    void operator()()const noexcept {
+      state->requested_at.store(Clock::now().time_since_epoch().count());
+      state->wake.request_stop();
+    }
+  };
+  std::stop_callback<Cancel> on_cancel;
+  explicit State(std::stop_token external):on_cancel(external,Cancel{this}){}
+};
 DeadlineWatchdog::DeadlineWatchdog(Deadline deadline, std::stop_source& cancellation)
     : DeadlineWatchdog(deadline,cancellation,SystemWatchdog(),{}) {}
 DeadlineWatchdog::DeadlineWatchdog(Deadline deadline, std::stop_source& cancellation,IWatchdogBackend& backend)
@@ -446,21 +461,16 @@ DeadlineWatchdog::DeadlineWatchdog(Deadline deadline, std::stop_source& cancella
 DeadlineWatchdog::DeadlineWatchdog(Deadline deadline, std::stop_source& cancellation, std::stop_token external)
     : DeadlineWatchdog(deadline, cancellation, SystemWatchdog(), external) {}
 DeadlineWatchdog::DeadlineWatchdog(Deadline deadline, std::stop_source& cancellation, IWatchdogBackend& backend, std::stop_token external)
-    : thread_([deadline, &cancellation, &backend, external](std::stop_token disarmed) {
-        std::stop_source wake;
-        using Clock=std::chrono::steady_clock;
-        constexpr auto unset=std::numeric_limits<Clock::rep>::max();
-        std::atomic<Clock::rep> requested_at{unset};
-        std::stop_callback on_disarm(disarmed,[&] { wake.request_stop(); });
-        std::stop_callback on_cancel(external,[&] {
-          requested_at.store(Clock::now().time_since_epoch().count());
-          wake.request_stop();
-        });
-        const bool expired=backend.WaitUntil(deadline,wake.get_token());
-        if(disarmed.stop_requested() || (!expired && !external.stop_requested()))return;
+    : state_(std::make_unique<State>(external)),
+      thread_([deadline, &cancellation, &backend, state=state_.get()](std::stop_token disarmed) {
+        // The stop state and external callback are fully constructed on the
+        // caller before this worker can overlap an unsafe transaction interval.
+        std::stop_callback on_disarm(disarmed,[&] { state->wake.request_stop(); });
+        const bool expired=backend.WaitUntil(deadline,state->wake.get_token());
+        const auto request=state->requested_at.load();
+        if(disarmed.stop_requested() || (!expired && request==State::Unset))return;
         auto cleanup=deadline.value+std::chrono::seconds(2);
-        const auto request=requested_at.load();
-        if(request!=unset)cleanup=std::min(cleanup,Clock::time_point(Clock::duration(request))+std::chrono::seconds(2));
+        if(request!=State::Unset)cleanup=std::min(cleanup,State::Clock::time_point(State::Clock::duration(request))+std::chrono::seconds(2));
         cancellation.request_stop();
         if(backend.WaitUntil({cleanup},disarmed) && !disarmed.stop_requested())backend.ExitHelper();
       }) {}

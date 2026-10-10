@@ -1,4 +1,5 @@
 #include "wfg/support_bundle.hpp"
+#include "observation_diagnostic_tags.hpp"
 
 #include <algorithm>
 #include <array>
@@ -208,7 +209,18 @@ std::string_view SafeOperation(std::string_view value) {
       "fingerprint_read","fingerprint_hash","factory_read","manager_read","mixed_routing","application_local_loader",
       "transaction_routing","transaction_stop","factory_created","pointer_verification","protection_verification",
       "restore_previous_protection","diagnostic_layout_unavailable","observation_creation_changed",
-      "observation_process_not_current","diagnostic_io","invalid_operation"}) ? value : "redacted";
+      "observation_process_not_current","diagnostic_io","invalid_operation",
+      "config_local_storage_required","config_directory_unavailable","config_file_unavailable","config_file_not_regular",
+      "config_file_too_large_or_unavailable","config_file_read_failed","config_schema_invalid","config_syntax_invalid",
+      "unknown_argument","conflicting_modes","invalid_log_level_option","invalid_log_level",
+      "storage_local_or_writer_refused","storage_file_refused","storage_file_info","storage_open","storage_prune",
+      "storage_rotate","storage_write","summary_destination","summary_open","summary_write","local_app_data_unavailable",
+      "launcher_deadline","launcher_exception","executable_directory","transaction_failed","configuration_completed",
+      "package_discovery_entered","package_discovery_completed","activation_entered","activation_completed",
+      "process_identity_entered","process_identity_completed","debug_attach_entered","debug_attach_completed",
+      "dependencies_entered","dependencies_completed","build_validation_entered","build_validation_completed",
+      "pre_factory_guard_entered","pre_factory_guard_completed","import_transaction_entered",
+      "detach_entered","detach_completed","runtime_observation_entered","runtime_observation_completed"}) ? value : "redacted";
 }
 
 bool Version(std::string_view value) {
@@ -276,6 +288,34 @@ bool ObservedJson(const JsonValue& parent, std::string_view key, std::string& ou
   output = "{\"availability\":" + JsonString(availability->string) + ",\"source\":" + JsonString(safe_source) + ",\"value\":" + safe_value + "}";
   return true;
 }
+bool RuntimeJson(const JsonValue& root,std::string& output) {
+  const auto* runtime=ObjectMember(root,"runtime_observation");if(!runtime)return false;
+  const auto* samples=NumberMember(*runtime,"samples");const auto* duration=NumberMember(*runtime,"duration_ms");const auto* activity=StringMember(*runtime,"activity");
+  if(!samples||samples->number>121||!duration||duration->number>122000||!activity||
+     !IsChoice(activity->string,{"unknown","off_expected","rejection_observed","activity_observed","not_observed_in_window"}))return false;
+  output="{\"samples\":"+Primitive(*samples)+",\"duration_ms\":"+Primitive(*duration)+",\"activity\":"+JsonString(activity->string);
+  for(const auto key:{"cancelled","process_lost","acquisition_overran"}) {
+    const auto* value=BooleanMember(*runtime,key);if(!value)return false;output+=",\""+std::string(key)+"\":"+Primitive(*value);
+  }
+  for(const auto key:{"requested_mode","requested_count","sdk_status","sdk_code","frame_id","actual_presentations","generation_active","factory_created","factory_proxy","swap_chain_intercepted","decoded_rejection","import_routing"}) {
+    const auto* field=ObjectMember(*runtime,key);if(!field)return false;
+    const auto* availability=StringMember(*field,"availability");const auto* source=StringMember(*field,"source");const auto* reason=StringMember(*field,"reason");const auto* value=Member(*field,"value");
+    if(!availability||!source||!reason||!value||!IsChoice(availability->string,{"observed","not_observed","unsupported_layout","read_failed"}))return false;
+    const bool observed=availability->string=="observed";
+    if(!observed&&value->type!=JsonValue::Type::Null)return false;
+    const bool boolean=IsChoice(key,{"generation_active","factory_created","factory_proxy","swap_chain_intercepted"});
+    const bool text=IsChoice(key,{"requested_mode","import_routing"});
+    if(value->type!=JsonValue::Type::Null) {
+      if(value->type!=(boolean?JsonValue::Type::Boolean:text?JsonValue::Type::String:JsonValue::Type::Number))return false;
+      if(value->type==JsonValue::Type::Number&&std::string_view(key)!="frame_id"&&value->number>UINT32_MAX)return false;
+      if(text&&!IsChoice(value->string,std::string_view(key)=="requested_mode"?std::initializer_list<std::string_view>{"on","off"}:std::initializer_list<std::string_view>{"native","already_present"}))return false;
+    }
+    output+=",\""+std::string(key)+"\":{\"availability\":"+JsonString(availability->string)+",\"source\":"+
+      JsonString(diagnostic_detail::ObservationSource(source->string))+",\"reason\":"+JsonString(diagnostic_detail::ObservationReason(reason->string))+",\"value\":"+
+      (value->type==JsonValue::Type::String?JsonString(value->string):Primitive(*value))+"}";
+  }
+  output+="}";return true;
+}
 bool FailureJson(const JsonValue& parent, std::string& output) {
   const auto* failure = Member(parent, "failure");
   if (!failure) return false;
@@ -342,6 +382,7 @@ Result<BundleEntry> SanitizeSummary(std::string_view text) {
     for (const auto key : keys) { std::string value; if (!ObservedJson(*parent,key,value)) return Fail("ParseDiagnosticObservation"); if (!first) output += ','; first = false; output += "\"" + std::string(key) + "\":" + value; }
     output += "}";
   }
+  if(Member(root,"runtime_observation")) {std::string runtime_json;if(!RuntimeJson(root,runtime_json))return Fail("ParseDiagnosticRuntime");output+=",\"runtime_observation\":"+runtime_json;}
   const auto* hook = StringMember(root,"hook_state"); const auto* fg = StringMember(root,"frame_generation");
   if (!hook || !fg || !IsChoice(hook->string, {"unknown","applied","routing_already_present","refused","rolled_back","startup_aborted"}) || !IsChoice(fg->string, {"unknown","activity_not_observed","activity_observed","rejected"})) return Fail("ParseDiagnosticState");
   output += ",\"hook_state\":" + JsonString(hook->string) + ",\"frame_generation\":" + JsonString(fg->string);

@@ -1,4 +1,5 @@
 #include "support.hpp"
+#include "fixtures/worker_allocation_probe.hpp"
 #include "wfg/diagnostics.hpp"
 
 #include <algorithm>
@@ -95,6 +96,7 @@ public:
 }
 
 void* operator new(std::size_t size) {
+  worker_allocation_probe::Record();
   if (track_allocations.load(std::memory_order_relaxed)) tracked_allocation_count.fetch_add(1, std::memory_order_relaxed);
   if (void* memory = std::malloc(size)) return memory;
   throw std::bad_alloc();
@@ -108,6 +110,7 @@ TEST("diagnostics.concurrent_producer_is_refused_for_writer_lifetime") {
   REQUIRE_ERROR(second.AppendEvent("{}", 2, 5), wfg::ErrorCode::DiagnosticFailure);
 }
 void* operator new[](std::size_t size) {
+  worker_allocation_probe::Record();
   if (track_allocations.load(std::memory_order_relaxed)) tracked_allocation_count.fetch_add(1, std::memory_order_relaxed);
   if (void* memory = std::malloc(size)) return memory;
   throw std::bad_alloc();
@@ -633,3 +636,17 @@ TEST("diagnostics.windows_localappdata_resolution_is_absolute_and_available") {
   CHECK(wfg::Value(resolved) != fixture.path / L"WitcherFG" / L"diagnostics");
 }
 #endif
+
+TEST("diagnostics.optional_runtime_fields_are_bounded_and_source_preserving") {
+  auto record=Record();record.runtime_observation.emplace();auto& runtime=*record.runtime_observation;
+  runtime.latest.requested_mode={std::nullopt,wfg::Availability::UnsupportedLayout,"read_only_runtime","No independently validated SDK diagnostic layout."};
+  runtime.latest.frame_id={UINT64_MAX,wfg::Availability::Observed,"read_only_runtime",""};
+  runtime.latest.sdk_code={std::nullopt,wfg::Availability::ReadFailed,"C:\\Users\\PRIVATE_SECRET","PRIVATE_SECRET"};
+  runtime.samples=2;runtime.duration_ms=30000;
+  const auto text=REQUIRE_OK(wfg::SerializeSummary(record));
+  CHECK(text.find("\"runtime_observation\":{")!=std::string::npos);
+  CHECK(text.find("diagnostic_layout_unavailable")!=std::string::npos);
+  CHECK(text.find("18446744073709551615")!=std::string::npos);
+  CHECK(text.find("PRIVATE_SECRET")==std::string::npos);
+  runtime.duration_ms=122001;CHECK(!wfg::IsOk(wfg::SerializeSummary(record)));
+}
