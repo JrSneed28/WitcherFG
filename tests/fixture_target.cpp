@@ -99,7 +99,15 @@ int wmain(int argc, wchar_t **argv) {
     auto pipe = Arg(argv[1]), go = Arg(argv[2]), quit = Arg(argv[3]);
     const bool exception = std::wcscmp(argv[4], L"exception") == 0;
     auto l = Create();
+    const bool malformed = std::wcscmp(argv[4], L"malformed") == 0;
+    const bool stalled = std::wcscmp(argv[4], L"stalled") == 0;
+    if (malformed)
+      l.magic = 0;
     Send(pipe, l);
+    if (malformed || stalled) {
+      Sleep(9000);
+      return 6;
+    }
     if (WaitForSingleObject(go, 9000) != WAIT_OBJECT_0)
       return 3;
     Report r;

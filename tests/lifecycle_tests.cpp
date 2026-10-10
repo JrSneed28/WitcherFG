@@ -5,6 +5,7 @@ void Ready(const Observation &o) {
   CHECK(o.ready);
   CHECK(o.helper_exited);
   CHECK(o.sentinel_alive);
+  CHECK(o.total_ms > 0 && o.total_ms <= 10000);
 }
 void Originals(const Observation &o) {
   Ready(o);
@@ -39,6 +40,7 @@ TEST("lifecycle.death_after_each_real_write_cannot_resume_mixed") {
     CHECK(o.armed);
     CHECK(o.writes == ++n);
     CHECK(o.write_values_verified);
+    CHECK(o.controller_write_checks == n);
     CHECK(o.target_exited);
     CHECK(!o.mixed);
     CHECK(!o.ran_originals && !o.ran_replacements);
@@ -167,4 +169,14 @@ TEST("lifecycle.observed_handle_rejects_exited_pinned_target") {
   CHECK(o.protections_restored);
   CHECK(o.observed_exit_rejected);
   CHECK(o.attach_calls == 0 && o.writes == 0 && o.abort_calls == 0);
+}
+
+TEST("lifecycle.setup_failure_and_denied_cleanup_are_contained") {
+  auto o = RunCleanupRegression();
+  CHECK(o.setup_failed);
+  CHECK(o.constructor_exit);
+  CHECK(o.denial_reported);
+  CHECK(o.denied_alive);
+  CHECK(o.recovered_exit);
+  CHECK(o.sentinel_survived);
 }

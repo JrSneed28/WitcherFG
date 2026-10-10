@@ -37,7 +37,7 @@ struct Shared {
   volatile LONG identity{}, readonly_denied{}, write_denied_error{}, protect_denied_error{},
       storage_refused{}, thread_exited{}, thread_resumed_ack{}, target_reported{},
       observed_exit_rejected{}, readonly_acquired{}, exception_passed{};
-  volatile LONG helper_error{}, transaction{}, status{};
+  volatile LONG helper_error{}, transaction{}, status{}, write_waiting{}, write_ack{};
   alignas(8) volatile LONG64 requested_at{};
   std::array<std::uint64_t, 4> last_write_values{};
 };

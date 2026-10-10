@@ -132,8 +132,20 @@ struct Memory final : IWritableMemory {
     }
     const auto count = InterlockedIncrement(&shared->writes);
     const int death = static_cast<int>(Which()) - static_cast<int>(Case::Die1) + 1;
-    if (death >= 1 && death <= 4 && count == death)
-      Die(70);
+    if (death >= 1 && death <= 4) {
+      // Keep the real stop and TRUE policy while the independent controller
+      // reads every slot through its retained target handle after every write.
+      InterlockedExchange(&shared->write_waiting, count);
+      const auto until = GetTickCount64() + 500;
+      while (Load(shared->write_ack) < count && GetTickCount64() < until)
+        Sleep(1);
+      if (Load(shared->write_ack) != count) {
+        InterlockedExchange(&shared->helper_error, ERROR_TIMEOUT);
+        Die(71);
+      }
+      if (count == death)
+        Die(70);
+    }
     if (Is(Case::WatchdogMutation) && count == 1)
       Sleep(INFINITE);
     if ((Is(Case::Rollback) || Is(Case::Abort) || Is(Case::TerminationDenied)) && count == 2)
