@@ -33,6 +33,17 @@ struct InterposerEvidence {
   bool backing_image_matches_loaded_module{};
 };
 struct LoaderCandidate { std::string basename; std::string version; bool trusted_signature{}; bool recognized_official{}; };
+enum class DependencyRole { Interposer, StreamlinePlugin, NgxPlugin, ApplicationLocalLoader };
+enum class DependencySigner { Nvidia, Microsoft };
+struct DependencyIdentity {
+  std::string basename;
+  Observed<std::string> version;
+  Observed<Hash256> sha256;
+  Observed<DependencySigner> signer;
+  Observed<DependencyRole> role;
+  Availability availability{Availability::NotObserved};
+  std::string source;
+};
 struct RuntimeInventory {
   std::string package_name;
   std::string package_version;
@@ -40,6 +51,7 @@ struct RuntimeInventory {
   std::vector<TrustedModule> trusted_system_modules;
   InterposerEvidence interposer;
   std::vector<LoaderCandidate> application_local_loaders;
+  std::vector<DependencyIdentity> dependencies;
 };
 
 struct PointerMapping { Address slot{}; Address original{}; Address replacement{}; Rva rva{}; };

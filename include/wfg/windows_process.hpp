@@ -1,0 +1,107 @@
+#pragma once
+
+#include "wfg/compatibility.hpp"
+
+#include <memory>
+
+namespace wfg {
+
+struct LaunchIdentity {
+  std::uint64_t earliest_creation_time{};
+  std::uint32_t session{};
+  std::wstring user;
+  std::wstring package;
+  std::wstring executable;
+  bool require_fresh{true};
+};
+
+struct Candidate {
+  std::uint32_t pid{};
+  std::uint64_t creation_time{};
+  std::uint32_t session{};
+  std::wstring user;
+  std::wstring package;
+  std::wstring executable;
+  std::uint32_t pinned_pid{};
+  std::uint64_t pinned_creation_time{};
+  std::shared_ptr<void> pin;
+};
+
+Result<Candidate> SelectCandidate(std::span<const Candidate> candidates, const LaunchIdentity& launch);
+
+class IProcessBackend {
+public:
+  virtual ~IProcessBackend() = default;
+  virtual std::chrono::steady_clock::time_point Now() const = 0;
+  virtual void Sleep(std::chrono::milliseconds duration) = 0;
+  virtual Result<Unit> Install() = 0;
+  virtual Result<Unit> CheckRegistration() = 0;
+  virtual Result<Unit> Activate() = 0;
+  virtual Result<std::vector<Candidate>> Enumerate() = 0;
+  virtual bool ActivationRequested() const = 0;
+};
+
+class PackageIdentity {
+public:
+  std::string name() const;
+  std::string version() const;
+  std::string family() const;
+  std::string application_id() const;
+  std::uint16_t architecture() const;
+private:
+  struct State;
+  explicit PackageIdentity(std::shared_ptr<State> state) : state_(std::move(state)) {}
+  std::shared_ptr<State> state_;
+  friend class NativeProcessBackend;
+  friend class VerifiedIdentityFactory;
+  friend Result<PackageIdentity> DiscoverPackage();
+  friend Result<Unit> ActivateRegistered(const PackageIdentity&);
+  friend Result<ObservedProcess> OpenDiagnosticTarget(const PackageIdentity&);
+  friend Result<std::unique_ptr<class ProcessObserver>> StartObserver(const PackageIdentity&, Deadline);
+};
+
+class ProcessObserver {
+public:
+  Result<Unit> Activate();
+  Result<Candidate> WaitForCandidate();
+  Result<OwnedProcess> WaitForFreshProcess();
+private:
+  ProcessObserver(LaunchIdentity launch, IProcessBackend& backend, Deadline deadline)
+      : launch_(std::move(launch)), backend_(&backend), deadline_(deadline) {}
+  LaunchIdentity launch_;
+  IProcessBackend* backend_;
+  Deadline deadline_;
+  std::shared_ptr<IProcessBackend> owner_;
+  bool activated_{};
+  bool consumed_{};
+  friend Result<std::unique_ptr<ProcessObserver>> InstallProcessObserver(LaunchIdentity, IProcessBackend&, Deadline);
+  friend Result<std::unique_ptr<ProcessObserver>> StartObserver(const PackageIdentity&, Deadline);
+};
+
+Result<std::unique_ptr<ProcessObserver>> InstallProcessObserver(LaunchIdentity launch, IProcessBackend& backend, Deadline deadline);
+Result<PackageIdentity> DiscoverPackage();
+Result<std::unique_ptr<ProcessObserver>> StartObserver(const PackageIdentity& package, Deadline deadline);
+Result<Unit> ActivateRegistered(const PackageIdentity& package);
+Result<RuntimeInventory> InventoryProcess(const OwnedProcess& process, const IMemory& memory);
+Result<std::unique_ptr<IWritableMemory>> OpenMemory(const OwnedProcess& process);
+Result<ObservedProcess> OpenDiagnosticTarget(const PackageIdentity& package);
+Result<std::unique_ptr<IMemory>> OpenReadOnlyMemory(const ObservedProcess& process);
+Result<RuntimeInventory> InventoryObservedProcess(const ObservedProcess& process, const IMemory& memory);
+EnvironmentSnapshot ObserveEnvironment(const ObservedProcess* process);
+
+namespace process_detail {
+struct FileEvidence {
+  std::uint64_t length{};
+  Hash256 sha256{};
+  std::string version;
+  bool trusted_signature{};
+  std::optional<DependencySigner> signer;
+};
+Result<FileEvidence> InspectFile(const std::wstring& path, bool require_nvidia);
+Result<Unit> ReadIntoHandle(void* handle, Address address, std::span<std::byte> bytes);
+Result<Unit> VerifyBackingImage(void* handle, Address base, const std::wstring& path, const IMemory& memory);
+Observed<DependencyRole> IdentifyDependencyRole(const IMemory& memory, const PeImage& image, const FileEvidence& evidence, std::string_view basename);
+Result<Unit> ValidateStartupInventory(const RuntimeInventory& inventory);
+}
+
+}
