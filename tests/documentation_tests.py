@@ -118,6 +118,78 @@ def read_config_snapshot(test_runner: pathlib.Path, config: pathlib.Path) -> dic
     return json.loads(result.stdout)
 
 
+def assert_version_identity(text: str, generated_identity: dict | None = None) -> dict:
+    version_lines = [line for line in text.splitlines() if line.startswith("WitcherFG ")]
+    if len(version_lines) != 1:
+        raise AssertionError("expected one version identity line")
+    match = re.fullmatch(
+        r"WitcherFG (?P<version>\S+) (?P<build_type>\S+) "
+        r"commit=(?P<commit>(?:[0-9a-f]{40})?) input=(?P<input_digest>[0-9a-f]{64})",
+        version_lines[0])
+    if not match:
+        raise AssertionError("malformed version identity")
+    fields = match.groupdict()
+    if generated_identity is not None:
+        for key, value in fields.items():
+            if generated_identity.get(key) != value:
+                raise AssertionError("version/generated identity mismatch: " + key)
+        if generated_identity.get("archive") is not (fields["commit"] == ""):
+            raise AssertionError("version/generated identity mismatch: archive")
+    return fields
+
+
+class VersionIdentityTests(unittest.TestCase):
+    def test_repository_shape_accepts_full_commit(self):
+        fields = assert_version_identity(
+            "WitcherFG 0.1.0-preview.1 Release commit=" + "a" * 40 + " input=" + "b" * 64 + "\n")
+        self.assertEqual(fields["commit"], "a" * 40)
+        self.assertEqual(fields["input_digest"], "b" * 64)
+
+    def test_archive_shape_keeps_commit_empty(self):
+        fields = assert_version_identity(
+            "WitcherFG 0.1.0-preview.1 Release commit= input=" + "b" * 64 + "\n")
+        self.assertEqual(fields["commit"], "")
+        self.assertEqual(fields["input_digest"], "b" * 64)
+
+    def test_identity_line_accepts_actual_completion_output(self):
+        line = "WitcherFG 0.1.0-preview.1 Release commit=" + "a" * 40 + " input=" + "b" * 64
+        output = line + "\nThe read-only operation completed.\nCompleted UTC: 2026-10-10T23:24:33Z elapsed_ms=0\n"
+        self.assertEqual(assert_version_identity(output)["commit"], "a" * 40)
+        with self.assertRaises(AssertionError):
+            assert_version_identity(line + "\n" + line + "\n")
+
+    def test_short_or_malformed_commit_and_digest_are_rejected(self):
+        for commit in ("a" * 7, "a" * 39, "a" * 41, "g" * 40):
+            with self.subTest(commit=commit), self.assertRaises(AssertionError):
+                assert_version_identity("WitcherFG 0.1.0-preview.1 Release commit=" + commit + " input=" + "b" * 64)
+        for commit in ("", "a" * 40):
+            for digest in ("", "b" * 63, "b" * 65, "g" * 64):
+                with self.subTest(commit=commit, digest=digest), self.assertRaises(AssertionError):
+                    assert_version_identity("WitcherFG 0.1.0-preview.1 Release commit=" + commit + " input=" + digest)
+        with self.assertRaises(AssertionError):
+            assert_version_identity("WitcherFG 0.1.0-preview.1 Release commit= input=" + "b" * 64 + " extra")
+
+    def test_actual_generated_repository_and_archive_identity_are_consistent(self):
+        from tools.build_identity import make_identity
+        metadata = {"version": "0.1.0-preview.1", "channel": "preview", "diagnostic_schema": 1}
+        for archive in (False, True):
+            generated = make_identity(metadata, {"commit": "a" * 40, "archive": archive, "inputs": {}}, "Release")
+            text = "WitcherFG 0.1.0-preview.1 Release commit=" + generated["commit"] + " input=" + generated["input_digest"]
+            with self.subTest(archive=archive):
+                fields = assert_version_identity(text, generated)
+                self.assertEqual(fields["commit"], "" if archive else "a" * 40)
+
+    def test_supplied_identity_mismatch_is_rejected(self):
+        text = "WitcherFG 0.1.0-preview.1 Release commit=" + "a" * 40 + " input=" + "b" * 64
+        identity = {"version": "0.1.0-preview.1", "build_type": "Release", "commit": "a" * 40,
+                    "input_digest": "b" * 64, "archive": False}
+        self.assertEqual(assert_version_identity(text, identity)["commit"], "a" * 40)
+        for key, wrong in (("version", "0.2.0"), ("build_type", "Debug"), ("commit", "c" * 40),
+                           ("input_digest", "c" * 64), ("archive", True)):
+            with self.subTest(key=key), self.assertRaises(AssertionError):
+                assert_version_identity(text, {**identity, key: wrong})
+
+
 def compatibility_fixture(scope="diagnostic_probe", status="Verified"):
     return [{"component": "synthetic evidence row", "status": status, "scope": scope,
              "native_release_status": "Pending", "evidence_method": "local measured probe",
@@ -263,7 +335,9 @@ class NativeDocumentation(unittest.TestCase):
         self.assertEqual(version.returncode, 0, version.stderr)
         metadata = tomllib.loads((ROOT / "release/project.toml").read_text(encoding="utf-8"))
         self.assertIn("WitcherFG " + metadata["version"] + " ", version.stdout)
-        self.assertRegex(version.stdout, r"commit=[0-9a-f]{40} input=[0-9a-f]{64}")
+        identity_path = os.environ.get("WFG_BUILD_IDENTITY")
+        generated = json.loads(pathlib.Path(identity_path).read_text(encoding="utf-8-sig")) if identity_path else None
+        assert_version_identity(version.stdout, generated)
 
 
 if __name__ == "__main__":
