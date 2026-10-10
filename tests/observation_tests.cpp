@@ -130,6 +130,7 @@ TEST("observation.cancellation_during_wait_stops_before_next_sample") {
   CHECK(report.cancelled);
   CHECK(report.samples == 1);
   CHECK(report.duration == std::chrono::milliseconds{0});
+  CHECK(fixture.provider.checks == 2);
 }
 TEST("observation.interval_duration_are_defensively_bounded") {
   Fixture fixture; fixture.config.sample_interval_ms = 1; fixture.config.observation_seconds = 0;
@@ -171,6 +172,66 @@ TEST("observation.acquisition_cancelled_does_not_check_or_wait_again") {
 
 namespace {
 void CloseNative(void* handle) noexcept { CloseHandle(handle); }
+template<class T> void CheckProvenance(const Observed<T>& field) {
+  CHECK(!field.source.empty());
+  if (field.availability == Availability::Observed) CHECK(field.value);
+  else {
+    CHECK(!field.value);
+    CHECK(!field.reason.empty());
+  }
+}
+void CheckMetadataProvenance(const ObservationReport& report) {
+  CheckProvenance(report.inventory);
+  CheckProvenance(report.import_routing);
+  CheckProvenance(report.environment.os);
+  CheckProvenance(report.environment.gpu);
+  CheckProvenance(report.environment.driver);
+  CheckProvenance(report.environment.selected_adapter);
+  CheckProvenance(report.environment.hags_configured);
+  CheckProvenance(report.environment.hags_active);
+}
+class NativeChild {
+public:
+  NativeChild() {
+    wchar_t directory[MAX_PATH]{};
+    const auto length = GetSystemDirectoryW(directory, MAX_PATH);
+    if (length == 0 || length >= MAX_PATH) throw std::runtime_error("native_system_directory_failed");
+    const auto executable = std::wstring(directory) + L"\\cmd.exe";
+    auto command = L"\"" + executable + L"\" /d /c exit 0";
+    STARTUPINFOW startup{}; startup.cb = sizeof(startup);
+    if (!CreateProcessW(executable.c_str(), command.data(), nullptr, nullptr, FALSE,
+                        CREATE_SUSPENDED | CREATE_NO_WINDOW, nullptr, nullptr, &startup, &child_))
+      throw std::runtime_error("native_child_create_failed");
+  }
+  ~NativeChild() {
+    if (WaitForSingleObject(child_.hProcess, 0) == WAIT_TIMEOUT) {
+      TerminateProcess(child_.hProcess, 37);
+      WaitForSingleObject(child_.hProcess, 1000);
+    }
+    CloseHandle(child_.hThread);
+    CloseHandle(child_.hProcess);
+  }
+  ObservedProcess Pin() const {
+    HANDLE handle{};
+    if (!DuplicateHandle(GetCurrentProcess(), child_.hProcess, GetCurrentProcess(), &handle,
+                         PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ | SYNCHRONIZE, FALSE, 0))
+      throw std::runtime_error("native_child_pin_failed");
+    FILETIME created{}, exited{}, kernel{}, user{};
+    if (!GetProcessTimes(handle, &created, &exited, &kernel, &user)) {
+      CloseHandle(handle);
+      throw std::runtime_error("native_child_creation_failed");
+    }
+    const auto creation = (static_cast<std::uint64_t>(created.dwHighDateTime) << 32) | created.dwLowDateTime;
+    return VerifiedIdentityTestFactory::Observed(handle, CloseNative, GetProcessId(handle), creation);
+  }
+  bool Release() const { return ResumeThread(child_.hThread) != static_cast<DWORD>(-1); }
+  bool ExitedNormally() const {
+    DWORD code{};
+    return WaitForSingleObject(child_.hProcess, 0) == WAIT_OBJECT_0 && GetExitCodeProcess(child_.hProcess, &code) && code == 0;
+  }
+private:
+  PROCESS_INFORMATION child_{};
+};
 ObservedProcess PinSelf(std::uint64_t creation_delta = 0) {
   HANDLE handle{};
   if (!DuplicateHandle(GetCurrentProcess(), GetCurrentProcess(), GetCurrentProcess(), &handle,
@@ -233,4 +294,91 @@ TEST("observation.unsourced_values_are_unavailable_with_reasons") {
   CHECK(!report.latest.requested_mode.reason.empty());
   CHECK(!report.latest.swap_chain_intercepted.source.empty());
   CHECK(!report.latest.swap_chain_intercepted.reason.empty());
+}
+TEST("observation.terminal_wait_process_loss_discards_prior_target_values") {
+  Fixture fixture; fixture.config.sample_interval_ms = 10000; fixture.provider.fail_check = 3;
+  auto sample = OnSample(); sample.sdk_status = Field(4U); sample.sdk_code = Field(91U);
+  sample.decoded_rejection = Field(SdkRejection{91U, "synthetic exposed rejection"});
+  fixture.provider.sequence = {sample};
+  fixture.provider.facts.inventory = Field(RuntimeInventory{});
+  fixture.provider.facts.import_routing = Field(Routing::AlreadyPresent);
+  fixture.provider.facts.environment.selected_adapter = Field(std::string{"synthetic selected adapter"});
+  fixture.provider.facts.environment.os = Field(std::string{"synthetic host OS"});
+  const auto report = fixture.Run();
+  CHECK(report.process_lost);
+  CHECK(report.samples == 1);
+  CHECK(report.duration == std::chrono::milliseconds{5000});
+  CHECK(report.activity == ActivityAssessment::Unknown);
+  CHECK(!report.sdk_rejection);
+  CHECK(report.latest.sdk_status.availability == Availability::ReadFailed);
+  CHECK(!report.latest.sdk_status.value);
+  CHECK(!report.inventory.value && !report.import_routing.value);
+  CHECK(!report.environment.selected_adapter.value);
+  CHECK(report.environment.os.value == "synthetic host OS");
+  CheckMetadataProvenance(report);
+}
+TEST("observation.native_child_exit_in_terminal_wait_is_detected") {
+  NativeChild child;
+  auto process = child.Pin();
+  auto config = DefaultConfiguration(); config.observation_seconds = 5; config.sample_interval_ms = 10000;
+  bool released{};
+  std::jthread release([&] { std::this_thread::sleep_for(std::chrono::milliseconds{250}); released = child.Release(); });
+  const auto report = ObserveRuntime(process, config, {});
+  release.join();
+  CHECK(released);
+  CHECK(child.ExitedNormally());
+  CHECK(report.process_lost);
+  CHECK(report.samples <= 1);
+  CHECK(!report.inventory.value && !report.import_routing.value);
+  CHECK(report.latest.sdk_status.availability == Availability::ReadFailed);
+  CHECK(!report.sdk_rejection);
+  CHECK(report.activity == ActivityAssessment::Unknown);
+  CheckMetadataProvenance(report);
+}
+TEST("observation.metadata_is_sourced_when_pre_cancelled") {
+  Fixture fixture; std::stop_source stop; stop.request_stop();
+  const auto report = fixture.Run(stop.get_token());
+  CHECK(report.cancelled && report.samples == 0);
+  CHECK(fixture.provider.checks == 0);
+  CheckMetadataProvenance(report);
+}
+TEST("observation.metadata_is_sourced_on_first_identity_failure") {
+  Fixture fixture; fixture.provider.fail_check = 1;
+  const auto report = fixture.Run();
+  CHECK(report.process_lost && report.samples == 0);
+  CheckMetadataProvenance(report);
+}
+TEST("observation.metadata_is_sourced_when_first_acquisition_is_late") {
+  Fixture fixture; fixture.provider.capture_time = std::chrono::milliseconds{6000};
+  const auto report = fixture.Run();
+  CHECK(report.acquisition_overran && report.samples == 0);
+  CheckMetadataProvenance(report);
+}
+TEST("observation.metadata_is_sourced_when_first_acquisition_is_cancelled") {
+  Fixture fixture; std::stop_source stop; fixture.provider.cancel_during_capture = &stop;
+  const auto report = fixture.Run(stop.get_token());
+  CHECK(report.cancelled && report.samples == 0);
+  CHECK(fixture.provider.checks == 1 && fixture.provider.waits == 0);
+  CheckMetadataProvenance(report);
+}
+TEST("observation.metadata_inventory_failure_explains_skipped_routing") {
+  Fixture fixture;
+  fixture.provider.facts.inventory = {std::nullopt, Availability::ReadFailed, "synthetic_inventory", "Pinned inventory failed."};
+  const auto report = fixture.Run();
+  CHECK(report.inventory.availability == Availability::ReadFailed);
+  CHECK(!report.import_routing.value);
+  CheckMetadataProvenance(report);
+  CHECK(report.import_routing.reason.find("inventory") != std::string::npos);
+}
+TEST("observation.metadata_native_read_only_access_failure_is_sourced") {
+  auto process = PinSelf();
+  const auto memory = OpenReadOnlyMemory(process);
+  CHECK(!IsOk(memory)); // An unpackaged self target cannot pass process_package.
+  auto config = DefaultConfiguration(); config.observation_seconds = 5; config.sample_interval_ms = 10000;
+  const auto report = ObserveRuntime(process, config, {});
+  CHECK(!report.process_lost);
+  CHECK(report.inventory.availability == Availability::ReadFailed);
+  CHECK(!report.inventory.value && !report.import_routing.value);
+  CheckMetadataProvenance(report);
+  CHECK(report.import_routing.reason.find("access") != std::string::npos);
 }

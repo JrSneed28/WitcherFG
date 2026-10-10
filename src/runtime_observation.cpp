@@ -10,8 +10,19 @@
 
 namespace wfg {
 namespace {
-template<class T> Observed<T> Missing(Availability availability, std::string_view reason) {
-  return {std::nullopt, availability, "read_only_runtime", std::string(reason)};
+template<class T> Observed<T> Missing(Availability availability, std::string_view reason, std::string_view source = "read_only_runtime") {
+  return {std::nullopt, availability, std::string(source), std::string(reason)};
+}
+EnvironmentSnapshot UncollectedEnvironment() {
+  EnvironmentSnapshot environment;
+  constexpr auto reason = "Host environment collection was not completed.";
+  environment.os = Missing<std::string>(Availability::NotObserved, reason, "host_environment");
+  environment.gpu = Missing<std::string>(Availability::NotObserved, reason, "host_environment");
+  environment.driver = Missing<std::string>(Availability::NotObserved, reason, "host_environment");
+  environment.selected_adapter = Missing<std::string>(Availability::NotObserved, "Target adapter was not independently observed.", "read_only_runtime");
+  environment.hags_configured = Missing<bool>(Availability::NotObserved, reason, "host_environment");
+  environment.hags_active = Missing<bool>(Availability::NotObserved, reason, "host_environment");
+  return environment;
 }
 RuntimeSample Unavailable(Availability availability, std::string_view reason) {
   RuntimeSample sample;
@@ -61,6 +72,20 @@ void Normalize(RuntimeSample& sample) {
   DiscardUnavailableValue(sample.swap_chain_intercepted);
   DiscardUnavailableValue(sample.decoded_rejection);
 }
+void NormalizeMetadata(observation_detail::Snapshot& snapshot) {
+  if (!Available(snapshot.inventory) && snapshot.import_routing.reason.empty())
+    snapshot.import_routing.reason = "Import routing was not checked because pinned inventory was unavailable.";
+  if (snapshot.inventory.reason.empty() && !Available(snapshot.inventory))
+    snapshot.inventory.reason = "Pinned inventory collection was not completed.";
+  DiscardUnavailableValue(snapshot.inventory);
+  DiscardUnavailableValue(snapshot.import_routing);
+  DiscardUnavailableValue(snapshot.environment.os);
+  DiscardUnavailableValue(snapshot.environment.gpu);
+  DiscardUnavailableValue(snapshot.environment.driver);
+  DiscardUnavailableValue(snapshot.environment.selected_adapter);
+  DiscardUnavailableValue(snapshot.environment.hags_configured);
+  DiscardUnavailableValue(snapshot.environment.hags_active);
+}
 bool UsableActivityState(const RuntimeSample& sample) {
   return Available(sample.requested_mode) && *sample.requested_mode.value == RequestedFgMode::On &&
          Available(sample.sdk_status) && *sample.sdk_status.value == 0 &&
@@ -100,6 +125,7 @@ public:
     if (!IsOk(memory)) {
       snapshot_.runtime = Unavailable(Availability::ReadFailed, "Read-only process access unavailable.");
       snapshot_.inventory = Missing<RuntimeInventory>(Availability::ReadFailed, "Read-only process access unavailable.");
+      snapshot_.import_routing = Missing<Routing>(Availability::NotObserved, "Import routing skipped because read-only process access was unavailable.", "validated_imports");
       return snapshot_;
     }
     const auto inventory = InventoryObservedProcess(process, *Value(memory));
@@ -107,6 +133,7 @@ public:
     if (!IsOk(inventory)) {
       snapshot_.runtime = Unavailable(Availability::ReadFailed, "Pinned process inventory unavailable.");
       snapshot_.inventory = Missing<RuntimeInventory>(Availability::ReadFailed, "Pinned process inventory unavailable.");
+      snapshot_.import_routing = Missing<Routing>(Availability::NotObserved, "Import routing skipped because pinned inventory was unavailable.", "validated_imports");
       return snapshot_;
     }
     snapshot_.inventory = {Value(inventory), Availability::Observed, "pinned_process_inventory", "Initial read-only dependency snapshot."};
@@ -143,6 +170,9 @@ ObservationReport ObserveRuntimeWithProvider(const ObservedProcess& process, con
                                              std::stop_token cancellation, IReadOnlyObservationProvider& provider) {
   ObservationReport report;
   report.latest = Unavailable(Availability::NotObserved, "No runtime sample captured.");
+  report.inventory = Missing<RuntimeInventory>(Availability::NotObserved, "Pinned inventory collection was not completed.", "pinned_process_inventory");
+  report.import_routing = Missing<Routing>(Availability::NotObserved, "Import routing was not checked.", "validated_imports");
+  report.environment = UncollectedEnvironment();
   report.limitations = {"Visible output requires an independent visual check.",
                         "Loaded modules and zero SDK status do not prove SDK initialization or interpolation.",
                         "SDK actual presentations are raw values, not generated/rendered ratios.",
@@ -175,6 +205,7 @@ ObservationReport ObserveRuntimeWithProvider(const ObservedProcess& process, con
       break;
     }
     Normalize(snapshot.runtime);
+    NormalizeMetadata(snapshot);
     report.latest = std::move(snapshot.runtime);
     report.inventory = std::move(snapshot.inventory);
     report.environment = std::move(snapshot.environment);
@@ -190,7 +221,16 @@ ObservationReport ObserveRuntimeWithProvider(const ObservedProcess& process, con
       previous_frame = *sample.frame_id.value;
     } else previous_frame.reset();
     const auto next = std::min(provider.Now() + interval, deadline);
-    if (provider.Now() < next) provider.WaitUntil(next, cancellation);
+    if (provider.Now() < next) {
+      provider.WaitUntil(next, cancellation);
+      // A terminal wait must revalidate the pinned object too. Cancellation
+      // exits before any additional process work or acquisition.
+      if (cancellation.stop_requested()) break;
+      if (!IsOk(provider.CheckPinned(process))) {
+        report.process_lost = true;
+        break;
+      }
+    }
   }
   report.cancelled = cancellation.stop_requested();
   report.duration = std::chrono::duration_cast<std::chrono::milliseconds>(provider.Now() - started);
@@ -199,6 +239,7 @@ ObservationReport ObserveRuntimeWithProvider(const ObservedProcess& process, con
     report.sdk_rejection.reset();
     report.inventory = Missing<RuntimeInventory>(Availability::ReadFailed, "Pinned process exited or identity changed.");
     report.import_routing = Missing<Routing>(Availability::ReadFailed, "Pinned process exited or identity changed.");
+    report.environment.selected_adapter = Missing<std::string>(Availability::ReadFailed, "Pinned process exited or identity changed; target adapter discarded.");
   } else if (report.sdk_rejection) report.activity = ActivityAssessment::RejectionObserved;
   else if (Available(report.latest.requested_mode) && *report.latest.requested_mode.value == RequestedFgMode::Off) report.activity = ActivityAssessment::OffExpected;
   else if (activity_observed) report.activity = ActivityAssessment::ActivityObserved;

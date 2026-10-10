@@ -37,7 +37,7 @@ public:
     sample_times.push_back(elapsed);
     elapsed += capture_time;
     if (cancel_during_capture) cancel_during_capture->request_stop();
-    wfg::observation_detail::Snapshot result;
+    auto result = facts;
     if (!sequence.empty()) result.runtime = sequence[std::min(sample_times.size() - 1, sequence.size() - 1)];
     else result.runtime.sdk_status = {std::nullopt, wfg::Availability::UnsupportedLayout, "synthetic_unknown_layout", "no approved SDK layout"};
     return result;
@@ -46,6 +46,7 @@ public:
   std::chrono::milliseconds capture_time{};
   std::vector<std::chrono::milliseconds> sample_times;
   std::vector<wfg::RuntimeSample> sequence;
+  wfg::observation_detail::Snapshot facts;
   unsigned checks{};
   unsigned waits{};
   unsigned fail_check{~0U};
