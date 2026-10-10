@@ -85,6 +85,7 @@ struct DiagnosticRecord {
   RunOutcome outcome{RunOutcome::NotStarted};
   SafetyDisposition safety{SafetyDisposition::Unverified};
   std::uint64_t elapsed_ms{};
+  std::array<char,20> completed_utc{};
   std::optional<RuntimeDiagnosticRecord> runtime_observation;
   std::optional<FailureInfo> failure;
 };

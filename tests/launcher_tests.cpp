@@ -26,9 +26,17 @@ struct Backend final : IDebugBackend {
 };
 struct Storage final : ILogStorage {
   int writes{};bool fail{},throw_summary{};std::string summary,console,events;
+  int* active_guard{};int guard_at_final{},final_writes{};std::string final_prefix;
+  std::stop_source* external_cancel{};std::stop_token cooperative;bool cancellation_forwarded{};
   Result<Unit> AppendEvent(std::string_view text,std::uint32_t,std::uint32_t) override{++writes;events+=text;return fail?Result<Unit>{Fault(ErrorCode::DiagnosticFailure)}:Result<Unit>{Unit{}};}
   Result<Unit> WriteSummaryAtomically(std::string_view text) override{if(throw_summary)throw 1;++writes;summary=text;return fail?Result<Unit>{Fault(ErrorCode::DiagnosticFailure)}:Result<Unit>{Unit{}};}
-  void WriteConsoleLine(std::string_view text) override{console+=text;}
+  void WriteConsoleLine(std::string_view text) override{
+    console+=text;
+    if(!final_prefix.empty()&&text.starts_with(final_prefix)) {
+      ++final_writes;guard_at_final=*active_guard;
+      if(external_cancel){external_cancel->request_stop();cancellation_forwarded=cooperative.stop_requested();}
+    }
+  }
 };
 struct Memory final : IWritableMemory {
   SupportedRuntimeFixture& runtime;Backend& backend;
@@ -65,7 +73,12 @@ struct MemoryView final : IWritableMemory {
   Result<Unit> Write(Address a,std::span<const std::byte>b)override{return m.Write(a,b);}
   Result<std::uint32_t> Protect(Address a,std::size_t s,std::uint32_t p)override{return m.Protect(a,s,p);}
 };
-struct Guard final:IRunGuard{void Disarm()override{}};
+struct Guard final:IRunGuard {
+  int& active;int id;
+  Guard(int& value,int identity):active(value),id(identity){active=id;}
+  ~Guard()override{Disarm();}
+  void Disarm()override{if(active==id)active=0;}
+};
 struct Fixture final : ILaunchEnvironment {
   SupportedRuntimeFixture runtime;Backend backend;::Memory memory{runtime,backend};Storage storage;
   CompatibilityRecord compatibility=runtime.SyntheticBuild();
@@ -74,7 +87,8 @@ struct Fixture final : ILaunchEnvironment {
   EnvironmentSnapshot host;
   int configurations{},discoveries{},installed{},activated{},pins{},memory_opens{},inventories{},observations{},collections{};
   int handle{};void* memory_pin{};bool expire_inventory{},cancel_observation{};int missing_inventories{};
-  std::vector<Deadline> guards;std::stop_source* active_cancel{};
+  std::vector<Deadline> guards;std::stop_source* active_cancel{};int active_guard{};
+  Fixture(){storage.active_guard=&active_guard;}
   std::span<const std::string_view> Arguments()const override{return args;}
   std::chrono::steady_clock::time_point Now()const override{return backend.now;}
   Result<EffectiveConfig> Configuration(const CommandLine& options)override{
@@ -82,7 +96,7 @@ struct Fixture final : ILaunchEnvironment {
     if(options.log_level){effective.log_level=*options.log_level;effective.origins["logging.level"]=ConfigOrigin::CommandLine;}return effective;
   }
   ILogStorage& Diagnostics()override{return storage;}
-  std::unique_ptr<IRunGuard> Guard(Deadline deadline,std::stop_source& cancel,std::stop_token)override{guards.push_back(deadline);active_cancel=&cancel;return std::make_unique<::Guard>();}
+  std::unique_ptr<IRunGuard> Guard(Deadline deadline,std::stop_source& cancel,std::stop_token)override{guards.push_back(deadline);active_cancel=&cancel;storage.cooperative=cancel.get_token();return std::make_unique<::Guard>(active_guard,static_cast<int>(guards.size()));}
   Result<PackageFacts> Discover()override{++discoveries;if(discover_error)return *discover_error;return PackageFacts{compatibility.package_name,compatibility.package_version,compatibility.machine};}
   EnvironmentSnapshot Environment()override{return host;}
   Result<Unit> InstallObserver(Deadline)override{++installed;CHECK(activated==0);return Unit{};}
@@ -101,7 +115,7 @@ struct Fixture final : ILaunchEnvironment {
     ++observations;if(observe_error)return *observe_error;if(owner){CHECK(backend.detaches>0);CHECK(owner->native_handle()==memory_pin);}
     if(cancel_observation)active_cancel->request_stop();ObservationReport report;report.cancelled=cancel_observation;return report;
   }
-  Result<Unit> Collect(const EffectiveConfig&)override{++collections;if(collect_error)return *collect_error;return Unit{};}
+  Result<Unit> Collect(const EffectiveConfig&)override{++collections;backend.now+=std::chrono::milliseconds(750);if(collect_error)return *collect_error;return Unit{};}
   [[noreturn]] void ExitHelper()noexcept override{std::_Exit(backend.kill&&backend.continues==0&&backend.detaches==0&&storage.writes==0?91:92);}
 };
 void Refusal(Fixture& f,Status status){const auto result=RunLauncher(f,{});if(result.status!=status)std::fprintf(stderr,"Status expected=%d actual=%d operation=%s\n",static_cast<int>(status),static_cast<int>(result.status),result.failure?std::string(result.failure->operation.view()).c_str():"none");CHECK(result.status==status);CHECK(result.failure);CHECK(!result.next_action.empty());CHECK(!result.diagnostic.operation.empty());CHECK(f.memory.writes==0);}
@@ -205,4 +219,47 @@ TEST("launcher.already_cancelled_request_never_activates") {
   Fixture fixture;std::stop_source cancel;cancel.request_stop();
   CHECK(RunLauncher(fixture,cancel.get_token()).status==Status::TimedOut);
   CHECK(fixture.activated==0&&fixture.backend.attaches==0&&fixture.memory.writes==0);
+}
+
+TEST("launcher.native_final_status_route_retains_guard_and_cancellation") {
+  for(bool observation:{false,true}) {
+    Fixture fixture;fixture.config.runtime_observation=observation;
+    fixture.storage.final_prefix="Import routing applied";std::stop_source cancel;fixture.storage.external_cancel=&cancel;
+    CHECK(RunLauncherToConsole(fixture,cancel.get_token())==0);
+    CHECK(fixture.storage.final_writes==1);CHECK(fixture.storage.guard_at_final==(observation?2:1));
+    CHECK(fixture.storage.cancellation_forwarded);CHECK(fixture.active_guard==0);
+    CHECK(fixture.guards.size()==(observation?2U:1U));CHECK(fixture.guards.front().value==std::chrono::steady_clock::time_point{}+std::chrono::seconds(60));
+    CHECK(fixture.backend.detaches==1&&fixture.backend.aborts==0);
+  }
+}
+TEST("launcher.native_readonly_and_preconfig_status_routes_are_guarded") {
+  for(auto mode:{"--help","--version","--collect-support","--invalid"}) {
+    Fixture fixture;fixture.args={mode};const bool invalid=std::string_view(mode)=="--invalid";
+    fixture.storage.final_prefix=invalid?"The launcher configuration":"The read-only operation completed";
+    CHECK(RunLauncherToConsole(fixture,{})==(invalid?2:0));CHECK(fixture.storage.final_writes==1);
+    CHECK(fixture.storage.guard_at_final==1);CHECK(fixture.active_guard==0);CHECK(fixture.guards.size()==1);
+    CHECK(fixture.activated==0&&fixture.backend.attaches==0);
+  }
+}
+namespace {
+void CompletionUtc(std::string_view text) {
+  constexpr std::string_view prefix="\"completed_utc\":\"";
+  const auto position=text.find(prefix);CHECK(position!=std::string_view::npos);
+  const auto utc=text.substr(position+prefix.size(),20);
+  CHECK(utc.size()==20);CHECK(utc[4]=='-'&&utc[7]=='-'&&utc[10]=='T'&&utc[13]==':'&&utc[16]==':'&&utc[19]=='Z');
+  for(std::size_t i=0;i<utc.size();++i)if(i!=4&&i!=7&&i!=10&&i!=13&&i!=16&&i!=19)CHECK(utc[i]>='0'&&utc[i]<='9');
+}
+}
+TEST("launcher.success_error_summary_and_console_fallback_keep_completion_time") {
+  for(bool fail:{false,true})for(bool present:{false,true}) {
+    Fixture fixture;fixture.storage.fail=fail;if(present)fixture.runtime.SetAllImportsToInterposer();
+    CHECK(RunLauncherToConsole(fixture,{})==0);
+    CompletionUtc(fail?fixture.storage.console:fixture.storage.summary);
+    CHECK(fixture.storage.summary.find("\"failure\":null")!=std::string::npos);CHECK(fixture.storage.events.empty());
+  }
+}
+TEST("launcher.collect_completion_uses_actual_elapsed_time") {
+  Fixture fixture;fixture.args={"--collect-support"};CHECK(RunLauncherToConsole(fixture,{})==0);
+  CompletionUtc(fixture.storage.console);CHECK(fixture.storage.console.find("\"elapsed_ms\":750")!=std::string::npos);
+  CHECK(fixture.storage.summary.empty());
 }

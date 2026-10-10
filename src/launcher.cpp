@@ -156,8 +156,21 @@ RunResult RunLauncher(ILaunchEnvironment& env,std::stop_token external) {
       result.detach=DetachOutcome::Detached;
     }
   };
+  const auto stamp_completion=[&] {record.elapsed_ms=elapsed();record.completed_utc=UtcStamp();};
+  const auto complete=[&] {
+    cleanup();
+    if(record.completed_utc[0]==0)stamp_completion();
+    // This is the native final-status route. Keep the same guard and stop
+    // callback alive through formatting and the sink's potentially blocking flush.
+    const auto wide=FormatStatus(result);
+    std::string text;for(const auto ch:wide)text.push_back(static_cast<char>(ch));
+    text+="\nCompleted UTC: "+std::string(record.completed_utc.data(),record.completed_utc.size())+
+      " elapsed_ms="+std::to_string(record.elapsed_ms);
+    env.Diagnostics().WriteConsoleLine(text);
+    if(guard)guard->Disarm();return result;
+  };
   const auto finish=[&] {
-    cleanup();record.elapsed_ms=elapsed();
+    cleanup();stamp_completion();
     try {
     RunLogger logger(record.effective_config,env.Diagnostics());
     if(result.failure){DiagnosticEvent failure{EventLevel::Failure,EventCode::Failure,result.failure->stage,result.failure->operation.view()};failure.failure=result.failure;failure.elapsed_ms=elapsed();failure.time_utc=UtcStamp();static_cast<void>(logger.Emit(failure));}
@@ -169,18 +182,18 @@ RunResult RunLauncher(ILaunchEnvironment& env,std::stop_token external) {
       if(IsOk(summary))env.Diagnostics().WriteConsoleLine(Value(summary));
       else env.Diagnostics().WriteConsoleLine("Diagnostic serialization failed; retain the final status.");
     }
-    if(guard)guard->Disarm();return result;
+    return complete();
   };
   try {
+    guard=env.Guard(total,cancellation,external);
     const auto options=ParseOptions(env.Arguments());
     if(!IsOk(options)){refuse(Failure(options));return finish();}
     if(Value(options).mode==Mode::Help||Value(options).mode==Mode::Version) {
       result.status=Status::ReadOnlyCompleted;
       if(Value(options).mode==Mode::Help)env.Diagnostics().WriteConsoleLine(Help);
       else {const auto& build=EmbeddedBuildIdentity();env.Diagnostics().WriteConsoleLine(std::string("WitcherFG ")+std::string(build.version)+" "+std::string(build.build_type)+" commit="+std::string(build.commit)+" input="+std::string(build.input_digest));}
-      return result;
+      return complete();
     }
-    guard=env.Guard(total,cancellation,external);
     if(expired()){refuse(Timeout(stage));return finish();}
     const auto config=env.Configuration(Value(options));
     if(!IsOk(config)){refuse(Failure(config));return finish();}
@@ -196,9 +209,10 @@ RunResult RunLauncher(ILaunchEnvironment& env,std::stop_token external) {
       const auto collected=env.Collect(record.effective_config);
       if(!IsOk(collected))refuse(Failure(collected));else result.status=Status::ReadOnlyCompleted;
       // Collection preserves the last launch summary for a later support run.
+      cleanup();stamp_completion();
       const auto summary=SerializeSummary(record);
       if(IsOk(summary))env.Diagnostics().WriteConsoleLine(Value(summary));
-      if(guard)guard->Disarm();return result;
+      return complete();
     }
     event(Stage::package_discovery,EventCode::Initialization,"package_discovery_entered");
     const auto package=env.Discover();
@@ -302,7 +316,7 @@ RunResult RunLauncher(ILaunchEnvironment& env,std::stop_token external) {
     event(Stage::detach,EventCode::Initialization,"detach_entered");cleanup();
     event(stage,EventCode::StageCompleted,"detach_completed");
     // Deferred transaction events are flushed only after verified safety and detach.
-    record.elapsed_ms=elapsed();
+    stamp_completion();
     try {result.diagnostic_file_failed=!IsOk(stages.Finish(record));}
     catch(...) {result.diagnostic_file_failed=true;}
     if((result.status==Status::Applied||result.status==Status::RoutingAlreadyPresent)&&record.effective_config.runtime_observation&&!cancellation.stop_requested())observe(&*owned);
@@ -397,12 +411,11 @@ private:
 Result<Unit> WriteDiagnostic(const DiagnosticRecord& record) {
   NativeSink sink;RunLogger logger(record.effective_config,sink);return logger.Finish(record);
 }
+int RunLauncherToConsole(ILaunchEnvironment& environment,std::stop_token cancellation) {
+  return ExitCode(RunLauncher(environment,cancellation).status);
+}
 int RunNativeLauncher(std::span<const std::string_view> arguments,std::stop_token cancellation) {
   NativeEnvironment environment(arguments);
-  const auto result=RunLauncher(environment,cancellation);
-  const auto wide=FormatStatus(result);
-  std::string text;for(const auto ch:wide)text.push_back(static_cast<char>(ch));
-  environment.Diagnostics().WriteConsoleLine(text);
-  return ExitCode(result.status);
+  return RunLauncherToConsole(environment,cancellation);
 }
 }

@@ -354,6 +354,14 @@ bool ValidUtc(std::string_view time_utc) {
   return valid_utc;
 }
 
+std::string_view CompletionUtc(const std::array<char,20>& value) {
+  const std::string_view text(value.data(),value.size());
+  if(!ValidUtc(text))return "unknown";
+  const auto pair=[&](std::size_t at){return (text[at]-'0')*10+text[at+1]-'0';};
+  if(pair(5)<1||pair(5)>12||pair(8)<1||pair(8)>31||pair(11)>23||pair(14)>59||pair(17)>59)return "unknown";
+  return text;
+}
+
 bool WriteFailure(JsonWriter& writer, const FailureInfo& failure, std::uint64_t elapsed_ms) {
   return writer.Raw("{\"code\":" ) && writer.String(SafeTag(failure.code)) &&
          writer.Raw(",\"stage\":" ) && writer.String(StageName(failure.stage)) &&
@@ -541,6 +549,7 @@ Result<std::string> SerializeSummary(const DiagnosticRecord& record) {
   }
   if (!writer.Raw("],\"outcome\":" ) || !writer.String(OutcomeName(record.outcome)) ||
       !writer.Raw(",\"elapsed_ms\":" ) || !writer.Number(record.elapsed_ms) ||
+      !writer.Raw(",\"completed_utc\":" ) || !writer.String(CompletionUtc(record.completed_utc)) ||
       !writer.Raw(",\"failure\":" ) || !(record.failure ? WriteFailure(writer, *record.failure, record.elapsed_ms) : writer.Null()) || !writer.Raw("}")) {
     return DiagnosticError("summary_tail");
   }

@@ -372,6 +372,12 @@ Result<BundleEntry> SanitizeSummary(std::string_view text) {
     }
   }
   output += "}},\"outcome\":" + JsonString(outcome->string) + ",\"elapsed_ms\":" + std::to_string(elapsed->number);
+  // Optional schema-1 extension: old producers have no completion field.
+  if(const auto* completed=Member(root,"completed_utc")) {
+    if(completed->type!=JsonValue::Type::String||SafeUtc(completed->string)!=completed->string)return Fail("ParseDiagnosticCompletion");
+    // The validated UTC alphabet is JSON-safe; generic tokens reject colons.
+    output+=",\"completed_utc\":\""+completed->string+"\"";
+  }
   for (const auto group : {"game","environment","dependencies"}) {
     const auto* parent = ObjectMember(root,group); if (!parent) return Fail("ParseDiagnosticObservation");
     output += ",\"" + std::string(group) + "\":{";

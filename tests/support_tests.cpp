@@ -579,3 +579,25 @@ TEST("support.native_optional_runtime_producer_roundtrip_is_sanitized") {
   const auto zip=ReadFileText(bundle.local_output);CHECK(zip.find("diagnostic_layout_unavailable")!=std::string::npos);
   CHECK(zip.find("18446744073709551615")!=std::string::npos);CHECK(zip.find("PRIVATE_SECRET")==std::string::npos);CHECK(zip.find("unsupported_private_field")==std::string::npos);
 }
+
+TEST("support.completion_utc_is_optional_but_recognized_private_text_is_refused") {
+  SupportFixture old;const auto key=old.producer.summary.find("\"completed_utc\":");
+  if(key!=std::string::npos){const auto end=old.producer.summary.find(',',key);CHECK(end!=std::string::npos);old.producer.summary.erase(key,end-key+1);}
+  REQUIRE_OK(wfg::CollectSupport(Inputs(),old));
+  SupportFixture malformed;
+  const auto existing=malformed.producer.summary.find("\"completed_utc\":");
+  if(existing!=std::string::npos){const auto end=malformed.producer.summary.find(',',existing);CHECK(end!=std::string::npos);malformed.producer.summary.erase(existing,end-existing+1);}
+  malformed.producer.summary.pop_back();malformed.producer.summary+=",\"completed_utc\":\"PRIVATE_SECRET\"}";
+  CHECK(!wfg::IsOk(wfg::CollectSupport(Inputs(),malformed)));CHECK(malformed.commits==0);
+}
+TEST("support.native_successful_completion_time_roundtrips_from_producer") {
+  NativeFixture fixture;auto record=Record();record.failure.reset();record.outcome=wfg::RunOutcome::Applied;
+  record.safety=wfg::SafetyDisposition::VerifiedCommit;record.elapsed_ms=750;
+  std::memcpy(record.completed_utc.data(),"2026-10-10T12:34:56Z",20);
+  {wfg::FileLogStorage storage(fixture.root/L"diagnostics");wfg::RunLogger logger(record.effective_config,storage);REQUIRE_OK(logger.Finish(record));}
+  CHECK(ReadFileText(fixture.root/L"diagnostics"/L"last-run.json").find("\"completed_utc\":\"2026-10-10T12:34:56Z\"")!=std::string::npos);
+  wfg::WindowsSupportStorage collector(fixture.root);const auto bundle=REQUIRE_OK(wfg::CollectSupport(Inputs(),collector));
+  const auto zip=ReadFileText(bundle.local_output);
+  CHECK(zip.find("\"completed_utc\":\"2026-10-10T12:34:56Z\"")!=std::string::npos);
+  CHECK(zip.find("\"elapsed_ms\":750")!=std::string::npos);CHECK(zip.find("\"failure\":null")!=std::string::npos);
+}

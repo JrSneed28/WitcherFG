@@ -34,9 +34,12 @@ public:
   virtual Result<Unit> Collect(const EffectiveConfig&) = 0;
   [[noreturn]] virtual void ExitHelper() noexcept = 0;
 };
+// Returns only after final console status completes inside the applicable guard.
 RunResult RunLauncher(ILaunchEnvironment&, std::stop_token);
 std::wstring FormatStatus(const RunResult&);
 Result<Unit> WriteDiagnostic(const DiagnosticRecord&);
 int ExitCode(Status) noexcept;
+// Shared native completion route; exposed for integration callers and tests.
+int RunLauncherToConsole(ILaunchEnvironment&, std::stop_token);
 int RunNativeLauncher(std::span<const std::string_view>, std::stop_token);
 }

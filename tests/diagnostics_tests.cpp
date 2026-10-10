@@ -650,3 +650,11 @@ TEST("diagnostics.optional_runtime_fields_are_bounded_and_source_preserving") {
   CHECK(text.find("PRIVATE_SECRET")==std::string::npos);
   runtime.duration_ms=122001;CHECK(!wfg::IsOk(wfg::SerializeSummary(record)));
 }
+
+TEST("diagnostics.completion_time_cannot_serialize_private_or_malformed_text") {
+  auto record=Record();std::memcpy(record.completed_utc.data(),"C:\\Users\\PRIVATE____",20);
+  auto json=REQUIRE_OK(wfg::SerializeSummary(record));CHECK(json.find("PRIVATE")==std::string::npos);
+  CHECK(json.find("\"completed_utc\":\"unknown\"")!=std::string::npos);
+  std::memcpy(record.completed_utc.data(),"2026-99-10T12:34:56Z",20);
+  json=REQUIRE_OK(wfg::SerializeSummary(record));CHECK(json.find("\"completed_utc\":\"unknown\"")!=std::string::npos);
+}
