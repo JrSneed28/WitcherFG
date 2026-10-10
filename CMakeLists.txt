@@ -20,7 +20,8 @@ add_custom_target(wfg_build_identity
   BYPRODUCTS "${WFG_GENERATED_DIRECTORY}/wfg/build_info.hpp" "${WFG_GENERATED_DIRECTORY}/wfg/build_info.json"
   VERBATIM)
 
-add_library(wfg_core STATIC src/pe.cpp src/compatibility.cpp src/configuration.cpp src/diagnostics.cpp src/windows_process.cpp)
+add_library(wfg_core STATIC src/pe.cpp src/compatibility.cpp src/configuration.cpp src/diagnostics.cpp src/windows_process.cpp
+  src/debug_session.cpp)
 add_dependencies(wfg_core wfg_build_identity)
 target_include_directories(wfg_core PUBLIC include "${WFG_GENERATED_DIRECTORY}")
 target_link_libraries(wfg_core PRIVATE bcrypt advapi32 psapi shlwapi xmllite ole32 wintrust crypt32 version)
@@ -33,18 +34,31 @@ target_link_libraries(wfg_launcher PRIVATE wfg_core)
 target_compile_options(wfg_launcher PRIVATE /W4 /permissive-)
 
 add_executable(wfg_tests tests/test_main.cpp tests/pe_tests.cpp tests/core_tests.cpp tests/compatibility_tests.cpp
-  tests/configuration_tests.cpp tests/diagnostics_tests.cpp tests/process_tests.cpp)
+  tests/configuration_tests.cpp tests/diagnostics_tests.cpp tests/process_tests.cpp tests/debug_tests.cpp)
 target_compile_definitions(wfg_tests PRIVATE WFG_CONFIG_SNAPSHOT)
 target_include_directories(wfg_tests PRIVATE include tests)
 target_link_libraries(wfg_tests PRIVATE wfg_core)
 target_compile_options(wfg_tests PRIVATE /W4 /permissive-)
 
 enable_testing()
-foreach(group IN ITEMS pe compatibility process debug transaction launcher configuration diagnostics)
+foreach(group IN ITEMS pe compatibility process debug configuration diagnostics)
   add_test(NAME wfg_${group} COMMAND wfg_tests --filter ${group})
   set_tests_properties(wfg_${group} PROPERTIES LABELS ${group})
 endforeach()
 set_tests_properties(wfg_configuration PROPERTIES LABELS "configuration;config")
+
+add_executable(wfg_debug_win32_boundary tests/test_main.cpp tests/fixtures/debug_win32_backend.cpp src/pe.cpp)
+target_include_directories(wfg_debug_win32_boundary PRIVATE include tests)
+target_compile_options(wfg_debug_win32_boundary PRIVATE /W4 /permissive-)
+target_compile_definitions(wfg_debug_win32_boundary PRIVATE _WIN32_WINNT=0x0A00 WINVER=0x0A00)
+add_test(NAME wfg_debug_win32_boundary COMMAND wfg_debug_win32_boundary --filter debug.native_)
+set_tests_properties(wfg_debug_win32_boundary PROPERTIES LABELS debug)
+
+add_executable(wfg_debug_api_smoke tests/fixtures/debug_api_smoke.cpp)
+target_link_libraries(wfg_debug_api_smoke PRIVATE wfg_core)
+target_compile_options(wfg_debug_api_smoke PRIVATE /W4 /permissive-)
+add_test(NAME wfg_debug_api_smoke COMMAND wfg_debug_api_smoke)
+set_tests_properties(wfg_debug_api_smoke PROPERTIES LABELS debug)
 
 add_test(NAME wfg_build_identity COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/build_identity_tests.py"
   --native-runner "$<TARGET_FILE:wfg_tests>" --generated-json "${WFG_GENERATED_DIRECTORY}/wfg/build_info.json" BuildIdentityTests)
