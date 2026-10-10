@@ -41,6 +41,8 @@ public:
   void MakeFactoryUnreadable();
   void SetNativeTrusted(bool trusted);
   void EnableNativeForwarder();
+  void EnableNativeOrdinalForwarder();
+  void EnableNativeForwarderCycle();
   void EnableInterposerForwarder();
   void AddApplicationLocalLoader(std::string basename, std::string version, bool recognized_official);
   void Mutate(Mutation mutation);
@@ -155,6 +157,16 @@ inline void SupportedRuntimeFixture::MakeManagerUnreadable() { memory.SetReadabl
 inline void SupportedRuntimeFixture::MakeFactoryUnreadable() { memory.SetReadable(manager_, false); }
 inline void SupportedRuntimeFixture::SetNativeTrusted(bool trusted) { inventory.trusted_system_modules.front().trusted_system = trusted; }
 inline void SupportedRuntimeFixture::EnableNativeForwarder() { RuntimeFixtureDetail::Text(memory, 0x00007FF710000000ULL + 0x400, "dxcore.CreateDXGIFactory1"); memory.Put<std::uint32_t>(0x00007FF710000000ULL + 0x280, 0x400U); native_exports_["CreateDXGIFactory1"] = 0x00007FF720000000ULL + 0x600; SetImportPointer("CreateDXGIFactory1", native_exports_.at("CreateDXGIFactory1")); }
+inline void SupportedRuntimeFixture::EnableNativeOrdinalForwarder() {
+  EnableNativeForwarder();
+  RuntimeFixtureDetail::Text(memory, 0x00007FF710000400ULL, "dxcore.#7");
+  memory.Put<std::uint32_t>(0x00007FF720000210ULL, 7U);
+}
+inline void SupportedRuntimeFixture::EnableNativeForwarderCycle() {
+  EnableNativeForwarder();
+  RuntimeFixtureDetail::Text(memory, 0x00007FF720000400ULL, "dxgi.CreateDXGIFactory1");
+  memory.Put<std::uint32_t>(0x00007FF720000280ULL, 0x400U);
+}
 inline void SupportedRuntimeFixture::EnableInterposerForwarder() { RuntimeFixtureDetail::Text(memory, 0x00007FF730000000ULL + 0x400, "dxgi.CreateDXGIFactory"); memory.Put<std::uint32_t>(0x00007FF730000000ULL + 0x280, 0x400U); }
 inline void SupportedRuntimeFixture::AddApplicationLocalLoader(std::string basename, std::string version, bool recognized_official) { inventory.application_local_loaders.push_back({std::move(basename), std::move(version), true, recognized_official}); }
 inline void SupportedRuntimeFixture::Mutate(Mutation mutation) { switch (mutation) { case Mutation::Package: inventory.package_name = "other"; break; case Mutation::Version: inventory.package_version = "1"; break; case Mutation::Machine: memory.Put<std::uint16_t>(executable_base_ + 0x84, 0x14c); break; case Mutation::Timestamp: memory.Put<std::uint32_t>(executable_base_ + 0x88, 1U); break; case Mutation::ImageSize: memory.Put<std::uint32_t>(executable_base_ + 0xd0, 0x1234U); break; case Mutation::InterposerVersion: inventory.interposer.version = "0"; break; case Mutation::InterposerLength: ++inventory.interposer.length; break; case Mutation::InterposerHash: inventory.interposer.sha256[0] ^= std::byte{1}; break; case Mutation::Signer: inventory.interposer.trusted_nvidia_signer = false; break; case Mutation::Correspondence: inventory.interposer.backing_image_matches_loaded_module = false; break; case Mutation::FirstHash: memory.Put<std::byte>(executable_base_ + 0x1CB0384, std::byte{1}); break; case Mutation::SecondHash: memory.Put<std::byte>(executable_base_ + 0x1CB061D, std::byte{1}); break; } }
