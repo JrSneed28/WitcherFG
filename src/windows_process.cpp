@@ -724,7 +724,7 @@ private:
     const auto file = OpenFile(path);
     if (!IsOk(file)) return Fail(ErrorCode::AccessDenied, "dxgi_system_file", Stage::Diagnostic, Failure(file).native_code.value_or(0));
     if (!Signature(Value(file).get(), path, false)) return Fail(ErrorCode::UntrustedInterposer, "dxgi_factory_trust", Stage::Diagnostic);
-    const auto module = LoadLibraryExW(path.c_str(), nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32 | LOAD_LIBRARY_REQUIRE_SIGNED_TARGET);
+    const auto module = LoadLibraryExW(path.c_str(), nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
     if (!module) return Fail(ErrorCode::AccessDenied, "dxgi_system_load", Stage::Diagnostic, GetLastError());
     library_ = Pin(module, [](void* handle) noexcept { FreeLibrary(static_cast<HMODULE>(handle)); });
     auto handle = Duplicate(GetCurrentProcess(), ReadRights);

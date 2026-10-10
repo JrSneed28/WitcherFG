@@ -274,6 +274,20 @@ TEST("process.native_environment_queries_host_without_asserting_active_state") {
   CHECK(!environment.selected_adapter.value && !environment.hags_active.value);
 }
 
+TEST("process.native_catalog_trusted_dxgi_reaches_adapter_enumeration") {
+  const auto environment = wfg::ObserveEnvironment(nullptr);
+  if (!environment.gpu.value) throw std::runtime_error("expected native GPU observation; actual=" + environment.gpu.reason);
+  CHECK(environment.gpu.availability == wfg::Availability::Observed);
+  CHECK(environment.gpu.source == "DXGI_EnumAdapters1_GetDesc1");
+  CHECK(environment.gpu.value->find("adapter 0 ") != std::string::npos);
+  if (environment.driver.value) CHECK(environment.driver.availability == wfg::Availability::Observed);
+  else {
+    CHECK(environment.driver.availability == wfg::Availability::UnsupportedLayout || environment.driver.availability == wfg::Availability::ReadFailed);
+    CHECK(!environment.driver.reason.empty());
+  }
+  CHECK(!environment.selected_adapter.value && !environment.hags_active.value);
+}
+
 TEST("process.prelaunch_delay_cannot_cross_activation_deadline") {
   ActivationOperationsFixture operations;
   operations.preparation_time = std::chrono::milliseconds(10);
