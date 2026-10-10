@@ -108,3 +108,30 @@ set_tests_properties(wfg_configuration_snapshot PROPERTIES LABELS "configuration
 add_test(NAME wfg_runner_unknown_filter COMMAND ${CMAKE_COMMAND}
   -DTEST_EXECUTABLE=$<TARGET_FILE:wfg_tests> -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/runner_tests.cmake)
 set_tests_properties(wfg_runner_unknown_filter PROPERTIES LABELS pe)
+
+# Disposable Windows OS lifecycle gate; fixture capabilities never enter wfg_core.
+add_executable(wfg_lifecycle_tests tests/test_main.cpp tests/lifecycle_tests.cpp tests/lifecycle_harness.cpp)
+target_include_directories(wfg_lifecycle_tests PRIVATE include tests)
+target_compile_options(wfg_lifecycle_tests PRIVATE /W4 /permissive-)
+add_test(NAME wfg_lifecycle COMMAND wfg_lifecycle_tests --filter lifecycle.)
+set_tests_properties(wfg_lifecycle PROPERTIES LABELS lifecycle TIMEOUT 180 RUN_SERIAL TRUE)
+
+get_target_property(WFG_LIFECYCLE_SOURCES wfg_core SOURCES)
+add_library(wfg_lifecycle_core STATIC ${WFG_LIFECYCLE_SOURCES}
+  src/launcher.cpp src/support_bundle.cpp src/support_storage_windows.cpp)
+add_dependencies(wfg_lifecycle_core wfg_build_identity)
+target_include_directories(wfg_lifecycle_core PUBLIC include "${WFG_GENERATED_DIRECTORY}")
+target_compile_definitions(wfg_lifecycle_core PRIVATE WFG_LIFECYCLE_TESTING WFG_SUPPORT_TESTING
+  _WIN32_WINNT=0x0A00 WINVER=0x0A00)
+target_compile_options(wfg_lifecycle_core PRIVATE /W4 /permissive-)
+target_link_libraries(wfg_lifecycle_core PRIVATE shell32 bcrypt advapi32 psapi shlwapi xmllite ole32 wintrust crypt32 version)
+add_executable(wfg_fixture_target tests/fixture_target.cpp)
+target_include_directories(wfg_fixture_target PRIVATE include tests)
+target_compile_options(wfg_fixture_target PRIVATE /W4 /permissive-)
+add_executable(wfg_lifecycle_helper tests/lifecycle_helper.cpp)
+target_include_directories(wfg_lifecycle_helper PRIVATE include tests)
+target_link_libraries(wfg_lifecycle_helper PRIVATE wfg_lifecycle_core)
+target_compile_definitions(wfg_lifecycle_helper PRIVATE WFG_LIFECYCLE_TESTING WFG_SUPPORT_TESTING
+  _WIN32_WINNT=0x0A00 WINVER=0x0A00)
+target_compile_options(wfg_lifecycle_helper PRIVATE /W4 /permissive-)
+add_dependencies(wfg_lifecycle_tests wfg_fixture_target wfg_lifecycle_helper)

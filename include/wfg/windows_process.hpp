@@ -92,6 +92,11 @@ Result<RuntimeInventory> InventoryObservedProcess(const ObservedProcess& process
 EnvironmentSnapshot ObserveEnvironment(const ObservedProcess* process);
 
 namespace process_detail {
+#ifdef WFG_LIFECYCLE_TESTING
+// Disposable-child test core only. No package eligibility bypass in production.
+Result<std::unique_ptr<IWritableMemory>> OpenLifecycleMemory(const OwnedProcess&);
+Result<std::unique_ptr<IMemory>> OpenLifecycleReadOnlyMemory(const ObservedProcess&);
+#endif
 struct OsBuild { std::uint32_t major{}; std::uint32_t minor{}; std::uint32_t build{}; };
 struct AdapterFacts {
   std::string model;

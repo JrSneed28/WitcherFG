@@ -536,6 +536,36 @@ Result<std::unique_ptr<IWritableMemory>> OpenMemory(const OwnedProcess& process)
   return std::unique_ptr<IWritableMemory>(new WritableMemory(Value(handle)));
 }
 
+#ifdef WFG_LIFECYCLE_TESTING
+namespace process_detail {
+namespace {
+Result<Pin> LifecyclePin(HANDLE handle, std::uint32_t pid, std::uint64_t creation, DWORD rights) {
+  const auto matches = [&](HANDLE candidate) {
+    const auto time = Creation(candidate);
+    return candidate && GetProcessId(candidate) == pid && IsOk(time) && Value(time) == creation &&
+      WaitForSingleObject(candidate, 0) == WAIT_TIMEOUT;
+  };
+  if (!matches(handle)) return Fail(ErrorCode::IdentityChanged, "lifecycle_pin_identity");
+  auto duplicate = Duplicate(handle, rights);
+  if (!IsOk(duplicate)) return Failure(duplicate);
+  if (!matches(handle) || !matches(Value(duplicate).get())) return Fail(ErrorCode::IdentityChanged, "lifecycle_pin_identity");
+  return duplicate;
+}
+}
+Result<std::unique_ptr<IWritableMemory>> OpenLifecycleMemory(const OwnedProcess& process) {
+  auto pin = LifecyclePin(process.native_handle(), process.pid(), process.creation_time(),
+    ReadRights | PROCESS_VM_WRITE | PROCESS_VM_OPERATION);
+  if (!IsOk(pin)) return Failure(pin);
+  return std::unique_ptr<IWritableMemory>(new WritableMemory(Value(pin)));
+}
+Result<std::unique_ptr<IMemory>> OpenLifecycleReadOnlyMemory(const ObservedProcess& process) {
+  auto pin = LifecyclePin(process.native_handle(), process.pid(), process.creation_time(), ReadRights);
+  if (!IsOk(pin)) return Failure(pin);
+  return std::unique_ptr<IMemory>(new ReadMemory(Value(pin)));
+}
+}
+#endif
+
 namespace { EnvironmentSnapshot NativeEnvironment(); }
 EnvironmentSnapshot ObserveEnvironment(const ObservedProcess*) { return NativeEnvironment(); }
 
