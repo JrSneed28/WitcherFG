@@ -10,12 +10,18 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
-add_library(wfg_launcher INTERFACE)
-set_target_properties(wfg_launcher PROPERTIES OUTPUT_NAME WitcherFG)
-target_include_directories(wfg_launcher INTERFACE include)
+add_library(wfg_core STATIC src/pe.cpp)
+target_include_directories(wfg_core PUBLIC include)
+target_compile_options(wfg_core PRIVATE /W4 /permissive-)
 
-add_executable(wfg_tests src/pe.cpp tests/test_main.cpp tests/pe_tests.cpp)
+add_executable(wfg_launcher src/main.cpp)
+set_target_properties(wfg_launcher PROPERTIES OUTPUT_NAME WitcherFG)
+target_link_libraries(wfg_launcher PRIVATE wfg_core)
+target_compile_options(wfg_launcher PRIVATE /W4 /permissive-)
+
+add_executable(wfg_tests tests/test_main.cpp tests/pe_tests.cpp)
 target_include_directories(wfg_tests PRIVATE include tests)
+target_link_libraries(wfg_tests PRIVATE wfg_core)
 target_compile_options(wfg_tests PRIVATE /W4 /permissive-)
 
 enable_testing()

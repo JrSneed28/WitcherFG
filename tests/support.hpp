@@ -24,6 +24,27 @@ private:
   wfg::Address base_; wfg::Bytes bytes_; bool short_reads_{}; std::size_t writes_{}; std::size_t protects_{};
 };
 
+class FakeAddressSpace final : public wfg::IMemory {
+public:
+  void Add(const wfg::IMemory& memory) { memories_.push_back(&memory); }
+  wfg::Result<wfg::Bytes> Read(wfg::Address address, std::size_t size) const override {
+    for (const auto* memory : memories_) {
+      auto result = memory->Read(address, size);
+      if (wfg::IsOk(result)) return result;
+    }
+    return wfg::Error{wfg::ErrorCode::UnreadableMemory, wfg::Stage::Inspect, "read"};
+  }
+  wfg::Result<wfg::MemoryRegion> Query(wfg::Address address) const override {
+    for (const auto* memory : memories_) {
+      auto result = memory->Query(address);
+      if (wfg::IsOk(result) && address >= wfg::Value(result).base && address - wfg::Value(result).base < wfg::Value(result).size) return result;
+    }
+    return wfg::Error{wfg::ErrorCode::UnreadableMemory, wfg::Stage::Inspect, "query"};
+  }
+private:
+  std::vector<const wfg::IMemory*> memories_;
+};
+
 namespace test {
 struct Case { const char* name; void (*run)(); };
 inline std::vector<Case>& Cases() { static std::vector<Case> cases; return cases; }
@@ -35,5 +56,5 @@ inline void Check(bool value, const char* expression, const char* file, int line
 #define WFG_TEST_IMPL(name, line) static void WFG_TEST_JOIN(test_, line)(); static test::Register WFG_TEST_JOIN(register_, line){name, WFG_TEST_JOIN(test_, line)}; static void WFG_TEST_JOIN(test_, line)()
 #define TEST(name) WFG_TEST_IMPL(name, __LINE__)
 #define CHECK(expr) test::Check(static_cast<bool>(expr), #expr, __FILE__, __LINE__)
-#define REQUIRE_OK(expr) ([&]() { auto result = (expr); if (!wfg::IsOk(result)) throw std::runtime_error("expected successful result"); return wfg::Value(result); }())
+#define REQUIRE_OK(expr) ([&]() { auto result = (expr); if (!wfg::IsOk(result)) throw std::runtime_error("expected success: " + wfg::Failure(result).operation); return wfg::Value(result); }())
 #define REQUIRE_ERROR(expr, expected) do { auto result = (expr); CHECK(!wfg::IsOk(result)); CHECK(wfg::Failure(result).code == (expected)); } while (false)
