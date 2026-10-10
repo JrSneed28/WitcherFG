@@ -98,4 +98,11 @@ inline Image ExportImage(const char* name, std::uint32_t function_rva, std::stri
   if (!forwarder.empty()) Text(bytes, 0x350, forwarder.c_str());
   return {base, FakeMemory(base, std::move(bytes))};
 }
+inline Image WithDirectory(std::uint32_t index, std::uint32_t address, std::uint32_t size) {
+  auto image = ExportImage("Direct", 0x500);
+  auto bytes = wfg::Value(image.memory.Read(image.base, 0x1000));
+  Put<std::uint32_t>(bytes, 0x98 + 0x70 + index * 8, address);
+  Put<std::uint32_t>(bytes, 0x98 + 0x74 + index * 8, size);
+  return {image.base, FakeMemory(image.base, std::move(bytes))};
+}
 }  // namespace FixturePe

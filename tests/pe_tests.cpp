@@ -5,6 +5,54 @@
 #include <string>
 #include <type_traits>
 
+TEST("pe.certificate_file_offset_outside_image_is_not_read_as_rva") {
+  auto image = FixturePe::WithDirectory(4, 0x2000, 0x100);
+  class HeaderMemory final : public wfg::IMemory {
+  public:
+    explicit HeaderMemory(const wfg::IMemory& memory) : memory_(memory) {}
+    wfg::Result<wfg::Bytes> Read(wfg::Address address, std::size_t size) const override {
+      ++read_count;
+      return memory_.Read(address, size);
+    }
+    wfg::Result<wfg::MemoryRegion> Query(wfg::Address address) const override {
+      return memory_.Query(address);
+    }
+    mutable std::size_t read_count{};
+  private:
+    const wfg::IMemory& memory_;
+  } memory(image.memory);
+  REQUIRE_ERROR(image.memory.Read(image.base + 0x2000, 0x100), wfg::ErrorCode::UnreadableMemory);
+  const auto pe = REQUIRE_OK(wfg::InspectPe(memory, image.base));
+  CHECK(pe.size_of_image == 0x1000);
+  CHECK(pe.directories[4].rva == 0x2000);
+  CHECK(pe.directories[4].size == 0x100);
+  CHECK(memory.read_count == 4);
+  CHECK(REQUIRE_OK(wfg::FindExport(image.memory, pe, "Direct")).rva == 0x500);
+  CHECK(image.memory.write_count() == 0);
+  CHECK(image.memory.protect_count() == 0);
+}
+
+TEST("pe.certificate_presence_fields_must_agree") {
+  for (const auto fields : std::array<std::array<std::uint32_t, 2>, 2>{{{0, 0x100}, {0x2000, 0}}}) {
+    auto image = FixturePe::WithDirectory(4, fields[0], fields[1]);
+    REQUIRE_ERROR(wfg::InspectPe(image.memory, image.base), wfg::ErrorCode::MalformedImage);
+    CHECK(image.memory.write_count() == 0);
+  }
+}
+
+TEST("pe.noncertificate_directories_keep_image_bounds") {
+  for (std::uint32_t index = 0; index < 16; ++index) {
+    if (index == 4) continue;
+    for (const auto fields : std::array<std::array<std::uint32_t, 2>, 2>{{{0x2000, 0x100}, {0xff8, 0x10}}}) {
+      auto image = FixturePe::WithDirectory(index, fields[0], fields[1]);
+      const auto inspected = wfg::InspectPe(image.memory, image.base);
+      REQUIRE_ERROR(inspected, wfg::ErrorCode::MalformedImage);
+      CHECK(wfg::Failure(inspected).operation.view() == "directory_range");
+      CHECK(image.memory.write_count() == 0);
+    }
+  }
+}
+
 TEST("pe.named_import_survives_aslr") {
   auto image = FixturePe::SupportedHeaders(0x00007FF600000000ULL);
   auto pe = REQUIRE_OK(wfg::InspectPe(image.memory, image.base));

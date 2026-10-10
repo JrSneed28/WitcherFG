@@ -12,6 +12,7 @@ namespace {
 constexpr std::size_t kMaxRead = 1024U * 1024U;
 constexpr std::size_t kMaxString = 4096U;
 constexpr std::size_t kMaxForwarderLinks = 8;
+constexpr std::size_t kCertificateDirectoryIndex = 4;
 
 Error Fail(ErrorCode code, const char* operation) { return {code, Stage::Inspect, operation}; }
 
@@ -70,7 +71,7 @@ std::string NormalizeModule(std::string_view value) {
 bool SameModule(std::string_view left, std::string_view right) { return NormalizeModule(left) == NormalizeModule(right); }
 
 Result<Unit> Directory(const PeImage& image, std::size_t index, DataDirectory& directory) {
-  if (index >= image.directories.size()) return Fail(ErrorCode::MalformedImage, "directory_index");
+  if (index >= image.directories.size() || index == kCertificateDirectoryIndex) return Fail(ErrorCode::MalformedImage, "directory_index");
   directory = image.directories[index];
   if (directory.rva == 0 && directory.size == 0) return Fail(ErrorCode::MalformedImage, "missing_directory");
   if (directory.rva == 0 || directory.size == 0 || directory.size > kMaxRead || !InImage(image, directory.rva, directory.size)) return Fail(ErrorCode::MalformedImage, "directory_range");
@@ -186,7 +187,7 @@ Result<PeImage> InspectPe(const IMemory& memory, Address base) {
     auto& directory = image.directories[index];
     std::memcpy(&directory.rva, Value(optional).data() + 0x70 + index * 8, 4);
     std::memcpy(&directory.size, Value(optional).data() + 0x74 + index * 8, 4);
-    if ((directory.rva == 0) != (directory.size == 0) || (directory.size != 0 && !InImage(image, directory.rva, directory.size))) return Fail(ErrorCode::MalformedImage, "directory_range");
+    if ((directory.rva == 0) != (directory.size == 0) || (index != kCertificateDirectoryIndex && directory.size != 0 && !InImage(image, directory.rva, directory.size))) return Fail(ErrorCode::MalformedImage, "directory_range");
   }
 
   const auto section_bytes_count = static_cast<std::uint64_t>(section_count) * 40;
