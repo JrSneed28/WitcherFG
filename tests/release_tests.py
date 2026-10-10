@@ -48,13 +48,16 @@ class ReleaseTests(unittest.TestCase):
 
     def rewrite(self, change):
         with zipfile.ZipFile(self.package()) as archive:
+            infos = {entry.filename: entry for entry in archive.infolist()}
             payload = [(entry.filename, archive.read(entry)) for entry in archive.infolist()]
         payload = change(payload)
         with zipfile.ZipFile(self.archive, "w", zipfile.ZIP_STORED) as archive:
             for name, data in payload:
+                info = copy.copy(infos.get(name, next(iter(infos.values()))))
+                info.filename = name
                 with warnings.catch_warnings():
                     warnings.filterwarnings("ignore", message="Duplicate name:", category=UserWarning)
-                    archive.writestr(name, data)
+                    archive.writestr(info, data)
 
     def test_installer_inventory_hashes_and_no_private_payload(self):
         with zipfile.ZipFile(self.package()) as archive:
@@ -122,6 +125,11 @@ class ReleaseTests(unittest.TestCase):
                 self.rewrite(change)
                 self.assertTrue(release.verify_release(self.archive, self.identity, None))
 
+    def test_executable_tampering_reaches_payload_sha_check(self):
+        self.rewrite(lambda p: [(n, d + b"x" if n == "WitcherFG.exe" else d) for n, d in p])
+        self.assertEqual(release.verify_release(self.archive, self.identity, None),
+                         ["payload SHA256 manifest mismatch"])
+
     def test_corrupt_zip_is_a_verification_error(self):
         self.archive.write_bytes(b"not a zip")
         self.assertTrue(release.verify_release(self.archive, self.identity, None))
@@ -186,6 +194,106 @@ class ReleaseTests(unittest.TestCase):
         (self.root / "docs/acceptance.md").write_text(record["artifact_sha256"], encoding="utf-8")
         self.assertEqual(release.verify_release(self.archive, self.identity, record), [])
         self.assertEqual(self.archive.read_bytes(), before)
+
+    def git_fixture(self):
+        """Real CLI/Git provenance with fixture bytes; never an executable or acceptance."""
+        repo = self.root / "git-source"
+        repo.mkdir()
+        for name in ("docs", "config", "third_party", "tools", "release"):
+            shutil.copytree(ROOT / name, repo / name, ignore=shutil.ignore_patterns(
+                "superpowers", "bug-reports", "__pycache__", "validation.json"))
+        for name in ("LICENSE", "THIRD_PARTY_NOTICES.md", "CHANGELOG.md"):
+            shutil.copyfile(ROOT / name, repo / name)
+        (repo / "src").mkdir()
+        (repo / "src/probe.cpp").write_text("// synthetic build-input fixture\n", encoding="utf-8")
+        self.fixture_repo = repo
+        self.fixture_git("init")
+        self.fixture_git("add", ".")
+        self.fixture_git("commit", "-m", "synthetic fixture source")
+        commit = self.fixture_git("rev-parse", "HEAD").strip()
+        self.identity = release.build_identity.make_identity(self.metadata,
+            {"commit": commit, "dirty": False, "archive": False,
+             "inputs": release.build_identity._collect_inputs(repo)}, "Release")
+        self.identity["commit_epoch"] = int(self.fixture_git("show", "-s", "--format=%ct", "HEAD"))
+        self.package()
+        self.archive.with_suffix(".manifest.json").write_text(json.dumps({
+            "build": self.identity, "artifact_sha256": release.sha256(self.archive.read_bytes()),
+            "binary_sha256": release.sha256(self.binary.read_bytes())}), encoding="utf-8")
+        return repo, commit
+
+    def fixture_git(self, *arguments):
+        result = subprocess.run(["git", "-c", "user.name=Fixture", "-c", "user.email=fixture@invalid.test",
+            "-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false", "-c", "core.autocrlf=false",
+            *arguments], cwd=self.fixture_repo,
+            text=True, capture_output=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout
+
+    def public_verify(self, record=None):
+        arguments = [sys.executable, str(self.fixture_repo / "tools/release.py"),
+                     "verify", "--archive", str(self.archive)]
+        if record is not None:
+            validation = self.root / "synthetic-validation.json"
+            validation.write_text(json.dumps(record), encoding="utf-8")
+            arguments += ["--validation", str(validation)]
+        return subprocess.run(arguments, cwd=self.fixture_repo, text=True, capture_output=True, timeout=30)
+
+    def test_public_verifier_rejects_nonexistent_acceptance_tag(self):
+        self.git_fixture()
+        tag = "v" + self.identity["version"]
+        result = self.public_verify({**self.validation(), "tag": tag})
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("acceptance tag", result.stderr)
+        self.fixture_git("branch", tag)
+        result = self.public_verify({**self.validation(), "tag": tag})
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("acceptance tag", result.stderr)
+
+    def test_public_verifier_rejects_acceptance_tag_with_changed_inputs_or_metadata(self):
+        repo, tested_commit = self.git_fixture()
+        tag = "v" + self.identity["version"]
+        for kind in ("code", "metadata"):
+            with self.subTest(kind=kind):
+                if kind == "code":
+                    (repo / "src/probe.cpp").write_text("// changed code, not tested\n", encoding="utf-8")
+                else:
+                    path = repo / "release/project.toml"
+                    path.write_text(path.read_text().replace('diagnostic_schema = 1', 'diagnostic_schema = 2'),
+                                    encoding="utf-8")
+                self.fixture_git("add", ".")
+                self.fixture_git("commit", "-m", "synthetic untested " + kind)
+                self.fixture_git("tag", tag)
+                self.fixture_git("checkout", "--detach", tested_commit)
+                result = self.public_verify({**self.validation(), "tag": tag})
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn("acceptance tag", result.stderr)
+                self.fixture_git("tag", "-d", tag)
+
+    def test_public_verifier_accepts_annotated_documentation_only_tag_without_repackaging(self):
+        repo, tested_commit = self.git_fixture()
+        before = self.archive.read_bytes()
+        record = {**self.validation(), "tag": "v" + self.identity["version"]}
+        (repo / "docs/acceptance.md").write_text("Synthetic fixture only: " + record["artifact_sha256"],
+                                                 encoding="utf-8")
+        self.fixture_git("add", ".")
+        self.fixture_git("commit", "-m", "synthetic documentation-only acceptance")
+        tagged_commit = self.fixture_git("rev-parse", "HEAD").strip()
+        self.assertNotEqual(tagged_commit, tested_commit)
+        self.fixture_git("tag", "-a", record["tag"], "-m", "synthetic fixture tag")
+        self.assertEqual(self.fixture_git("rev-parse", "refs/tags/" + record["tag"] + "^{commit}").strip(),
+                         tagged_commit)
+        result = self.public_verify(record)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("external live acceptance matches", result.stdout)
+        self.assertEqual(self.archive.read_bytes(), before)
+
+    def test_public_verifier_accepts_untagged_pending_preview(self):
+        self.git_fixture()
+        result = self.public_verify()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("candidate; live acceptance Pending", result.stdout)
+        result = self.public_verify(self.validation())
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_stable_metadata_cannot_create_unaccepted_archive(self):
         with self.assertRaises(ValueError):

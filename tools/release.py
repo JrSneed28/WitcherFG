@@ -44,7 +44,11 @@ def _read(path: pathlib.Path) -> bytes:
 
 
 def load_metadata(path: pathlib.Path) -> dict:
-    metadata = tomllib.loads(_read(path).decode("utf-8"))
+    return _parse_metadata(_read(path))
+
+
+def _parse_metadata(data: bytes) -> dict:
+    metadata = tomllib.loads(data.decode("utf-8"))
     if not re.fullmatch(SEMVER, metadata.get("version", "")):
         raise ValueError("invalid canonical version")
     if metadata.get("channel") not in {"preview", "stable"}:
@@ -361,6 +365,7 @@ def _validate_acceptance(validation: dict, identity: dict, archive_hash: str, bi
 
 
 def verify_release(archive: pathlib.Path, identity: dict, validation: dict | None) -> list[str]:
+    """Check ZIP/record consistency; the public CLI also proves any claimed Git tag."""
     errors = []
     try:
         _validate_identity(identity)
@@ -428,6 +433,49 @@ def _git(*arguments: str) -> str:
 def _current_digest(metadata: dict) -> str:
     return build_identity.make_identity(metadata, {"commit": "", "archive": True,
               "inputs": build_identity._collect_inputs(ROOT)}, "Release")["input_digest"]
+
+
+def _verify_acceptance_tag(tag: str, identity: dict) -> None:
+    if not tag:
+        return
+    if tag != "v" + identity["version"]:
+        raise ValueError("acceptance tag/version mismatch")
+    try:
+        # Use an exact tag ref, never a branch/shorthand; peel annotated tags to a commit.
+        commit = _git("rev-parse", "--verify", "refs/tags/" + tag + "^{commit}")
+        if not re.fullmatch(r"[0-9a-f]{40}", commit):
+            raise ValueError("invalid tagged commit")
+        inputs = {}
+        metadata_bytes = None
+        for entry in _git("ls-tree", "-r", "-z", "--full-tree", commit).split("\0"):
+            if not entry:
+                continue
+            header, name = entry.split("\t", 1)
+            mode, kind, object_id = header.split()
+            if name != "release/project.toml" and not build_identity._is_build_input(name):
+                continue
+            if kind != "blob" or mode not in {"100644", "100755"}:
+                raise ValueError("nonregular tagged build input")
+            if int(_git("cat-file", "-s", object_id)) > MAX_ENTRY:
+                raise ValueError("tagged input exceeds bound")
+            result = subprocess.run(["git", "cat-file", "blob", object_id], cwd=ROOT,
+                                    capture_output=True, timeout=20)
+            if result.returncode or len(result.stdout) > MAX_ENTRY:
+                raise ValueError("unavailable tagged input")
+            if name == "release/project.toml":
+                metadata_bytes = result.stdout
+            else:
+                inputs[name] = result.stdout
+        if metadata_bytes is None:
+            raise ValueError("missing tagged canonical metadata")
+        metadata = _parse_metadata(metadata_bytes)
+        tagged = build_identity.make_identity(metadata,
+            {"commit": commit, "dirty": False, "archive": False, "inputs": inputs}, identity["build_type"])
+        if any(tagged[key] != identity[key] for key in build_identity.IDENTITY_FIELDS) or \
+                tagged["input_digest"] != identity["input_digest"]:
+            raise ValueError("tagged metadata or build inputs differ from tested binary")
+    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
+        raise ValueError("acceptance tag provenance failed: " + str(error)) from error
 
 
 def record_toolchain(build_root: pathlib.Path) -> dict:
@@ -523,6 +571,8 @@ def main(argv=None) -> int:
                     errors.append("external candidate binary checksum mismatch")
             if errors:
                 raise ValueError("; ".join(errors))
+            if validation is not None:
+                _verify_acceptance_tag(validation["tag"], identity)
             print("Archive verified: " + ("external live acceptance matches" if validation else "candidate; live acceptance Pending"))
         return 0
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError, zipfile.BadZipFile) as error:
