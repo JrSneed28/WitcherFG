@@ -28,9 +28,15 @@ target_link_libraries(wfg_core PRIVATE bcrypt advapi32 psapi shlwapi xmllite ole
 target_compile_options(wfg_core PRIVATE /W4 /permissive-)
 target_compile_definitions(wfg_core PRIVATE _WIN32_WINNT=0x0A00 WINVER=0x0A00)
 
+add_library(wfg_support STATIC src/support_bundle.cpp src/support_storage_windows.cpp)
+target_include_directories(wfg_support PUBLIC include)
+target_link_libraries(wfg_support PUBLIC wfg_core PRIVATE shell32 ole32)
+target_compile_options(wfg_support PRIVATE /W4 /permissive-)
+target_compile_definitions(wfg_support PRIVATE _WIN32_WINNT=0x0A00 WINVER=0x0A00)
+
 add_executable(wfg_launcher src/main.cpp)
 set_target_properties(wfg_launcher PROPERTIES OUTPUT_NAME WitcherFG)
-target_link_libraries(wfg_launcher PRIVATE wfg_core)
+target_link_libraries(wfg_launcher PRIVATE wfg_core wfg_support)
 target_compile_options(wfg_launcher PRIVATE /W4 /permissive-)
 
 add_executable(wfg_tests tests/test_main.cpp tests/pe_tests.cpp tests/core_tests.cpp tests/compatibility_tests.cpp
@@ -46,6 +52,26 @@ foreach(group IN ITEMS pe compatibility process debug configuration diagnostics 
   set_tests_properties(wfg_${group} PROPERTIES LABELS ${group})
 endforeach()
 set_tests_properties(wfg_configuration PROPERTIES LABELS "configuration;config")
+
+add_executable(wfg_support_tests tests/test_main.cpp tests/support_tests.cpp
+  src/support_bundle.cpp src/support_storage_windows.cpp)
+target_include_directories(wfg_support_tests PRIVATE include tests)
+target_link_libraries(wfg_support_tests PRIVATE wfg_core shell32 ole32 advapi32)
+target_compile_options(wfg_support_tests PRIVATE /W4 /permissive-)
+target_compile_definitions(wfg_support_tests PRIVATE WFG_SUPPORT_TESTING
+  _WIN32_WINNT=0x0A00 WINVER=0x0A00)
+set(WFG_SUPPORT_FIXTURE "${CMAKE_CURRENT_BINARY_DIR}/support-fixture-$<CONFIG>.zip")
+set(WFG_SUPPORT_NATIVE_FIXTURE "${CMAKE_CURRENT_BINARY_DIR}/support-native-fixture-$<CONFIG>.zip")
+set(WFG_SUPPORT_TEST_ENV
+  "WFG_SUPPORT_FIXTURE=${WFG_SUPPORT_FIXTURE}"
+  "WFG_SUPPORT_NATIVE_FIXTURE=${WFG_SUPPORT_NATIVE_FIXTURE}")
+add_test(NAME wfg_support COMMAND wfg_support_tests --filter support.)
+set_tests_properties(wfg_support PROPERTIES LABELS support
+  ENVIRONMENT "${WFG_SUPPORT_TEST_ENV}" FIXTURES_SETUP wfg_support_archives)
+add_test(NAME wfg_support_zip COMMAND "${Python3_EXECUTABLE}" -m unittest discover
+  -s "${CMAKE_CURRENT_SOURCE_DIR}/tests" -p support_zip_tests.py)
+set_tests_properties(wfg_support_zip PROPERTIES LABELS support
+  ENVIRONMENT "${WFG_SUPPORT_TEST_ENV}" FIXTURES_REQUIRED wfg_support_archives)
 
 add_executable(wfg_transaction_tests tests/test_main.cpp tests/transaction_tests.cpp)
 target_include_directories(wfg_transaction_tests PRIVATE include tests)
