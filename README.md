@@ -2,13 +2,16 @@
 
 WitcherFG is a portable Windows x64 launcher that attempts guarded, temporary Streamline import routing for one Xbox PC build of The Witcher 3.
 
-**Status: unpublished preview, 0.1.0-preview.1.** The native launcher and synthetic Windows lifecycle tests exist. A packaged player candidate and its installation/gameplay acceptance are Pending. There is no stable release or public download/support URL yet.
+<!-- BEGIN WFG STATUS -->
+**Status: unpublished preview, 0.1.0-preview.1.** A candidate can be packaged locally. Exact-candidate gameplay/install/upgrade/uninstall acceptance is Pending. No stable release is available.
+Release: unpublished. Support: unpublished.
+<!-- END WFG STATUS -->
 
 The earlier local diagnostic probe restored FG/MFG on an RTX 5070 Ti. That observation does not verify this launcher or a release ZIP. `Applied` and `RoutingAlreadyPresent` describe import routing; they do not prove gameplay frame generation.
 
 ## Quick start
 
-Player packaging is pending. Developers can [build the executable](docs/building.md). For a built copy, close the game and keep the utility in its own folder on a fixed local drive, outside the game directory. Run from PowerShell in that folder:
+Developers can [build the executable](docs/building.md) and [package a local candidate](docs/releasing.md). Public downloads and player acceptance remain Pending. For a built copy, close the game and keep the utility in its own folder on a fixed local drive, outside the game directory. Run from PowerShell in that folder:
 
 ```powershell
 .\WitcherFG.exe --help

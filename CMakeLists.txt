@@ -116,6 +116,10 @@ target_compile_options(wfg_lifecycle_tests PRIVATE /W4 /permissive-)
 add_test(NAME wfg_lifecycle COMMAND wfg_lifecycle_tests --filter lifecycle.)
 set_tests_properties(wfg_lifecycle PROPERTIES LABELS lifecycle TIMEOUT 180 RUN_SERIAL TRUE)
 
+add_test(NAME wfg_release COMMAND "${Python3_EXECUTABLE}" -m unittest discover
+  -s "${CMAKE_CURRENT_SOURCE_DIR}/tests" -p release_tests.py)
+set_tests_properties(wfg_release PROPERTIES LABELS "release;identity" WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
+
 get_target_property(WFG_LIFECYCLE_SOURCES wfg_core SOURCES)
 add_library(wfg_lifecycle_core STATIC ${WFG_LIFECYCLE_SOURCES}
   src/launcher.cpp src/support_bundle.cpp src/support_storage_windows.cpp)

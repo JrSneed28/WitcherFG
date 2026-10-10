@@ -22,7 +22,7 @@ ctest --test-dir build/native -C Release --no-tests=error --output-on-failure
 .\build\native\Release\WitcherFG.exe --version
 ```
 
-Configuration requires a Python interpreter; if discovery chooses the wrong installation, pass CMake's `Python3_EXECUTABLE` cache setting with the full path of your installed interpreter. Use the same build directory/configuration consistently. Help shows the supported modes; version includes source commit and build-input digest. CTest must report no failures. Dirty/source-archive identity is development provenance, not release acceptance.
+Configuration requires a Python interpreter; if discovery chooses the wrong installation, pass CMake's `Python3_EXECUTABLE` cache setting with the full path of your installed interpreter. Use the same build directory/configuration consistently. Help shows the supported modes; version includes source commit, build-input digest, channel, dirty/archive booleans and diagnostic schema. CTest must report no failures. Dirty/source-archive identity is development provenance; candidate packaging refuses it.
 
 The VS17 preset is available for developers with that generator installed:
 
@@ -46,4 +46,4 @@ python -m unittest discover -s tests -p documentation_tests.py -v
 
 This runs public-link, evidence-scope, code-coverage, license/form and actual native config/help/version checks. The test runner's configuration snapshot uses a temporary fixed-local directory and never activates the game. Without those environment variables the three native integration cases explicitly skip; such a run does not close the native documentation gate.
 
-See [Windows fixture results](validation/windows-fixture-results.md) for measured synthetic lifecycle scope. The test fixture target is disposable and distinct from the game. Packaging tools/workflows are pending; [releasing](releasing.md) describes the remaining gates without claiming a working packaging command.
+See [Windows fixture results](validation/windows-fixture-results.md) for measured synthetic lifecycle scope. The test fixture target is disposable and distinct from the game. [Releasing](releasing.md) documents rendering, packaging and verification commands. Configured hosted workflows do not establish an executed CI result.

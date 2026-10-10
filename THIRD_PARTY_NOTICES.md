@@ -4,7 +4,7 @@ Project-owned source uses the [MIT License](LICENSE). That grant does not cover 
 
 The source tree vendors toml++ 3.4.0, compiled into the utility. Its source/tag/commit and header/license SHA256 are recorded in [dependency provenance](third_party/dependencies.toml). The full upstream license follows; preserve it in source distributions and future player notices. Windows SDK headers/import libraries are build prerequisites, and the game-owned interposer is inspected at runtime rather than distributed.
 
-Player packaging is pending. Its actual component inventory must be checked against the packager; test fixture executables and debug symbols must not silently become player components.
+The player candidate contains the project executable, configuration, offline guides, project license, these notices and the complete toml++ license. The parser is compiled into the executable; no parser, VCRUNTIME or NVIDIA DLL is redistributed. Test fixture executables, dumps and debug symbols are excluded from the player archive.
 
 ## toml++ 3.4.0
 

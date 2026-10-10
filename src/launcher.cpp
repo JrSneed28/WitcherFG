@@ -191,7 +191,7 @@ RunResult RunLauncher(ILaunchEnvironment& env,std::stop_token external) {
     if(Value(options).mode==Mode::Help||Value(options).mode==Mode::Version) {
       result.status=Status::ReadOnlyCompleted;
       if(Value(options).mode==Mode::Help)env.Diagnostics().WriteConsoleLine(Help);
-      else {const auto& build=EmbeddedBuildIdentity();env.Diagnostics().WriteConsoleLine(std::string("WitcherFG ")+std::string(build.version)+" "+std::string(build.build_type)+" commit="+std::string(build.commit)+" input="+std::string(build.input_digest));}
+      else {const auto& build=EmbeddedBuildIdentity();env.Diagnostics().WriteConsoleLine(std::string("WitcherFG ")+std::string(build.version)+" "+std::string(build.build_type)+" commit="+std::string(build.commit)+" input="+std::string(build.input_digest)+" channel="+std::string(build.channel)+(build.dirty?" dirty=true":" dirty=false")+(build.archive?" archive=true":" archive=false")+" diagnostic_schema="+std::to_string(build.diagnostic_schema));}
       return complete();
     }
     if(expired()){refuse(Timeout(stage));return finish();}

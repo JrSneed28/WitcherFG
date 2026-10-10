@@ -148,6 +148,17 @@ TEST("launcher.readonly_modes_have_zero_activation_attach_and_memory"){
     if(std::string_view(mode)=="--help"||std::string_view(mode)=="--version")CHECK(f.configurations==0&&f.discoveries==0);
   }
 }
+TEST("launcher.version_reports_complete_embedded_identity_without_activation"){
+  Fixture f;f.args={"--version"};CHECK(RunLauncherToConsole(f,{})==0);
+  const auto& identity=EmbeddedBuildIdentity();
+  CHECK(f.storage.console.find("channel="+std::string(identity.channel))!=std::string::npos);
+  CHECK(f.storage.console.find(identity.dirty?"dirty=true":"dirty=false")!=std::string::npos);
+  CHECK(f.storage.console.find(identity.archive?"archive=true":"archive=false")!=std::string::npos);
+  CHECK(f.storage.console.find("diagnostic_schema="+std::to_string(identity.diagnostic_schema))!=std::string::npos);
+  CHECK(f.storage.console.find("commit="+std::string(identity.commit))!=std::string::npos);
+  CHECK(f.storage.console.find("input="+std::string(identity.input_digest))!=std::string::npos);
+  CHECK(f.activated==0&&f.configurations==0&&f.backend.attaches==0&&f.memory_opens==0);
+}
 TEST("launcher.registration_failure_and_collector_failure_are_explicit"){
   Fixture absent;absent.discover_error=Fault(ErrorCode::NoMatchingProcess,Stage::package_discovery);Refusal(absent,Status::LaunchFailed);CHECK(absent.activated==0);
   Fixture collect;collect.args={"--collect-support"};collect.collect_error=Fault(ErrorCode::SupportBundleFailure);Refusal(collect,Status::SupportFailed);CHECK(collect.activated==0);

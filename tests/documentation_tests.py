@@ -119,16 +119,13 @@ def read_config_snapshot(test_runner: pathlib.Path, config: pathlib.Path) -> dic
 
 
 def assert_version_identity(text: str, generated_identity: dict | None = None) -> dict:
-    version_lines = [line for line in text.splitlines() if line.startswith("WitcherFG ")]
-    if len(version_lines) != 1:
-        raise AssertionError("expected one version identity line")
-    match = re.fullmatch(
-        r"WitcherFG (?P<version>\S+) (?P<build_type>\S+) "
-        r"commit=(?P<commit>(?:[0-9a-f]{40})?) input=(?P<input_digest>[0-9a-f]{64})",
-        version_lines[0])
-    if not match:
-        raise AssertionError("malformed version identity")
-    fields = match.groupdict()
+    import sys
+    sys.path.insert(0, str(ROOT))
+    from tools.release import parse_version
+    try:
+        fields = parse_version(text)
+    except ValueError as error:
+        raise AssertionError(str(error)) from error
     if generated_identity is not None:
         for key, value in fields.items():
             if generated_identity.get(key) != value:
@@ -141,18 +138,18 @@ def assert_version_identity(text: str, generated_identity: dict | None = None) -
 class VersionIdentityTests(unittest.TestCase):
     def test_repository_shape_accepts_full_commit(self):
         fields = assert_version_identity(
-            "WitcherFG 0.1.0-preview.1 Release commit=" + "a" * 40 + " input=" + "b" * 64 + "\n")
+            "WitcherFG 0.1.0-preview.1 Release commit=" + "a" * 40 + " input=" + "b" * 64 + " channel=preview dirty=false archive=false diagnostic_schema=1\n")
         self.assertEqual(fields["commit"], "a" * 40)
         self.assertEqual(fields["input_digest"], "b" * 64)
 
     def test_archive_shape_keeps_commit_empty(self):
         fields = assert_version_identity(
-            "WitcherFG 0.1.0-preview.1 Release commit= input=" + "b" * 64 + "\n")
+            "WitcherFG 0.1.0-preview.1 Release commit= input=" + "b" * 64 + " channel=preview dirty=false archive=true diagnostic_schema=1\n")
         self.assertEqual(fields["commit"], "")
         self.assertEqual(fields["input_digest"], "b" * 64)
 
     def test_identity_line_accepts_actual_completion_output(self):
-        line = "WitcherFG 0.1.0-preview.1 Release commit=" + "a" * 40 + " input=" + "b" * 64
+        line = "WitcherFG 0.1.0-preview.1 Release commit=" + "a" * 40 + " input=" + "b" * 64 + " channel=preview dirty=false archive=false diagnostic_schema=1"
         output = line + "\nThe read-only operation completed.\nCompleted UTC: 2026-10-10T23:24:33Z elapsed_ms=0\n"
         self.assertEqual(assert_version_identity(output)["commit"], "a" * 40)
         with self.assertRaises(AssertionError):
@@ -174,18 +171,18 @@ class VersionIdentityTests(unittest.TestCase):
         metadata = {"version": "0.1.0-preview.1", "channel": "preview", "diagnostic_schema": 1}
         for archive in (False, True):
             generated = make_identity(metadata, {"commit": "a" * 40, "archive": archive, "inputs": {}}, "Release")
-            text = "WitcherFG 0.1.0-preview.1 Release commit=" + generated["commit"] + " input=" + generated["input_digest"]
+            text = "WitcherFG 0.1.0-preview.1 Release commit=" + generated["commit"] + " input=" + generated["input_digest"] + " channel=preview dirty=false archive=" + str(archive).lower() + " diagnostic_schema=1"
             with self.subTest(archive=archive):
                 fields = assert_version_identity(text, generated)
                 self.assertEqual(fields["commit"], "" if archive else "a" * 40)
 
     def test_supplied_identity_mismatch_is_rejected(self):
-        text = "WitcherFG 0.1.0-preview.1 Release commit=" + "a" * 40 + " input=" + "b" * 64
+        text = "WitcherFG 0.1.0-preview.1 Release commit=" + "a" * 40 + " input=" + "b" * 64 + " channel=preview dirty=false archive=false diagnostic_schema=1"
         identity = {"version": "0.1.0-preview.1", "build_type": "Release", "commit": "a" * 40,
-                    "input_digest": "b" * 64, "archive": False}
+                    "input_digest": "b" * 64, "archive": False, "dirty": False, "channel": "preview", "diagnostic_schema": 1}
         self.assertEqual(assert_version_identity(text, identity)["commit"], "a" * 40)
         for key, wrong in (("version", "0.2.0"), ("build_type", "Debug"), ("commit", "c" * 40),
-                           ("input_digest", "c" * 64), ("archive", True)):
+                           ("input_digest", "c" * 64), ("archive", True), ("dirty", True), ("channel", "stable"), ("diagnostic_schema", 2)):
             with self.subTest(key=key), self.assertRaises(AssertionError):
                 assert_version_identity(text, {**identity, key: wrong})
 
