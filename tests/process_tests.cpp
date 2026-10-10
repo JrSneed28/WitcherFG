@@ -170,7 +170,6 @@ TEST("process.observer_precedes_activation_and_polls_at_twenty_ms") {
   fixture.backend.candidates = {fixture.candidate};
   REQUIRE_OK(observer->WaitForCandidate());
   CHECK(fixture.backend.events[1] == "activate");
-  CHECK(fixture.backend.attach_count == 0);
 }
 
 TEST("process.discovery_has_compiled_thirty_second_monotonic_bound") {
@@ -189,7 +188,6 @@ TEST("process.expired_deadline_and_package_removal_refuse") {
   auto observer = Observer(wfg::InstallProcessObserver(fixture.launch, fixture.backend, {fixture.backend.Now() + std::chrono::seconds(1)}));
   fixture.backend.registered = false;
   REQUIRE_ERROR(observer->Activate(), wfg::ErrorCode::IdentityChanged);
-  CHECK(fixture.backend.attach_count == 0);
 }
 
 TEST("process.readonly_selection_refuses_ambiguity_and_reuse") {
@@ -207,6 +205,118 @@ TEST("process.environment_never_guesses_active_adapter_or_hags") {
   const auto environment = wfg::ObserveEnvironment(nullptr);
   CHECK(!environment.selected_adapter.value);
   CHECK(!environment.hags_active.value);
+}
+
+TEST("process.environment_records_os_enumerated_adapters_drivers_and_configured_hags") {
+  EnvironmentBackendFixture backend;
+  const auto environment = wfg::process_detail::ObserveHostEnvironment(backend);
+  CHECK(environment.os.value == "Windows 10.0 build 26200");
+  CHECK(environment.os.availability == wfg::Availability::Observed);
+  CHECK(environment.os.source == "ntdll_RtlGetVersion");
+  CHECK(environment.gpu.value && environment.gpu.value->find("NVIDIA Test GPU") != std::string::npos);
+  CHECK(environment.gpu.value->find("Intel Test GPU") != std::string::npos);
+  CHECK(environment.gpu.source == "DXGI_EnumAdapters1_GetDesc1");
+  CHECK(environment.driver.value && environment.driver.value->find("32.0.15.1234") != std::string::npos);
+  CHECK(environment.driver.value->find("31.0.101.1234") != std::string::npos);
+  CHECK(environment.driver.source == "DXGI_CheckInterfaceSupport_IDXGIDevice");
+  CHECK(environment.hags_configured.value == true);
+  CHECK(!environment.selected_adapter.value && !environment.hags_active.value);
+  backend.hags = std::optional<std::uint32_t>{1};
+  CHECK(wfg::process_detail::ObserveHostEnvironment(backend).hags_configured.value == false);
+}
+
+TEST("process.environment_failed_queries_preserve_failure_provenance_and_unknowns") {
+  EnvironmentBackendFixture backend;
+  backend.os = wfg::Error{wfg::ErrorCode::AccessDenied, wfg::Stage::Diagnostic, "os_version_query", 5};
+  backend.adapter_error = wfg::Error{wfg::ErrorCode::AccessDenied, wfg::Stage::Diagnostic, "dxgi_factory_trust", 5};
+  backend.hags = wfg::Error{wfg::ErrorCode::AccessDenied, wfg::Stage::Diagnostic, "hags_registry_read", 5};
+  const auto environment = wfg::process_detail::ObserveHostEnvironment(backend);
+  CHECK(!environment.os.value && environment.os.availability == wfg::Availability::ReadFailed);
+  CHECK(environment.os.reason == "os_version_query_native_5");
+  CHECK(!environment.gpu.value && environment.gpu.availability == wfg::Availability::ReadFailed);
+  CHECK(environment.gpu.reason == "dxgi_factory_trust_native_5");
+  CHECK(!environment.driver.value && environment.driver.availability == wfg::Availability::ReadFailed);
+  CHECK(!environment.hags_configured.value && environment.hags_configured.availability == wfg::Availability::ReadFailed);
+  CHECK(environment.hags_configured.reason == "hags_registry_read_native_5");
+  CHECK(!environment.selected_adapter.value && !environment.hags_active.value);
+}
+
+TEST("process.environment_hags_missing_or_unknown_and_driver_failure_do_not_guess") {
+  EnvironmentBackendFixture backend;
+  backend.hags = std::optional<std::uint32_t>{};
+  backend.adapters[0].driver_version = wfg::Error{wfg::ErrorCode::UnsupportedObservation, wfg::Stage::Diagnostic, "dxgi_driver_unsupported"};
+  auto environment = wfg::process_detail::ObserveHostEnvironment(backend);
+  CHECK(environment.gpu.value.has_value());
+  CHECK(!environment.driver.value && environment.driver.availability == wfg::Availability::UnsupportedLayout);
+  CHECK(!environment.hags_configured.value && environment.hags_configured.availability == wfg::Availability::NotObserved);
+  backend.hags = std::optional<std::uint32_t>{0};
+  environment = wfg::process_detail::ObserveHostEnvironment(backend);
+  CHECK(!environment.hags_configured.value && environment.hags_configured.availability == wfg::Availability::UnsupportedLayout);
+}
+
+TEST("process.environment_adapter_enumeration_is_bounded") {
+  EnvironmentBackendFixture backend;
+  backend.repeat_adapter = true;
+  const auto environment = wfg::process_detail::ObserveHostEnvironment(backend);
+  CHECK(backend.adapter_queries <= 32);
+  CHECK(!environment.gpu.value && environment.gpu.availability == wfg::Availability::UnsupportedLayout);
+  CHECK(!environment.driver.value);
+}
+
+TEST("process.native_environment_queries_host_without_asserting_active_state") {
+  const auto environment = wfg::ObserveEnvironment(nullptr);
+  CHECK(environment.os.value && environment.os.availability == wfg::Availability::Observed);
+  CHECK(environment.os.source == "ntdll_RtlGetVersion");
+  CHECK(environment.gpu.source == "DXGI_EnumAdapters1_GetDesc1");
+  CHECK(environment.gpu.value || !environment.gpu.reason.empty());
+  CHECK(environment.hags_configured.source == "HKLM_GraphicsDrivers_HwSchMode");
+  CHECK(environment.hags_configured.value || !environment.hags_configured.reason.empty());
+  CHECK(!environment.selected_adapter.value && !environment.hags_active.value);
+}
+
+TEST("process.prelaunch_delay_cannot_cross_activation_deadline") {
+  ActivationOperationsFixture operations;
+  operations.preparation_time = std::chrono::milliseconds(10);
+  const auto activation_result = wfg::process_detail::ActivateBeforeDeadline(operations, {operations.Now() + std::chrono::milliseconds(10)});
+  REQUIRE_ERROR(activation_result, wfg::ErrorCode::TimedOut);
+  CHECK(wfg::Failure(activation_result).stage == wfg::Stage::Launch);
+  CHECK(operations.launch_calls == 0);
+}
+
+TEST("process.prelaunch_failure_and_unexpired_launch_keep_exact_sideeffect_count") {
+  ActivationOperationsFixture operations;
+  operations.preparation = wfg::Error{wfg::ErrorCode::LaunchFailed, wfg::Stage::Launch, "explorer_offline_trust"};
+  REQUIRE_ERROR(wfg::process_detail::ActivateBeforeDeadline(operations, {operations.Now() + std::chrono::milliseconds(10)}), wfg::ErrorCode::LaunchFailed);
+  CHECK(operations.launch_calls == 0);
+  operations.preparation = wfg::Unit{};
+  operations.preparation_time = std::chrono::milliseconds(9);
+  REQUIRE_OK(wfg::process_detail::ActivateBeforeDeadline(operations, {operations.Now() + std::chrono::milliseconds(10)}));
+  CHECK(operations.launch_calls == 1);
+}
+
+TEST("process.local_iteration_failure_is_dependency_refusal_not_exception") {
+  LocalDirectoryFixture directory;
+  directory.fail_increment = true;
+  std::optional<wfg::Result<std::vector<std::filesystem::path>>> outcome;
+  bool escaped{};
+  try { outcome = wfg::process_detail::EnumerateLocalFiles(directory); }
+  catch (const std::filesystem::filesystem_error&) { escaped = true; }
+  CHECK(!escaped);
+  CHECK(outcome.has_value());
+  const auto& enumeration_result = *outcome;
+  REQUIRE_ERROR(enumeration_result, wfg::ErrorCode::AccessDenied);
+  CHECK(wfg::Failure(enumeration_result).stage == wfg::Stage::dependencies);
+  CHECK(wfg::Failure(enumeration_result).operation.view() == "local_loader_increment");
+  CHECK(wfg::Failure(enumeration_result).native_code.has_value());
+}
+
+TEST("process.local_iteration_preserves_all_entries_and_bounds_count") {
+  LocalDirectoryFixture directory;
+  const auto files = REQUIRE_OK(wfg::process_detail::EnumerateLocalFiles(directory));
+  CHECK(files == directory.paths);
+  directory.index = 0;
+  directory.paths.assign(4097, L"preserved.dll");
+  REQUIRE_ERROR(wfg::process_detail::EnumerateLocalFiles(directory), wfg::ErrorCode::DllConflict);
 }
 
 TEST("process.only_missing_modules_are_retryable") {

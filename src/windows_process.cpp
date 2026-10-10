@@ -13,6 +13,7 @@
 #include <softpub.h>
 #include <mscat.h>
 #include <bcrypt.h>
+#include <dxgi1_2.h>
 #include <wrl/client.h>
 
 #include <algorithm>
@@ -518,15 +519,8 @@ Result<std::unique_ptr<IWritableMemory>> OpenMemory(const OwnedProcess& process)
   return std::unique_ptr<IWritableMemory>(new WritableMemory(Value(handle)));
 }
 
-EnvironmentSnapshot ObserveEnvironment(const ObservedProcess*) {
-  EnvironmentSnapshot result;
-  result.selected_adapter.source = "game_adapter_not_queried";
-  result.hags_active.source = "active_hags_not_queried";
-  result.gpu.source = "adapter_enumeration_not_queried";
-  result.driver.source = "driver_enumeration_not_queried";
-  result.hags_configured.source = "hags_configuration_not_queried";
-  return result;
-}
+namespace { EnvironmentSnapshot NativeEnvironment(); }
+EnvironmentSnapshot ObserveEnvironment(const ObservedProcess*) { return NativeEnvironment(); }
 
 namespace {
 Result<Pin> OpenFile(const std::wstring& path) {
@@ -671,9 +665,218 @@ Result<process_detail::FileEvidence> Evidence(HANDLE file, const std::wstring& p
   if (version.empty()) return Fail(ErrorCode::UntrustedInterposer, "file_version", Stage::dependencies);
   return process_detail::FileEvidence{Value(bytes).size(), Value(hash), version, true, nvidia ? DependencySigner::Nvidia : DependencySigner::Microsoft};
 }
+class NativeEnvironmentBackend final : public process_detail::IEnvironmentBackend {
+public:
+  Result<process_detail::OsBuild> QueryOsBuild() override {
+    const auto ntdll = GetModuleHandleW(L"ntdll.dll");
+    const auto address = ntdll ? GetProcAddress(ntdll, "RtlGetVersion") : nullptr;
+    if (!address) return Fail(ErrorCode::UnsupportedObservation, "os_version_api", Stage::Diagnostic);
+    using QueryVersion = LONG(WINAPI*)(OSVERSIONINFOW*);
+    QueryVersion query{};
+    static_assert(sizeof(query) == sizeof(address));
+    std::memcpy(&query, &address, sizeof(query));
+    OSVERSIONINFOW version{sizeof(version)};
+    const auto status = query(&version);
+    if (status != 0) return Fail(ErrorCode::DiagnosticFailure, "os_version_query", Stage::Diagnostic, static_cast<DWORD>(status));
+    return process_detail::OsBuild{version.dwMajorVersion, version.dwMinorVersion, version.dwBuildNumber};
+  }
+  Result<std::optional<std::uint32_t>> QueryHagsMode() override {
+    DWORD mode{}, type{}, size = sizeof(mode);
+    const auto status = RegGetValueW(HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Control\\GraphicsDrivers", L"HwSchMode", RRF_RT_REG_DWORD | RRF_ZEROONFAILURE, &type, &mode, &size);
+    if (status == ERROR_FILE_NOT_FOUND || status == ERROR_PATH_NOT_FOUND) return std::optional<std::uint32_t>{};
+    if (status == ERROR_UNSUPPORTED_TYPE || (status == ERROR_SUCCESS && (type != REG_DWORD || size != sizeof(mode)))) return Fail(ErrorCode::UnsupportedObservation, "hags_registry_type", Stage::Diagnostic, status);
+    if (status != ERROR_SUCCESS) return Fail(ErrorCode::AccessDenied, "hags_registry_read", Stage::Diagnostic, status);
+    return std::optional<std::uint32_t>{mode};
+  }
+  Result<std::optional<process_detail::AdapterFacts>> QueryAdapter(std::uint32_t index) override {
+    const auto factory = EnsureFactory();
+    if (!IsOk(factory)) return Failure(factory);
+    Microsoft::WRL::ComPtr<IDXGIAdapter1> adapter;
+    const auto status = factory_->EnumAdapters1(index, &adapter);
+    if (status == DXGI_ERROR_NOT_FOUND) return std::optional<process_detail::AdapterFacts>{};
+    if (FAILED(status)) return Fail(ErrorCode::DiagnosticFailure, "dxgi_adapter_enumeration", Stage::Diagnostic, static_cast<DWORD>(status));
+    DXGI_ADAPTER_DESC1 description{};
+    const auto described = adapter->GetDesc1(&description);
+    if (FAILED(described)) return Fail(ErrorCode::DiagnosticFailure, "dxgi_adapter_description", Stage::Diagnostic, static_cast<DWORD>(described));
+    if (description.Description[127] != L'\0') return Fail(ErrorCode::UnsupportedObservation, "dxgi_description_size", Stage::Diagnostic);
+    std::string model;
+    for (const auto character : description.Description) {
+      if (character == L'\0' || model.size() >= 112) break;
+      model.push_back(character >= 32 && character <= 126 && character != L'\\' && character != L'/' ? static_cast<char>(character) : '?');
+    }
+    if (description.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) model += " (software)";
+    LARGE_INTEGER version{};
+    const auto supported = adapter->CheckInterfaceSupport(__uuidof(IDXGIDevice), &version);
+    Result<std::string> driver = Fail(supported == DXGI_ERROR_UNSUPPORTED ? ErrorCode::UnsupportedObservation : ErrorCode::DiagnosticFailure, "dxgi_driver_query", Stage::Diagnostic, static_cast<DWORD>(supported));
+    if (supported == S_OK) {
+      const auto packed = static_cast<std::uint64_t>(version.QuadPart);
+      driver = std::to_string((packed >> 48) & 0xffff) + "." + std::to_string((packed >> 32) & 0xffff) + "." + std::to_string((packed >> 16) & 0xffff) + "." + std::to_string(packed & 0xffff);
+    }
+    return std::optional<process_detail::AdapterFacts>{{std::move(model), description.VendorId, description.DeviceId, std::move(driver)}};
+  }
+private:
+  Result<Unit> EnsureFactory() {
+    if (factory_) return Unit{};
+    wchar_t system[MAX_PATH]{};
+    const auto length = GetSystemDirectoryW(system, MAX_PATH);
+    if (length == 0 || length >= MAX_PATH) return Fail(ErrorCode::AccessDenied, "dxgi_system_directory", Stage::Diagnostic, GetLastError());
+    const auto path = std::wstring(system) + L"\\dxgi.dll";
+    const auto file = OpenFile(path);
+    if (!IsOk(file)) return Fail(ErrorCode::AccessDenied, "dxgi_system_file", Stage::Diagnostic, Failure(file).native_code.value_or(0));
+    if (!Signature(Value(file).get(), path, false)) return Fail(ErrorCode::UntrustedInterposer, "dxgi_factory_trust", Stage::Diagnostic);
+    const auto module = LoadLibraryExW(path.c_str(), nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32 | LOAD_LIBRARY_REQUIRE_SIGNED_TARGET);
+    if (!module) return Fail(ErrorCode::AccessDenied, "dxgi_system_load", Stage::Diagnostic, GetLastError());
+    library_ = Pin(module, [](void* handle) noexcept { FreeLibrary(static_cast<HMODULE>(handle)); });
+    auto handle = Duplicate(GetCurrentProcess(), ReadRights);
+    if (!IsOk(handle)) return Failure(handle);
+    ReadMemory local(Value(handle));
+    const auto backing = process_detail::VerifyBackingImage(GetCurrentProcess(), reinterpret_cast<Address>(module), path, local);
+    if (!IsOk(backing)) return Fail(ErrorCode::UntrustedInterposer, "dxgi_loaded_correspondence", Stage::Diagnostic, Failure(backing).native_code.value_or(0));
+    const auto address = GetProcAddress(module, "CreateDXGIFactory1");
+    MEMORY_BASIC_INFORMATION region{};
+    if (!address || VirtualQuery(reinterpret_cast<LPCVOID>(address), &region, sizeof(region)) != sizeof(region) || region.AllocationBase != module) return Fail(ErrorCode::UnsupportedObservation, "dxgi_factory_export", Stage::Diagnostic);
+    using CreateFactory = HRESULT(WINAPI*)(REFIID, void**);
+    CreateFactory create{};
+    static_assert(sizeof(create) == sizeof(address));
+    std::memcpy(&create, &address, sizeof(create));
+    const auto created = create(__uuidof(IDXGIFactory1), reinterpret_cast<void**>(factory_.GetAddressOf()));
+    if (FAILED(created)) return Fail(ErrorCode::DiagnosticFailure, "dxgi_factory_create", Stage::Diagnostic, static_cast<DWORD>(created));
+    return Unit{};
+  }
+  Pin library_;
+  Microsoft::WRL::ComPtr<IDXGIFactory1> factory_;
+};
+EnvironmentSnapshot NativeEnvironment() {
+  NativeEnvironmentBackend backend;
+  return process_detail::ObserveHostEnvironment(backend);
+}
 }
 
 namespace process_detail {
+namespace {
+Availability QueryAvailability(const Error& error) {
+  return error.code == ErrorCode::UnsupportedObservation ? Availability::UnsupportedLayout : Availability::ReadFailed;
+}
+std::string QueryReason(const Error& error) {
+  auto reason = std::string(error.operation.view());
+  if (error.native_code) reason += "_native_" + std::to_string(*error.native_code);
+  return reason;
+}
+bool NumericVersion(std::string_view value) {
+  return !value.empty() && value.size() <= 64 && std::all_of(value.begin(), value.end(), [](char character) { return (character >= '0' && character <= '9') || character == '.'; });
+}
+bool ModelText(std::string_view value) {
+  return !value.empty() && value.size() <= 128 && std::all_of(value.begin(), value.end(), [](unsigned char character) { return character >= 32 && character <= 126 && character != '\\' && character != '/'; });
+}
+}
+EnvironmentSnapshot ObserveHostEnvironment(IEnvironmentBackend& backend) {
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+  EnvironmentSnapshot snapshot;
+  snapshot.os.source = "ntdll_RtlGetVersion";
+  snapshot.gpu.source = "DXGI_EnumAdapters1_GetDesc1";
+  snapshot.driver.source = "DXGI_CheckInterfaceSupport_IDXGIDevice";
+  snapshot.hags_configured.source = "HKLM_GraphicsDrivers_HwSchMode";
+  snapshot.selected_adapter.source = "game_adapter_not_queried";
+  snapshot.hags_active.source = "active_hags_not_queried";
+  const auto os = backend.QueryOsBuild();
+  if (IsOk(os)) {
+    const auto& version = Value(os);
+    snapshot.os.value = "Windows " + std::to_string(version.major) + "." + std::to_string(version.minor) + " build " + std::to_string(version.build);
+    snapshot.os.availability = Availability::Observed;
+  } else {
+    snapshot.os.availability = QueryAvailability(Failure(os));
+    snapshot.os.reason = QueryReason(Failure(os));
+  }
+  const auto hags = backend.QueryHagsMode();
+  if (!IsOk(hags)) {
+    snapshot.hags_configured.availability = QueryAvailability(Failure(hags));
+    snapshot.hags_configured.reason = QueryReason(Failure(hags));
+  } else if (!Value(hags)) {
+    snapshot.hags_configured.reason = "hags_mode_not_configured";
+  } else if (*Value(hags) == 1 || *Value(hags) == 2) {
+    snapshot.hags_configured.value = *Value(hags) == 2;
+    snapshot.hags_configured.availability = Availability::Observed;
+  } else {
+    snapshot.hags_configured.availability = Availability::UnsupportedLayout;
+    snapshot.hags_configured.reason = "hags_mode_not_explicit_enabled_disabled";
+  }
+  std::string models, drivers;
+  bool driver_failure{}, finished{};
+  for (std::uint32_t index = 0; index < 32; ++index) {
+    if (std::chrono::steady_clock::now() >= deadline) {
+      snapshot.gpu.availability = snapshot.driver.availability = Availability::ReadFailed;
+      snapshot.gpu.reason = snapshot.driver.reason = "host_observation_deadline";
+      return snapshot;
+    }
+    const auto adapter = backend.QueryAdapter(index);
+    if (std::chrono::steady_clock::now() >= deadline) {
+      snapshot.gpu.availability = snapshot.driver.availability = Availability::ReadFailed;
+      snapshot.gpu.reason = snapshot.driver.reason = "host_observation_deadline";
+      return snapshot;
+    }
+    if (!IsOk(adapter)) {
+      snapshot.gpu.availability = snapshot.driver.availability = QueryAvailability(Failure(adapter));
+      snapshot.gpu.reason = snapshot.driver.reason = QueryReason(Failure(adapter));
+      return snapshot;
+    }
+    if (!Value(adapter)) { finished = true; break; }
+    const auto& facts = *Value(adapter);
+    if (!ModelText(facts.model)) {
+      snapshot.gpu.availability = snapshot.driver.availability = Availability::UnsupportedLayout;
+      snapshot.gpu.reason = snapshot.driver.reason = "adapter_description_layout";
+      return snapshot;
+    }
+    const auto identity = "adapter " + std::to_string(index) + " " + facts.model + " vendor " + std::to_string(facts.vendor) + " device " + std::to_string(facts.device);
+    if (!models.empty()) models += "; ";
+    models += identity;
+    if (!IsOk(facts.driver_version) || !NumericVersion(Value(facts.driver_version))) {
+      if (!driver_failure) {
+        snapshot.driver.availability = IsOk(facts.driver_version) ? Availability::UnsupportedLayout : QueryAvailability(Failure(facts.driver_version));
+        snapshot.driver.reason = IsOk(facts.driver_version) ? "driver_version_layout" : QueryReason(Failure(facts.driver_version));
+      }
+      driver_failure = true;
+    } else {
+      if (!drivers.empty()) drivers += "; ";
+      drivers += "adapter " + std::to_string(index) + " " + Value(facts.driver_version);
+    }
+  }
+  if (!finished) {
+    snapshot.gpu.availability = snapshot.driver.availability = Availability::UnsupportedLayout;
+    snapshot.gpu.reason = snapshot.driver.reason = "adapter_enumeration_limit";
+    return snapshot;
+  }
+  if (models.empty()) {
+    snapshot.gpu.reason = snapshot.driver.reason = "no_enumerated_adapters";
+    return snapshot;
+  }
+  snapshot.gpu.value = std::move(models);
+  snapshot.gpu.availability = Availability::Observed;
+  if (!driver_failure) {
+    snapshot.driver.value = std::move(drivers);
+    snapshot.driver.availability = Availability::Observed;
+  }
+  return snapshot;
+}
+Result<Unit> ActivateBeforeDeadline(IActivationOperations& operations, Deadline deadline) {
+  if (operations.Now() >= deadline.value) return Fail(ErrorCode::TimedOut, "activation_deadline", Stage::Launch);
+  const auto prepared = operations.Prepare();
+  if (!IsOk(prepared)) return Failure(prepared);
+  if (operations.Now() >= deadline.value) return Fail(ErrorCode::TimedOut, "activation_deadline", Stage::Launch);
+  return operations.Launch();
+}
+Result<std::vector<std::filesystem::path>> EnumerateLocalFiles(ILocalDirectory& directory) {
+  std::vector<std::filesystem::path> paths;
+  while (!directory.AtEnd()) {
+    if (paths.size() >= 4096) return Fail(ErrorCode::DllConflict, "local_loader_limit", Stage::dependencies);
+    auto path = directory.Current();
+    if (path.native().size() >= MaxPath) return Fail(ErrorCode::DllConflict, "local_loader_path_limit", Stage::dependencies);
+    paths.push_back(std::move(path));
+    std::error_code error;
+    directory.Increment(error);
+    if (error) return Fail(ErrorCode::AccessDenied, "local_loader_increment", Stage::dependencies, static_cast<DWORD>(error.value()));
+  }
+  return paths;
+}
 Observed<DependencyRole> IdentifyDependencyRole(const IMemory& memory, const PeImage& image, const FileEvidence& evidence, std::string_view) {
   Observed<DependencyRole> role;
   role.source = "authenticated_loaded_exports";
@@ -818,28 +1021,46 @@ Result<Unit> VerifyBackingImage(void* handle, Address base, const std::wstring& 
 
 Result<Unit> NativeProcessBackend::Activate() {
   if (!installed_ || activated_) return Fail(ErrorCode::LaunchFailed, "activation_state", Stage::Launch);
-  if (Now() >= deadline_.value) return Fail(ErrorCode::TimedOut, "activation_deadline", Stage::Launch);
-  const auto registered = CheckRegistration();
-  if (!IsOk(registered)) return Failure(registered);
-  const auto existing = Enumerate();
-  if (!IsOk(existing)) return Failure(existing);
-  const auto selected = SelectCandidate(Value(existing), Identity(false));
-  if (IsOk(selected) || Failure(selected).code != ErrorCode::NoMatchingProcess) return Fail(IsOk(selected) ? ErrorCode::AlreadyRunning : Failure(selected).code, "activation_existing", Stage::Launch);
-  wchar_t windows[MAX_PATH]{};
-  const auto length = GetWindowsDirectoryW(windows, MAX_PATH);
-  if (length == 0 || length >= MAX_PATH) return Fail(ErrorCode::LaunchFailed, "windows_directory", Stage::Launch);
-  const auto explorer = std::wstring(windows) + L"\\explorer.exe";
-  const auto file = OpenFile(explorer);
-  if (!IsOk(file)) return Failure(file);
-  if (!Signature(Value(file).get(), explorer, false)) return Fail(ErrorCode::LaunchFailed, "explorer_offline_trust", Stage::Launch);
-  std::wstring command = L"\"" + explorer + L"\" \"shell:AppsFolder\\" + Family + L"!" + Application + L"\"";
-  STARTUPINFOW startup{sizeof(startup)};
-  PROCESS_INFORMATION process{};
-  if (!CreateProcessW(explorer.c_str(), command.data(), nullptr, nullptr, FALSE, CREATE_UNICODE_ENVIRONMENT, nullptr, windows, &startup, &process)) return Fail(ErrorCode::LaunchFailed, "registered_activation", Stage::Launch, GetLastError());
-  CloseHandle(process.hThread);
-  CloseHandle(process.hProcess);
-  activated_ = true;
-  return Unit{};
+  class Operations final : public process_detail::IActivationOperations {
+  public:
+    explicit Operations(NativeProcessBackend& backend) : backend_(backend) {}
+    std::chrono::steady_clock::time_point Now() const override { return backend_.Now(); }
+    Result<Unit> Prepare() override {
+      const auto registered = backend_.CheckRegistration();
+      if (!IsOk(registered)) return Failure(registered);
+      const auto existing = backend_.Enumerate();
+      if (!IsOk(existing)) return Failure(existing);
+      const auto selected = SelectCandidate(Value(existing), backend_.Identity(false));
+      if (IsOk(selected) || Failure(selected).code != ErrorCode::NoMatchingProcess) return Fail(IsOk(selected) ? ErrorCode::AlreadyRunning : Failure(selected).code, "activation_existing", Stage::Launch);
+      wchar_t windows[MAX_PATH]{};
+      const auto length = GetWindowsDirectoryW(windows, MAX_PATH);
+      if (length == 0 || length >= MAX_PATH) return Fail(ErrorCode::LaunchFailed, "windows_directory", Stage::Launch);
+      windows_ = windows;
+      explorer_ = windows_ + L"\\explorer.exe";
+      const auto file = OpenFile(explorer_);
+      if (!IsOk(file)) return Failure(file);
+      file_ = Value(file);
+      if (!Signature(file_.get(), explorer_, false)) return Fail(ErrorCode::LaunchFailed, "explorer_offline_trust", Stage::Launch);
+      command_ = L"\"" + explorer_ + L"\" \"shell:AppsFolder\\" + Family + L"!" + Application + L"\"";
+      return Unit{};
+    }
+    Result<Unit> Launch() override {
+      STARTUPINFOW startup{sizeof(startup)};
+      PROCESS_INFORMATION process{};
+      if (Now() >= backend_.deadline_.value) return Fail(ErrorCode::TimedOut, "activation_deadline", Stage::Launch);
+      if (!CreateProcessW(explorer_.c_str(), command_.data(), nullptr, nullptr, FALSE, CREATE_UNICODE_ENVIRONMENT, nullptr, windows_.c_str(), &startup, &process)) return Fail(ErrorCode::LaunchFailed, "registered_activation", Stage::Launch, GetLastError());
+      CloseHandle(process.hThread);
+      CloseHandle(process.hProcess);
+      return Unit{};
+    }
+  private:
+    NativeProcessBackend& backend_;
+    std::wstring windows_, explorer_, command_;
+    Pin file_;
+  } operations(*this);
+  const auto launched = process_detail::ActivateBeforeDeadline(operations, deadline_);
+  if (IsOk(launched)) activated_ = true;
+  return launched;
 }
 
 namespace {
@@ -858,6 +1079,15 @@ bool ProxyName(const std::wstring& basename) {
   constexpr std::array names{L"dxgi.dll", L"d3d12.dll", L"d3d11.dll", L"dinput8.dll", L"version.dll", L"winmm.dll", L"dsound.dll", L"winhttp.dll", L"wininet.dll", L"xinput1_3.dll", L"dbghelp.dll"};
   return std::any_of(names.begin(), names.end(), [&](const auto* name) { return Equal(name, basename); });
 }
+class LocalDirectory final : public process_detail::ILocalDirectory {
+public:
+  explicit LocalDirectory(std::filesystem::directory_iterator iterator) : iterator_(std::move(iterator)) {}
+  bool AtEnd() const override { return iterator_ == std::filesystem::directory_iterator{}; }
+  std::filesystem::path Current() const override { return iterator_->path(); }
+  void Increment(std::error_code& error) override { iterator_.increment(error); }
+private:
+  std::filesystem::directory_iterator iterator_;
+};
 Result<RuntimeInventory> Inventory(HANDLE process, std::uint32_t pid, std::uint64_t creation, const IMemory& memory) {
   const auto identity = VerifiedIdentityFactory::Revalidate(process, pid, creation);
   if (!IsOk(identity)) return Failure(identity);
@@ -954,23 +1184,24 @@ Result<RuntimeInventory> Inventory(HANDLE process, std::uint32_t pid, std::uint6
   }
   std::error_code filesystem_error;
   std::filesystem::directory_iterator files(local_directory, filesystem_error);
-  if (filesystem_error) return Fail(ErrorCode::AccessDenied, "local_loader_enumeration", Stage::dependencies);
-  unsigned count{};
-  for (const auto& entry : files) {
-    if (++count > 4096) return Fail(ErrorCode::DllConflict, "local_loader_limit", Stage::dependencies);
-    if (!Equal(entry.path().extension().wstring(), L".dll")) continue;
-    const auto basename = Safe(entry.path().filename().wstring());
+  if (filesystem_error) return Fail(ErrorCode::AccessDenied, "local_loader_enumeration", Stage::dependencies, static_cast<DWORD>(filesystem_error.value()));
+  LocalDirectory directory(std::move(files));
+  const auto entries = process_detail::EnumerateLocalFiles(directory);
+  if (!IsOk(entries)) return Failure(entries);
+  for (const auto& entry : Value(entries)) {
+    if (!Equal(entry.extension().wstring(), L".dll")) continue;
+    const auto basename = Safe(entry.filename().wstring());
     if (basename.empty()) return Fail(ErrorCode::DllConflict, "local_loader_basename", Stage::dependencies);
-    const auto file = OpenFile(entry.path().wstring());
+    const auto file = OpenFile(entry.wstring());
     if (!IsOk(file)) return Failure(file);
     const auto loaded = std::find_if(loaded_dependencies.begin(), loaded_dependencies.end(), [&](const LoadedDependency& identity) { return identity.basename == basename && SameFile(identity.file.get(), Value(file).get()); });
     if (loaded != loaded_dependencies.end()) {
       const auto& dependency = inventory.dependencies[loaded->dependency_index];
       const bool official = dependency.signer.value == DependencySigner::Nvidia && dependency.role.value.has_value();
-      if (official || ProxyName(entry.path().filename().wstring())) inventory.application_local_loaders.push_back({basename, dependency.version.value.value_or(""), dependency.signer.value.has_value(), official});
+      if (official || ProxyName(entry.filename().wstring())) inventory.application_local_loaders.push_back({basename, dependency.version.value.value_or(""), dependency.signer.value.has_value(), official});
       continue;
     }
-    const auto evidence = Evidence(Value(file).get(), entry.path().wstring(), true);
+    const auto evidence = Evidence(Value(file).get(), entry.wstring(), true);
     if (IsOk(evidence)) {
       auto mapping = Hold(CreateFileMappingW(Value(file).get(), nullptr, PAGE_READONLY | SEC_IMAGE_NO_EXECUTE, 0, 0, nullptr));
       const auto* view = mapping ? MapViewOfFile(mapping.get(), FILE_MAP_READ, 0, 0, 0) : nullptr;
@@ -984,7 +1215,7 @@ Result<RuntimeInventory> Inventory(HANDLE process, std::uint32_t pid, std::uint6
       auto role = process_detail::IdentifyDependencyRole(local, Value(image), Value(evidence), basename);
       const bool official = role.value.has_value();
       inventory.dependencies.push_back(Dependency(basename, Value(evidence), std::move(role), "application_local_file"));
-      if (official || ProxyName(entry.path().filename().wstring())) inventory.application_local_loaders.push_back({basename, Value(evidence).version, true, official});
+      if (official || ProxyName(entry.filename().wstring())) inventory.application_local_loaders.push_back({basename, Value(evidence).version, true, official});
     } else {
       if (Failure(evidence).code == ErrorCode::AccessDenied) return Failure(evidence);
       DependencyIdentity unknown;
@@ -994,7 +1225,7 @@ Result<RuntimeInventory> Inventory(HANDLE process, std::uint32_t pid, std::uint6
       unknown.role.source = "authenticated_file_exports";
       unknown.role.reason = "nvidia_file_identity_unverified";
       inventory.dependencies.push_back(std::move(unknown));
-      if (ProxyName(entry.path().filename().wstring())) inventory.application_local_loaders.push_back({basename, FileVersion(entry.path().wstring()), false, false});
+      if (ProxyName(entry.filename().wstring())) inventory.application_local_loaders.push_back({basename, FileVersion(entry.wstring()), false, false});
     }
   }
   const auto final_identity = VerifiedIdentityFactory::Revalidate(process, pid, creation);

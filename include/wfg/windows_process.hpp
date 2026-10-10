@@ -3,6 +3,7 @@
 #include "wfg/compatibility.hpp"
 
 #include <memory>
+#include <filesystem>
 
 namespace wfg {
 
@@ -90,6 +91,37 @@ Result<RuntimeInventory> InventoryObservedProcess(const ObservedProcess& process
 EnvironmentSnapshot ObserveEnvironment(const ObservedProcess* process);
 
 namespace process_detail {
+struct OsBuild { std::uint32_t major{}; std::uint32_t minor{}; std::uint32_t build{}; };
+struct AdapterFacts {
+  std::string model;
+  std::uint32_t vendor{};
+  std::uint32_t device{};
+  Result<std::string> driver_version;
+};
+class IEnvironmentBackend {
+public:
+  virtual ~IEnvironmentBackend() = default;
+  virtual Result<OsBuild> QueryOsBuild() = 0;
+  virtual Result<std::optional<AdapterFacts>> QueryAdapter(std::uint32_t index) = 0;
+  virtual Result<std::optional<std::uint32_t>> QueryHagsMode() = 0;
+};
+EnvironmentSnapshot ObserveHostEnvironment(IEnvironmentBackend& backend);
+class IActivationOperations {
+public:
+  virtual ~IActivationOperations() = default;
+  virtual std::chrono::steady_clock::time_point Now() const = 0;
+  virtual Result<Unit> Prepare() = 0;
+  virtual Result<Unit> Launch() = 0;
+};
+Result<Unit> ActivateBeforeDeadline(IActivationOperations& operations, Deadline deadline);
+class ILocalDirectory {
+public:
+  virtual ~ILocalDirectory() = default;
+  virtual bool AtEnd() const = 0;
+  virtual std::filesystem::path Current() const = 0;
+  virtual void Increment(std::error_code& error) = 0;
+};
+Result<std::vector<std::filesystem::path>> EnumerateLocalFiles(ILocalDirectory& directory);
 struct FileEvidence {
   std::uint64_t length{};
   Hash256 sha256{};
