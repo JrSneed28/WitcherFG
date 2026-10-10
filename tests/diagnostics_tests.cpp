@@ -1,6 +1,7 @@
 #include "support.hpp"
 #include "wfg/diagnostics.hpp"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdlib>
@@ -187,7 +188,8 @@ TEST("diagnostics.spec_error_codes_are_stable") {
     FailureCase{wfg::ErrorCode::MutationFailure, "PROTECTION_RESTORE", "WFG-E-PROTECTION_RESTORE"},
     FailureCase{wfg::ErrorCode::MutationFailure, "ROLLBACK_ABORT", "WFG-E-ROLLBACK_ABORT"}};
   for (const auto& value : cases) {
-    const auto failure = wfg::ExplainFailure({value.code, wfg::Stage::import_transaction, value.operation, 5U, std::nullopt});
+    const auto stage = value.code == wfg::ErrorCode::AccessDenied ? wfg::Stage::debug_attach : wfg::Stage::import_transaction;
+    const auto failure = wfg::ExplainFailure({value.code, stage, value.operation, 5U, std::nullopt});
     CHECK(failure.code == value.expected);
     CHECK(failure.raw_code == 5U);
   }
@@ -214,7 +216,179 @@ TEST("diagnostics.fg_rejection_requires_a_decoded_rejection_code") {
   record.decoded_rejection_code = 0x1234U;
   auto with_code = wfg::SerializeSummary(record);
   CHECK(wfg::IsOk(with_code));
-  if (wfg::IsOk(with_code)) CHECK(wfg::Value(with_code).find("WFG-W-FG_REJECTED") != std::string::npos);
+  if (wfg::IsOk(with_code)) CHECK(wfg::Value(with_code).find("WFG-E-FG_REJECTED") != std::string::npos);
+}
+
+TEST("diagnostics.fix_i1_specific_failure_event_and_deferred_payload") {
+  for (const bool deferred : {false, true}) {
+    auto config = wfg::DefaultConfiguration();
+    FakeStorage storage;
+    storage.fail_events = true;
+    wfg::RunLogger logger(config, storage);
+    auto event = Event(wfg::EventLevel::Failure, wfg::EventCode::Failure);
+    event.failure = wfg::Error{wfg::ErrorCode::StartupTooLate, wfg::Stage::pre_factory_guard, "CheckFactory", 5U, std::nullopt};
+    const std::string_view utc = "2026-10-10T12:34:56Z";
+    std::copy(utc.begin(), utc.end(), event.time_utc.begin());
+    event.elapsed_ms = 1234;
+    event.vendor_code = 42U;
+    if (deferred) {
+      tracked_allocation_count = 0;
+      track_allocations = true;
+      const auto result = logger.DeferMutationEvent(event);
+      track_allocations = false;
+      CHECK(wfg::IsOk(result));
+      CHECK(tracked_allocation_count == 0);
+      CHECK(storage.event_writes == 0);
+      event.failure.reset();
+      event.time_utc.fill('x');
+      CHECK(!wfg::IsOk(logger.Finish(Record())));
+    } else {
+      CHECK(!wfg::IsOk(logger.Emit(event)));
+    }
+    CHECK(!storage.console.empty());
+    const auto& json = storage.console.front();
+    CHECK(json.find("WFG-E-STARTUP_TOO_LATE") != std::string::npos);
+    CHECK(json.find("\"stage\":\"pre_factory_guard\"") != std::string::npos);
+    CHECK(json.find("\"operation\":\"CheckFactory\"") != std::string::npos);
+    CHECK(json.find("\"time_utc\":\"2026-10-10T12:34:56Z\"") != std::string::npos);
+    CHECK(json.find("\"elapsed_ms\":1234") != std::string::npos);
+    CHECK(json.find("\"raw_code\":5") != std::string::npos);
+    CHECK(json.find("\"vendor_code\":42") != std::string::npos);
+    CHECK(json.find("launch this tool before the game") != std::string::npos);
+  }
+}
+
+TEST("diagnostics.fix_i2_initiating_iat_failure_never_asserts_rollback") {
+  for (const auto operation : {"IAT_WRITE", "IAT_VERIFY"}) {
+    for (const auto safety : {wfg::SafetyDisposition::VerifiedRollback, wfg::SafetyDisposition::VerifiedAbort}) {
+      auto record = Record();
+      record.safety = safety;
+      record.outcome = safety == wfg::SafetyDisposition::VerifiedAbort ? wfg::RunOutcome::StartupAborted : wfg::RunOutcome::RolledBack;
+      record.failure = wfg::ExplainFailure({wfg::ErrorCode::MutationFailure, wfg::Stage::import_transaction, operation, 998U, std::nullopt});
+      CHECK(record.failure->action.find("was rolled back") == std::string::npos);
+      const auto json = REQUIRE_OK(wfg::SerializeSummary(record));
+      CHECK(json.find(std::string("WFG-E-") + operation) != std::string::npos);
+      CHECK(json.find("\"raw_code\":998") != std::string::npos);
+      CHECK(json.find("was rolled back") == std::string::npos);
+      auto config = wfg::DefaultConfiguration();
+      FakeStorage storage;
+      wfg::RunLogger logger(config, storage);
+      CHECK(wfg::IsOk(logger.Finish(record)));
+      CHECK(storage.summary == json);
+      CHECK(record.failure->operation == operation);
+      CHECK(record.failure->raw_code == 998U);
+    }
+  }
+}
+
+TEST("diagnostics.fix_i3_rejection_events_require_sourced_decoded_code") {
+  auto config = wfg::DefaultConfiguration();
+  FakeStorage storage;
+  wfg::RunLogger logger(config, storage);
+  auto event = Event(wfg::EventLevel::CriticalWarning, wfg::EventCode::FgRejected);
+  CHECK(wfg::IsOk(logger.Emit(event)));
+  CHECK(storage.events.back().find("WFG-W-OBSERVATION_UNAVAILABLE") != std::string::npos);
+  CHECK(storage.events.back().find("FG_ACTIVITY_NOT_OBSERVED") == std::string::npos);
+  const std::array fields{wfg::DiagnosticField{wfg::DiagnosticFieldKey::DecodedRejectionCode, wfg::DiagnosticFieldSource::RuntimeObservation, std::uint64_t{0x1234}}};
+  event.fields = fields;
+  CHECK(wfg::IsOk(logger.Emit(event)));
+  CHECK(storage.events.back().find("WFG-E-FG_REJECTED") != std::string::npos);
+  for (const auto& field : {
+         wfg::DiagnosticField{wfg::DiagnosticFieldKey::DecodedRejectionCode, wfg::DiagnosticFieldSource::Launcher, std::uint64_t{0x1234}},
+         wfg::DiagnosticField{wfg::DiagnosticFieldKey::DecodedRejectionCode, wfg::DiagnosticFieldSource::RuntimeObservation, true},
+         wfg::DiagnosticField{wfg::DiagnosticFieldKey::DecodedRejectionCode, wfg::DiagnosticFieldSource::RuntimeObservation, std::uint64_t{0x100000000ULL}}}) {
+    event.fields = std::span<const wfg::DiagnosticField>(&field, 1);
+    CHECK(wfg::IsOk(logger.Emit(event)));
+    CHECK(storage.events.back().find("WFG-W-OBSERVATION_UNAVAILABLE") != std::string::npos);
+  }
+  auto record = Record();
+  record.frame_generation = wfg::FrameGenerationState::Rejected;
+  const auto json = REQUIRE_OK(wfg::SerializeSummary(record));
+  CHECK(json.find("\"frame_generation\":\"unknown\"") != std::string::npos);
+  CHECK(json.find("WFG-W-OBSERVATION_UNAVAILABLE") != std::string::npos);
+}
+
+TEST("diagnostics.fix_i4_utf8_boundary_and_malformed_direct_deferred_summary") {
+  const std::array values{std::string(95, 'A') + "\xc3\xa9", std::string("\xc3"), std::string("\xc0\xaf"), std::string("\xed\xa0\x80"), std::string("\xf4\x90\x80\x80"), std::string("\x80"), std::string("\xe2\x28\xa1"), std::string(94, 'A') + "\xc3\xa9", std::string("\xe2\x82\xac"), std::string("\xf0\x9f\x98\x80")};
+  std::size_t value_index = 0;
+  for (const auto& value : values) {
+    for (const bool deferred : {false, true}) {
+      auto config = wfg::DefaultConfiguration();
+      config.log_level = wfg::LogLevel::Debug;
+      FakeStorage storage;
+      wfg::RunLogger logger(config, storage);
+      const std::array fields{wfg::DiagnosticField{wfg::DiagnosticFieldKey::AdapterName, wfg::DiagnosticFieldSource::DxgiObservation, std::string_view(value)}};
+      auto event = Event(wfg::EventLevel::DebugDetail, wfg::EventCode::DependencyObserved);
+      event.fields = fields;
+      tracked_allocation_count = 0;
+      if (deferred) track_allocations = true;
+      const auto result = deferred ? logger.DeferMutationEvent(event) : logger.Emit(event);
+      track_allocations = false;
+      CHECK(wfg::IsOk(result));
+      if (deferred) {
+        CHECK(tracked_allocation_count == 0);
+        CHECK(storage.event_writes == 0);
+        CHECK(wfg::IsOk(logger.Finish(Record())));
+      }
+      const auto& json = storage.events.front();
+      const auto expected = value_index < 7 ? std::string("redacted") : value;
+      CHECK(json.find("\"value\":\"" + expected + "\"") != std::string::npos);
+      std::cout << "WFG_UTF8_JSON:" << json << '\n';
+    }
+    auto record = Record();
+    record.environment.gpu = wfg::Observed<std::string>(value, wfg::Availability::Observed, "dxgi", "query_ok");
+    const auto json = REQUIRE_OK(wfg::SerializeSummary(record));
+    const auto expected = value_index < 7 ? std::string("redacted") : value;
+    CHECK(json.find("\"value\":\"" + expected + "\"") != std::string::npos);
+    std::cout << "WFG_UTF8_JSON:" << json << '\n';
+    ++value_index;
+  }
+}
+
+TEST("diagnostics.filtered_deferred_events_do_not_consume_critical_capacity") {
+  auto config = wfg::DefaultConfiguration();
+  FakeStorage storage;
+  wfg::RunLogger logger(config, storage);
+  const auto invisible = Event(wfg::EventLevel::DebugDetail, wfg::EventCode::MutationStep);
+  tracked_allocation_count = 0;
+  track_allocations = true;
+  bool successful = true;
+  for (std::size_t index = 0; index < 100; ++index) successful = wfg::IsOk(logger.DeferMutationEvent(invisible)) && successful;
+  const auto critical = logger.DeferMutationEvent(Event(wfg::EventLevel::CriticalWarning, wfg::EventCode::ObservationUnavailable));
+  track_allocations = false;
+  CHECK(successful);
+  CHECK(wfg::IsOk(critical));
+  CHECK(tracked_allocation_count == 0);
+  CHECK(storage.event_writes == 0);
+  CHECK(wfg::IsOk(logger.Finish(Record())));
+  CHECK(storage.events.size() == 1);
+}
+
+TEST("diagnostics.overlong_operation_has_identical_direct_deferred_redaction") {
+  auto config = wfg::DefaultConfiguration();
+  FakeStorage storage;
+  wfg::RunLogger logger(config, storage);
+  const std::string operation(65, 'A');
+  auto event = Event(wfg::EventLevel::Failure, wfg::EventCode::Failure);
+  event.operation = operation;
+  CHECK(wfg::IsOk(logger.Emit(event)));
+  CHECK(wfg::IsOk(logger.DeferMutationEvent(event)));
+  CHECK(wfg::IsOk(logger.Finish(Record())));
+  CHECK(storage.events.size() == 2);
+  CHECK(storage.events[0] == storage.events[1]);
+  CHECK(storage.events[0].find("\"operation\":\"redacted\"") != std::string::npos);
+}
+
+TEST("diagnostics.fix_i5_stage_operation_cross_product") {
+  for (const auto stage : {wfg::Stage::debug_attach, wfg::Stage::dependencies, wfg::Stage::import_transaction, wfg::Stage::activation}) {
+    const auto denial = wfg::ExplainFailure({wfg::ErrorCode::AccessDenied, stage, "ReadInterposer", 5U, std::nullopt});
+    CHECK((denial.code == "WFG-E-ATTACH_DENIED") == (stage == wfg::Stage::debug_attach));
+    if (stage != wfg::Stage::debug_attach) CHECK(denial.action.find("current user session") == std::string::npos);
+    for (const auto operation : {"IatVerify", "VerifyIat", "IAT_VERIFY", "IAT_WRITE", "RestoreProtection", "ROLLBACK_ABORT"}) {
+      const auto failure = wfg::ExplainFailure({wfg::ErrorCode::MutationFailure, stage, operation, 5U, std::nullopt});
+      CHECK((failure.code != "WFG-E-LAUNCH_FAILED") == (stage == wfg::Stage::import_transaction));
+    }
+  }
 }
 
 TEST("diagnostics.embedded_identity_matches_generated_build") {
@@ -389,6 +563,7 @@ TEST("diagnostics.storage_refuses_symlink_file_escape") {
 
 TEST("diagnostics.full_mutation_buffer_refuses_without_allocation_or_io") {
   auto config = wfg::DefaultConfiguration();
+  config.log_level = wfg::LogLevel::Debug;
   FakeStorage storage;
   wfg::RunLogger logger(config, storage);
   const auto event = Event(wfg::EventLevel::DebugDetail, wfg::EventCode::MutationStep);

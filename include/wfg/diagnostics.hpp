@@ -40,6 +40,10 @@ struct DiagnosticEvent {
   Stage stage{Stage::activation};
   std::string_view operation;
   std::span<const DiagnosticField> fields;
+  std::array<char, 20> time_utc{};
+  std::uint64_t elapsed_ms{};
+  std::optional<Error> failure;
+  std::optional<std::uint32_t> vendor_code;
 };
 
 struct FailureInfo {
@@ -129,6 +133,10 @@ private:
     FixedText operation;
     std::array<DeferredField, MaxDeferredFields> fields{};
     std::uint8_t field_count{};
+    std::array<char, 20> time_utc{};
+    std::uint64_t elapsed_ms{};
+    std::optional<Error> failure;
+    std::optional<std::uint32_t> vendor_code;
   };
 
   [[nodiscard]] Result<Unit> StoreDeferred(const DiagnosticEvent& event) noexcept;

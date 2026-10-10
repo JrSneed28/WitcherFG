@@ -68,7 +68,7 @@ std::string UtcNow() {
   return std::string(text.data(), count);
 }
 
-std::string_view CodeFor(ErrorCode code, std::string_view operation) {
+std::string_view CodeFor(ErrorCode code, Stage stage, std::string_view operation) {
   switch (code) {
     case ErrorCode::ConfigurationInvalid: return "WFG-E-CONFIG_INVALID";
     case ErrorCode::MalformedImage:
@@ -76,13 +76,15 @@ std::string_view CodeFor(ErrorCode code, std::string_view operation) {
     case ErrorCode::UnexpectedImports: return "WFG-E-BUILD_UNSUPPORTED";
     case ErrorCode::DllConflict: return "WFG-E-DLL_CONFLICT";
     case ErrorCode::UntrustedInterposer: return "WFG-E-INTERPOSER_UNTRUSTED";
-    case ErrorCode::AccessDenied: return "WFG-E-ATTACH_DENIED";
+    case ErrorCode::AccessDenied: return stage == Stage::debug_attach ? "WFG-E-ATTACH_DENIED" : "WFG-E-LAUNCH_FAILED";
     case ErrorCode::StartupTooLate: return "WFG-E-STARTUP_TOO_LATE";
     case ErrorCode::MutationFailure:
+      if (stage != Stage::import_transaction) return "WFG-E-LAUNCH_FAILED";
       if (operation == "IatVerify" || operation == "VerifyIat" || operation == "IAT_VERIFY") return "WFG-E-IAT_VERIFY";
       if (operation == "ProtectionRestore" || operation == "RestoreProtection" || operation == "PROTECTION_RESTORE") return "WFG-E-PROTECTION_RESTORE";
       if (operation == "RollbackAbort" || operation == "AbortAfterRollbackFailure" || operation == "ROLLBACK_ABORT") return "WFG-E-ROLLBACK_ABORT";
-      return "WFG-E-IAT_WRITE";
+      if (operation == "IatWrite" || operation == "WriteIat" || operation == "IAT_WRITE") return "WFG-E-IAT_WRITE";
+      return "WFG-E-LAUNCH_FAILED";
     case ErrorCode::UnsupportedObservation: return "WFG-W-OBSERVATION_UNAVAILABLE";
     case ErrorCode::DiagnosticFailure: return "WFG-E-DIAGNOSTIC_IO";
     default: return "WFG-E-LAUNCH_FAILED";
@@ -96,13 +98,42 @@ std::string_view ActionFor(std::string_view code) {
   if (code == "WFG-E-INTERPOSER_UNTRUSTED") return "Restore the verified signed interposer and retry.";
   if (code == "WFG-E-ATTACH_DENIED") return "Close the game and retry from the current user session.";
   if (code == "WFG-E-STARTUP_TOO_LATE") return "Close the game and launch this tool before the game.";
-  if (code == "WFG-E-IAT_VERIFY") return "The import update could not be verified; the transaction was rolled back.";
+  if (code == "WFG-E-IAT_VERIFY") return "The import update could not be verified; inspect the recorded startup result.";
   if (code == "WFG-E-PROTECTION_RESTORE") return "Memory protections could not be restored; inspect the recorded startup result.";
-  if (code == "WFG-E-ROLLBACK_ABORT") return "Startup was aborted after rollback could not be verified.";
+  if (code == "WFG-E-ROLLBACK_ABORT") return "Rollback or abort verification failed; inspect the recorded startup result.";
   if (code == "WFG-W-OBSERVATION_UNAVAILABLE") return "Some optional runtime observations were unavailable; this does not indicate rejection.";
   if (code == "WFG-E-DIAGNOSTIC_IO") return "Diagnostics could not be saved; use the console result.";
-  if (code == "WFG-E-IAT_WRITE") return "The import update failed; the transaction was rolled back.";
+  if (code == "WFG-E-IAT_WRITE") return "The import update failed; inspect the recorded startup result.";
   return "Retry once; if the problem continues, collect a local support bundle.";
+}
+
+bool ValidUtf8(std::string_view value) {
+  for (std::size_t index = 0; index < value.size();) {
+    const auto lead = static_cast<unsigned char>(value[index]);
+    if (lead < 0x80) { ++index; continue; }
+    const std::size_t width = lead >= 0xc2 && lead <= 0xdf ? 2 :
+                              lead >= 0xe0 && lead <= 0xef ? 3 :
+                              lead >= 0xf0 && lead <= 0xf4 ? 4 : 0;
+    if (!width || width > value.size() - index) return false;
+    for (std::size_t offset = 1; offset < width; ++offset) {
+      const auto byte = static_cast<unsigned char>(value[index + offset]);
+      if (byte < 0x80 || byte > 0xbf) return false;
+    }
+    const auto second = static_cast<unsigned char>(value[index + 1]);
+    if ((lead == 0xe0 && second < 0xa0) || (lead == 0xed && second > 0x9f) ||
+        (lead == 0xf0 && second < 0x90) || (lead == 0xf4 && second > 0x8f)) return false;
+    index += width;
+  }
+  return true;
+}
+
+std::string_view SafeObservationText(std::string_view value) noexcept {
+  if (value.size() > 96 || !ValidUtf8(value)) return "redacted";
+  if (value.find_first_of("/\\:%@$~") != std::string_view::npos) return "redacted";
+  for (const unsigned char byte : value) {
+    if (byte < 0x20 || byte == 0x7f) return "redacted";
+  }
+  return value;
 }
 
 class JsonWriter {
@@ -114,6 +145,7 @@ public:
     return true;
   }
   bool String(std::string_view value) {
+    if (!ValidUtf8(value)) value = "redacted";
     if (!Raw("\"")) return false;
     for (const unsigned char ch : value) {
       if (ch == '"') { if (!Raw("\\\"")) return false; }
@@ -148,15 +180,7 @@ private:
 };
 
 std::string SafeObservationValue(std::string_view value) {
-  if (value.find_first_of("/\\:%@$~") != std::string_view::npos) return "redacted";
-  std::string safe;
-  safe.reserve(std::min<std::size_t>(value.size(), 96));
-  for (const unsigned char ch : value) {
-    if (safe.size() == 96) break;
-    if (ch < 0x20 || ch == 0x7f) return "redacted";
-    safe.push_back(static_cast<char>(ch));
-  }
-  return safe;
+  return std::string(SafeObservationText(value));
 }
 
 std::string SafeTag(std::string_view value) {
@@ -251,7 +275,7 @@ std::string_view EventCodeName(EventCode code, bool decoded_rejection) {
     case EventCode::DependencyObserved: return "DEPENDENCY_OBSERVED";
     case EventCode::ObservationUnavailable: return "WFG-W-OBSERVATION_UNAVAILABLE";
     case EventCode::FgActivityNotObserved: return "WFG-W-FG_ACTIVITY_NOT_OBSERVED";
-    case EventCode::FgRejected: return decoded_rejection ? "WFG-W-FG_REJECTED" : "WFG-W-FG_ACTIVITY_NOT_OBSERVED";
+    case EventCode::FgRejected: return decoded_rejection ? "WFG-E-FG_REJECTED" : "WFG-W-OBSERVATION_UNAVAILABLE";
     case EventCode::MutationStep: return "MUTATION_STEP";
   }
   return "UNKNOWN";
@@ -313,11 +337,11 @@ bool WriteBuild(JsonWriter& writer, const BuildIdentity& build) {
          writer.Raw(",\"input_digest\":" ) && writer.String(SafeTag(build.input_digest)) && writer.Raw("}");
 }
 
-bool WriteFailure(JsonWriter& writer, const FailureInfo& failure, std::uint64_t elapsed_ms) {
-  bool valid_utc = failure.time_utc.size() == 20;
+bool ValidUtc(std::string_view time_utc) {
+  bool valid_utc = time_utc.size() == 20;
   if (valid_utc) {
-    for (std::size_t index = 0; index < failure.time_utc.size(); ++index) {
-      const auto character = failure.time_utc[index];
+    for (std::size_t index = 0; index < time_utc.size(); ++index) {
+      const auto character = time_utc[index];
       if (index == 4 || index == 7) valid_utc = valid_utc && character == '-';
       else if (index == 10) valid_utc = valid_utc && character == 'T';
       else if (index == 13 || index == 16) valid_utc = valid_utc && character == ':';
@@ -325,10 +349,14 @@ bool WriteFailure(JsonWriter& writer, const FailureInfo& failure, std::uint64_t 
       else valid_utc = valid_utc && character >= '0' && character <= '9';
     }
   }
+  return valid_utc;
+}
+
+bool WriteFailure(JsonWriter& writer, const FailureInfo& failure, std::uint64_t elapsed_ms) {
   return writer.Raw("{\"code\":" ) && writer.String(SafeTag(failure.code)) &&
          writer.Raw(",\"stage\":" ) && writer.String(StageName(failure.stage)) &&
          writer.Raw(",\"operation\":" ) && writer.String(OperationName(failure.operation)) &&
-         writer.Raw(",\"time_utc\":" ) && writer.String(valid_utc ? std::string_view(failure.time_utc) : "unknown") &&
+         writer.Raw(",\"time_utc\":" ) && writer.String(ValidUtc(failure.time_utc) ? std::string_view(failure.time_utc) : "unknown") &&
          writer.Raw(",\"elapsed_ms\":" ) && writer.Number(failure.elapsed_ms ? failure.elapsed_ms : elapsed_ms) &&
          writer.Raw(",\"raw_code\":" ) && (failure.raw_code ? writer.Number(*failure.raw_code) : writer.Null()) &&
          writer.Raw(",\"vendor_code\":" ) && (failure.vendor_code ? writer.Number(*failure.vendor_code) : writer.Null()) &&
@@ -343,17 +371,31 @@ bool IsVisible(const EffectiveConfig& config, EventLevel level) {
 
 bool HasDecodedRejection(const DiagnosticEvent& event) {
   for (const auto& field : event.fields) {
-    if (field.key == DiagnosticFieldKey::DecodedRejectionCode && std::holds_alternative<std::uint64_t>(field.value)) return true;
+    if (field.key == DiagnosticFieldKey::DecodedRejectionCode && field.source == DiagnosticFieldSource::RuntimeObservation) {
+      const auto* code = std::get_if<std::uint64_t>(&field.value);
+      if (code && *code <= std::numeric_limits<std::uint32_t>::max()) return true;
+    }
   }
   return false;
 }
 
 bool WriteEventJson(JsonWriter& writer, const DiagnosticEvent& event) {
   if (event.fields.size() > 8) return false;
+  auto failure = event.code == EventCode::Failure && event.failure ? std::optional<FailureInfo>(ExplainFailure(*event.failure)) : std::nullopt;
+  const std::string_view time_utc(event.time_utc.data(), event.time_utc.size());
+  if (failure) {
+    failure->time_utc.assign(time_utc);
+    failure->elapsed_ms = event.elapsed_ms;
+    failure->vendor_code = event.vendor_code;
+  }
   if (!writer.Raw("{\"level\":" ) || !writer.String(EventLevelName(event.level)) ||
-      !writer.Raw(",\"code\":" ) || !writer.String(EventCodeName(event.code, HasDecodedRejection(event))) ||
-      !writer.Raw(",\"stage\":" ) || !writer.String(StageName(event.stage)) ||
-      !writer.Raw(",\"operation\":" ) || !writer.String(OperationName(event.operation)) || !writer.Raw(",\"fields\":[")) return false;
+      !writer.Raw(",\"code\":" ) || !writer.String(failure ? std::string_view(failure->code) : EventCodeName(event.code, HasDecodedRejection(event))) ||
+      !writer.Raw(",\"stage\":" ) || !writer.String(StageName(failure ? failure->stage : event.stage)) ||
+      !writer.Raw(",\"operation\":" ) || !writer.String(OperationName(failure ? std::string_view(failure->operation) : event.operation)) ||
+      !writer.Raw(",\"time_utc\":" ) || !writer.String(ValidUtc(time_utc) ? time_utc : "unknown") ||
+      !writer.Raw(",\"elapsed_ms\":" ) || !writer.Number(event.elapsed_ms) ||
+      !writer.Raw(",\"failure\":" ) || !(failure ? WriteFailure(writer, *failure, event.elapsed_ms) : writer.Null()) ||
+      !writer.Raw(",\"fields\":[")) return false;
   for (std::size_t index = 0; index < event.fields.size(); ++index) {
     if (index && !writer.Raw(",")) return false;
     const auto& field = event.fields[index];
@@ -461,7 +503,7 @@ const BuildIdentity& EmbeddedBuildIdentity() noexcept { return kEmbeddedBuildIde
 
 FailureInfo ExplainFailure(const Error& error) {
   const auto operation = error.operation.view();
-  const auto code = CodeFor(error.code, operation);
+  const auto code = CodeFor(error.code, error.stage, operation);
   return {std::string(code), error.stage, std::string(OperationName(operation)), UtcNow(), 0,
           error.native_code, std::nullopt, std::string(ActionFor(code))};
 }
@@ -520,14 +562,15 @@ Result<std::string> SerializeSummary(const DiagnosticRecord& record) {
   if (!writer.Raw(",\"warning_codes\":[")) return DiagnosticError("summary_warning_codes");
 
   bool first_warning = true;
-  if (record.frame_generation == FrameGenerationState::Unknown) {
+  if (record.frame_generation == FrameGenerationState::Unknown ||
+      (record.frame_generation == FrameGenerationState::Rejected && !record.decoded_rejection_code)) {
     if (!writer.String("WFG-W-OBSERVATION_UNAVAILABLE")) return DiagnosticError("summary_unavailable_warning");
     first_warning = false;
   } else if (record.frame_generation == FrameGenerationState::ActivityNotObserved) {
     if (!writer.String("WFG-W-FG_ACTIVITY_NOT_OBSERVED")) return DiagnosticError("summary_activity_warning");
     first_warning = false;
   } else if (record.frame_generation == FrameGenerationState::Rejected && record.decoded_rejection_code) {
-    if (!writer.String("WFG-W-FG_REJECTED")) return DiagnosticError("summary_rejected_warning");
+    if (!writer.String("WFG-E-FG_REJECTED")) return DiagnosticError("summary_rejected_warning");
     first_warning = false;
   }
   if (record.failure && record.failure->code == "WFG-W-OBSERVATION_UNAVAILABLE") {
@@ -707,12 +750,17 @@ Result<Unit> RunLogger::DeferMutationEvent(const DiagnosticEvent& event) noexcep
 }
 
 Result<Unit> RunLogger::StoreDeferred(const DiagnosticEvent& event) noexcept {
+  if (!IsVisible(config_, event.level)) return Unit{};
   if (deferred_count_ >= deferred_.size() || event.fields.size() > MaxDeferredFields) return DiagnosticError();
   auto& stored = deferred_[deferred_count_++];
   stored.level = event.level;
   stored.code = event.code;
   stored.stage = event.stage;
-  CopyFixed(stored.operation.bytes, stored.operation.length, event.operation, MaxOperationBytes);
+  CopyFixed(stored.operation.bytes, stored.operation.length, OperationName(event.operation), MaxOperationBytes);
+  stored.time_utc = event.time_utc;
+  stored.elapsed_ms = event.elapsed_ms;
+  stored.failure = event.failure;
+  stored.vendor_code = event.vendor_code;
   stored.field_count = static_cast<std::uint8_t>(event.fields.size());
   for (std::size_t index = 0; index < event.fields.size(); ++index) {
     const auto& field = event.fields[index];
@@ -734,7 +782,7 @@ Result<Unit> RunLogger::StoreDeferred(const DiagnosticEvent& event) noexcept {
       target.is_integer = false;
       target.boolean_value = false;
       target.integer_value = 0;
-      CopyFixed(target.text.bytes, target.text.length, std::get<std::string_view>(field.value), MaxFieldBytes);
+      CopyFixed(target.text.bytes, target.text.length, SafeObservationText(std::get<std::string_view>(field.value)), MaxFieldBytes);
     }
   }
   return Unit{};
@@ -776,6 +824,10 @@ Result<Unit> RunLogger::FlushDeferred() {
     DiagnosticEvent event{stored.level, stored.code, stored.stage,
                           std::string_view(stored.operation.bytes.data(), stored.operation.length),
                           std::span<const DiagnosticField>(fields.data(), stored.field_count)};
+    event.time_utc = stored.time_utc;
+    event.elapsed_ms = stored.elapsed_ms;
+    event.failure = stored.failure;
+    event.vendor_code = stored.vendor_code;
     if (!IsVisible(config_, event.level)) continue;
     auto result = WriteEvent(event);
     if (!IsOk(result) && !failed) {
