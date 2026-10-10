@@ -57,7 +57,8 @@ private:
   friend class VerifiedIdentityFactory;
   friend Result<PackageIdentity> DiscoverPackage();
   friend Result<Unit> ActivateRegistered(const PackageIdentity&);
-  friend Result<ObservedProcess> OpenDiagnosticTarget(const PackageIdentity&);
+  friend Result<ObservedProcess> DuplicateObservedProcess(const OwnedProcess& process);
+Result<ObservedProcess> OpenDiagnosticTarget(const PackageIdentity&);
   friend Result<std::unique_ptr<class ProcessObserver>> StartObserver(const PackageIdentity&, Deadline);
 };
 
@@ -85,6 +86,7 @@ Result<std::unique_ptr<ProcessObserver>> StartObserver(const PackageIdentity& pa
 Result<Unit> ActivateRegistered(const PackageIdentity& package);
 Result<RuntimeInventory> InventoryProcess(const OwnedProcess& process, const IMemory& memory);
 Result<std::unique_ptr<IWritableMemory>> OpenMemory(const OwnedProcess& process);
+Result<ObservedProcess> DuplicateObservedProcess(const OwnedProcess& process);
 Result<ObservedProcess> OpenDiagnosticTarget(const PackageIdentity& package);
 Result<std::unique_ptr<IMemory>> OpenReadOnlyMemory(const ObservedProcess& process);
 Result<RuntimeInventory> InventoryObservedProcess(const ObservedProcess& process, const IMemory& memory);

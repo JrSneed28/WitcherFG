@@ -6,6 +6,7 @@
 #include <condition_variable>
 #include <cstdlib>
 #include <mutex>
+#include <limits>
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -37,6 +38,7 @@ struct DebugSessionState {
   bool abort_requested{};
   bool process_created{};
   bool attach_exception_seen{};
+  bool observed_exit{};
 };
 
 DebugStop::DebugStop(std::shared_ptr<DebugSessionState> state, std::uint64_t sequence, DebugEvent event, Continuation continuation)
@@ -59,6 +61,11 @@ bool DebugStop::active() const noexcept {
 
 DebugSession::DebugSession(IDebugBackend& backend, std::stop_token cancellation)
     : backend_(backend), state_(std::make_shared<DebugSessionState>()), owner_(std::this_thread::get_id()), cancellation_(cancellation) {}
+DebugSafety DebugSession::Safety() const noexcept {
+  if(state_->observed_exit)return DebugSafety::Exited;
+  if(!state_->attached)return DebugSafety::NotAttached;
+  return state_->safe_policy && !state_->abort_requested ? DebugSafety::AttachedSafe : DebugSafety::AttachedUnverified;
+}
 bool DebugSession::Owner() const { return owner_ == std::this_thread::get_id(); }
 DebugSession::~DebugSession() {
   if (Owner() && state_->attached) {
@@ -106,6 +113,7 @@ Result<DebugStop> DebugSession::WaitStopped(Deadline deadline) {
       auto released = ReleaseHeld();
       if (!IsOk(released)) return Failure(released);
       state_->attached = false;
+      state_->observed_exit = true;
       return DebugFailure("debug_target_exited", ErrorCode::NoMatchingProcess);
     }
     return DebugStop(state_, state_->sequence, event, state_->continuation);
@@ -161,7 +169,7 @@ Result<Unit> DebugSession::Detach(Deadline deadline) {
       state_->continuation = event.kind != DebugEventKind::Exception || initial ? Continuation::Handled : Continuation::NotHandled;
       auto continued = ReleaseHeld();
       if (!IsOk(continued)) return Failure(continued);
-      if (event.kind == DebugEventKind::ProcessExited) { state_->attached = false; return Unit{}; }
+      if (event.kind == DebugEventKind::ProcessExited) { state_->attached = false; state_->observed_exit = true; return Unit{}; }
     }
   }
   return Error{ErrorCode::TimedOut, Stage::detach, "debug_detach_deadline"};
@@ -172,6 +180,7 @@ Result<Unit> DebugSession::AbortOwnedStartup() {
   const auto result = backend_.AbortOwnedStartup();
   if (IsOk(result)) {
     state_->attached = false;
+    state_->observed_exit = true;
     state_->held.reset();
     state_->held_sequence.store(0);
   }
@@ -431,12 +440,29 @@ IWatchdogBackend& SystemWatchdog() {
 }
 }
 DeadlineWatchdog::DeadlineWatchdog(Deadline deadline, std::stop_source& cancellation)
-    : DeadlineWatchdog(deadline, cancellation, SystemWatchdog()) {}
-DeadlineWatchdog::DeadlineWatchdog(Deadline deadline, std::stop_source& cancellation, IWatchdogBackend& backend)
-    : thread_([deadline, &cancellation, &backend](std::stop_token disarmed) {
-        if (!backend.WaitUntil(deadline, disarmed)) return;
+    : DeadlineWatchdog(deadline,cancellation,SystemWatchdog(),{}) {}
+DeadlineWatchdog::DeadlineWatchdog(Deadline deadline, std::stop_source& cancellation,IWatchdogBackend& backend)
+    : DeadlineWatchdog(deadline,cancellation,backend,{}) {}
+DeadlineWatchdog::DeadlineWatchdog(Deadline deadline, std::stop_source& cancellation, std::stop_token external)
+    : DeadlineWatchdog(deadline, cancellation, SystemWatchdog(), external) {}
+DeadlineWatchdog::DeadlineWatchdog(Deadline deadline, std::stop_source& cancellation, IWatchdogBackend& backend, std::stop_token external)
+    : thread_([deadline, &cancellation, &backend, external](std::stop_token disarmed) {
+        std::stop_source wake;
+        using Clock=std::chrono::steady_clock;
+        constexpr auto unset=std::numeric_limits<Clock::rep>::max();
+        std::atomic<Clock::rep> requested_at{unset};
+        std::stop_callback on_disarm(disarmed,[&] { wake.request_stop(); });
+        std::stop_callback on_cancel(external,[&] {
+          requested_at.store(Clock::now().time_since_epoch().count());
+          wake.request_stop();
+        });
+        const bool expired=backend.WaitUntil(deadline,wake.get_token());
+        if(disarmed.stop_requested() || (!expired && !external.stop_requested()))return;
+        auto cleanup=deadline.value+std::chrono::seconds(2);
+        const auto request=requested_at.load();
+        if(request!=unset)cleanup=std::min(cleanup,Clock::time_point(Clock::duration(request))+std::chrono::seconds(2));
         cancellation.request_stop();
-        if (backend.WaitUntil({deadline.value + std::chrono::seconds(2)}, disarmed) && !disarmed.stop_requested()) backend.ExitHelper();
+        if(backend.WaitUntil({cleanup},disarmed) && !disarmed.stop_requested())backend.ExitHelper();
       }) {}
 DeadlineWatchdog::~DeadlineWatchdog() { Disarm(); }
 void DeadlineWatchdog::Disarm() {

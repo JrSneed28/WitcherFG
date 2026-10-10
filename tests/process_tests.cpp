@@ -1,6 +1,7 @@
 #include "support.hpp"
 #include "wfg/windows_process.hpp"
 #include "fixtures/process_identity.hpp"
+#include "fixtures/verified_identity.hpp"
 #include "fixtures/runtime_images.hpp"
 
 #define WIN32_LEAN_AND_MEAN
@@ -407,4 +408,21 @@ TEST("process.native_backing_identity_rejects_other_file") {
   CHECK(!wfg::IsOk(mismatch));
   if (wfg::Failure(mismatch).code != wfg::ErrorCode::UntrustedInterposer) throw std::runtime_error(std::string(wfg::Failure(mismatch).operation.view()) + ":" + std::to_string(wfg::Failure(mismatch).native_code.value_or(0)));
   REQUIRE_OK(wfg::process_detail::VerifyBackingImage(GetCurrentProcess(), reinterpret_cast<wfg::Address>(module), std::wstring(system) + L"\\kernel32.dll", memory));
+}
+
+TEST("process.owned_observation_duplicate_keeps_identity_and_reduces_rights") {
+  FILETIME created{},exited{},kernel{},user{};
+  CHECK(GetProcessTimes(GetCurrentProcess(),&created,&exited,&kernel,&user));
+  const auto creation=(static_cast<std::uint64_t>(created.dwHighDateTime)<<32U)|created.dwLowDateTime;
+  auto owner=wfg::VerifiedIdentityTestFactory::Owned(GetCurrentProcess(),[](void*) noexcept {},GetCurrentProcessId(),creation);
+  auto duplicated=wfg::DuplicateObservedProcess(owner);
+  CHECK(wfg::IsOk(duplicated));
+  auto duplicate=std::move(std::get<wfg::ObservedProcess>(duplicated));
+  CHECK(duplicate.pid()==owner.pid());CHECK(duplicate.creation_time()==owner.creation_time());
+  CHECK(GetProcessId(duplicate.native_handle())==GetCurrentProcessId());
+  int value=1,replacement=2;SIZE_T written{};
+  CHECK(!WriteProcessMemory(duplicate.native_handle(),&value,&replacement,sizeof(value),&written));
+  CHECK(value==1);
+  auto stale=wfg::VerifiedIdentityTestFactory::Owned(GetCurrentProcess(),[](void*) noexcept {},GetCurrentProcessId(),creation+1);
+  REQUIRE_ERROR(wfg::DuplicateObservedProcess(stale),wfg::ErrorCode::IdentityChanged);
 }

@@ -241,7 +241,7 @@ public:
     if (deadlines.size() == 2) cancelled_before_grace = cancellation_.stop_requested();
     condition_.notify_all();
     condition_.wait(lock, disarmed, [&] { return permits > 0; });
-    if (disarmed.stop_requested()) return false;
+    if (disarmed.stop_requested()) { lock.unlock(); std::this_thread::sleep_for(stop_delay); return false; }
     --permits;
     return true;
   }
@@ -256,6 +256,7 @@ public:
   std::stop_source& cancellation_;
   std::vector<std::chrono::steady_clock::time_point> deadlines;
   unsigned permits{}, exits{};
+  std::chrono::milliseconds stop_delay{};
   bool cancelled_before_grace{};
 };
 }
@@ -313,4 +314,42 @@ TEST("debug.failed_abort_retains_session_capability_and_refuses_false_resume_or_
   REQUIRE_ERROR(fixture.session.Continue(stop, Continuation::Handled), ErrorCode::DebugFailure);
   REQUIRE_ERROR(fixture.session.Detach(), ErrorCode::DebugFailure);
   CHECK(fixture.backend.calls.size() == before); CHECK(fixture.backend.continued.empty());
+}
+
+TEST("debug.safety_accessor_distinguishes_failed_attach_and_verified_exit") {
+  static_assert(noexcept(std::declval<const DebugSession&>().Safety()));
+  {
+    Fixture fixture;CHECK(fixture.session.Safety()==DebugSafety::NotAttached);
+    REQUIRE_OK(fixture.session.Attach(fixture.owned));CHECK(fixture.session.Safety()==DebugSafety::AttachedSafe);
+    REQUIRE_OK(fixture.session.AbortOwnedStartup());CHECK(fixture.session.Safety()==DebugSafety::Exited);
+  }
+  {
+    Fixture fixture;fixture.backend.fail_policy=true;fixture.backend.fail_abort=true;
+    REQUIRE_ERROR(fixture.session.Attach(fixture.owned),ErrorCode::DebugFailure);
+    CHECK(fixture.session.Safety()==DebugSafety::AttachedUnverified);
+  }
+  {
+    Fixture fixture;fixture.backend.denied=true;
+    REQUIRE_ERROR(fixture.session.Attach(fixture.owned),ErrorCode::DebugFailure);
+    CHECK(fixture.session.Safety()==DebugSafety::NotAttached);
+  }
+}
+TEST("debug.watchdog_external_cancel_interrupts_deadline_wait") {
+  std::stop_source cancellation, external;WatchdogFixture backend(cancellation);
+  const auto before=std::chrono::steady_clock::now();
+  DeadlineWatchdog watchdog({before+std::chrono::seconds(60)},cancellation,backend,external.get_token());
+  CHECK(backend.Await(1));external.request_stop();CHECK(backend.Await(2));
+  CHECK(cancellation.stop_requested());
+  {std::lock_guard lock(backend.mutex_);CHECK(backend.deadlines[1]<=std::chrono::steady_clock::now()+std::chrono::seconds(2));}
+  backend.Advance();CHECK(backend.Await(2,true));watchdog.Disarm();
+}
+
+TEST("debug.watchdog_grace_is_measured_from_request_not_worker_wakeup") {
+  std::stop_source cancellation,external;WatchdogFixture backend(cancellation);
+  backend.stop_delay=std::chrono::milliseconds(30);
+  DeadlineWatchdog watchdog({std::chrono::steady_clock::now()+std::chrono::seconds(60)},cancellation,backend,external.get_token());
+  CHECK(backend.Await(1));external.request_stop();const auto requested=std::chrono::steady_clock::now();
+  CHECK(backend.Await(2));
+  {std::lock_guard lock(backend.mutex_);CHECK(backend.deadlines[1]<=requested+std::chrono::seconds(2));}
+  watchdog.Disarm();
 }

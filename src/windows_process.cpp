@@ -441,6 +441,20 @@ public:
     if (!DuplicateHandle(GetCurrentProcess(), handle.get(), GetCurrentProcess(), &transferred, OwnedRights, FALSE, 0)) return Fail(ErrorCode::AccessDenied, "owned_pin");
     return OwnedProcess(transferred, candidate.pid, candidate.creation_time, std::move(user), std::move(session), std::move(package), CloseNative);
   }
+  static Result<ObservedProcess> DuplicateObserved(const OwnedProcess& owner) {
+    const auto inspect=[&](HANDLE handle) {
+      FILETIME created{},exited{},kernel{},user{};
+      return handle && GetProcessId(handle)==owner.pid() && WaitForSingleObject(handle,0)==WAIT_TIMEOUT &&
+        GetProcessTimes(handle,&created,&exited,&kernel,&user) &&
+        ((static_cast<std::uint64_t>(created.dwHighDateTime)<<32U)|created.dwLowDateTime)==owner.creation_time();
+    };
+    if(!inspect(owner.native_handle()))return Fail(ErrorCode::IdentityChanged,"owned_observation_identity");
+    HANDLE duplicate{};
+    if(!DuplicateHandle(GetCurrentProcess(),owner.native_handle(),GetCurrentProcess(),&duplicate,ReadRights,FALSE,0))
+      return Fail(ErrorCode::AccessDenied,"owned_observation_duplicate");
+    if(!inspect(duplicate)||!inspect(owner.native_handle())) {CloseHandle(duplicate);return Fail(ErrorCode::IdentityChanged,"owned_observation_identity");}
+    return ObservedProcess(duplicate,owner.pid(),owner.creation_time(),CloseNative);
+  }
   static Result<ObservedProcess> ObservedTarget(const Candidate& candidate, const LaunchIdentity& launch) {
     const auto verified = Verify(candidate, launch);
     if (!IsOk(verified)) return Failure(verified);
@@ -500,6 +514,9 @@ Result<ObservedProcess> OpenDiagnosticTarget(const PackageIdentity& package) {
   const auto selected = SelectCandidate(Value(candidates), launch);
   if (!IsOk(selected)) return Failure(selected);
   return VerifiedIdentityFactory::ObservedTarget(Value(selected), launch);
+}
+Result<ObservedProcess> DuplicateObservedProcess(const OwnedProcess& process) {
+  return VerifiedIdentityFactory::DuplicateObserved(process);
 }
 Result<std::unique_ptr<IMemory>> OpenReadOnlyMemory(const ObservedProcess& process) {
   const auto verified = VerifiedIdentityFactory::Revalidate(process.native_handle(), process.pid(), process.creation_time());

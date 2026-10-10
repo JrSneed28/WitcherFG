@@ -51,6 +51,8 @@ private:
   friend class DebugSession;
 };
 
+enum class DebugSafety { NotAttached, AttachedSafe, AttachedUnverified, Exited };
+
 class DebugSession {
 public:
   explicit DebugSession(IDebugBackend&, std::stop_token = {});
@@ -58,6 +60,7 @@ public:
   DebugSession(const DebugSession&) = delete;
   DebugSession& operator=(const DebugSession&) = delete;
   Result<Unit> Attach(const OwnedProcess&);
+  DebugSafety Safety() const noexcept;
   Result<DebugStop> WaitStopped(Deadline);
   Result<Unit> SetKillOnExit(bool);
   bool Holds(const DebugStop&) const noexcept;
@@ -102,7 +105,9 @@ public:
 class DeadlineWatchdog {
 public:
   DeadlineWatchdog(Deadline, std::stop_source&);
+  DeadlineWatchdog(Deadline, std::stop_source&, std::stop_token external);
   DeadlineWatchdog(Deadline, std::stop_source&, IWatchdogBackend&);
+  DeadlineWatchdog(Deadline, std::stop_source&, IWatchdogBackend&, std::stop_token external);
   ~DeadlineWatchdog();
   DeadlineWatchdog(const DeadlineWatchdog&) = delete;
   DeadlineWatchdog& operator=(const DeadlineWatchdog&) = delete;
