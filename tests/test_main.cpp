@@ -9,6 +9,10 @@ int main(int argc, char** argv) {
     ++executed;
     try { test.run(); } catch (const std::exception& error) { ++failures; std::cerr << test.name << ": " << error.what() << '\n'; }
   }
+  if (!filter.empty() && executed == 0) {
+    std::cerr << "No tests matched the selected filter\n";
+    return 2;
+  }
   std::cout << executed - failures << "/" << executed << " tests passed\n";
   return failures == 0 ? 0 : 1;
 }

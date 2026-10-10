@@ -19,7 +19,7 @@ set_target_properties(wfg_launcher PROPERTIES OUTPUT_NAME WitcherFG)
 target_link_libraries(wfg_launcher PRIVATE wfg_core)
 target_compile_options(wfg_launcher PRIVATE /W4 /permissive-)
 
-add_executable(wfg_tests tests/test_main.cpp tests/pe_tests.cpp)
+add_executable(wfg_tests tests/test_main.cpp tests/pe_tests.cpp tests/core_tests.cpp)
 target_include_directories(wfg_tests PRIVATE include tests)
 target_link_libraries(wfg_tests PRIVATE wfg_core)
 target_compile_options(wfg_tests PRIVATE /W4 /permissive-)
@@ -29,3 +29,7 @@ foreach(group IN ITEMS pe compatibility process debug transaction launcher)
   add_test(NAME wfg_${group} COMMAND wfg_tests --filter ${group})
   set_tests_properties(wfg_${group} PROPERTIES LABELS ${group})
 endforeach()
+
+add_test(NAME wfg_runner_unknown_filter COMMAND ${CMAKE_COMMAND}
+  -DTEST_EXECUTABLE=$<TARGET_FILE:wfg_tests> -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/runner_tests.cmake)
+set_tests_properties(wfg_runner_unknown_filter PROPERTIES LABELS pe)

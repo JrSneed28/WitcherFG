@@ -14,6 +14,11 @@ public:
     return wfg::Bytes(bytes_.begin() + static_cast<std::ptrdiff_t>(address - base_), bytes_.begin() + static_cast<std::ptrdiff_t>(address - base_ + size));
   }
   wfg::Result<wfg::MemoryRegion> Query(wfg::Address) const override { return wfg::MemoryRegion{base_, bytes_.size(), true, true, true, false, 0}; }
+  wfg::Result<wfg::Unit> ReadInto(wfg::Address address, std::span<std::byte> bytes) const override {
+    if (short_reads_ || address < base_ || bytes.size() > bytes_.size() || address - base_ > bytes_.size() - bytes.size()) return Error();
+    if (!bytes.empty()) std::memcpy(bytes.data(), bytes_.data() + static_cast<std::size_t>(address - base_), bytes.size());
+    return wfg::Unit{};
+  }
   wfg::Result<wfg::Unit> Write(wfg::Address, std::span<const std::byte>) override { ++writes_; return wfg::Unit{}; }
   wfg::Result<std::uint32_t> Protect(wfg::Address, std::size_t, std::uint32_t) override { ++protects_; return 0U; }
   void SetShortReads(bool value = true) { short_reads_ = value; }
@@ -56,5 +61,5 @@ inline void Check(bool value, const char* expression, const char* file, int line
 #define WFG_TEST_IMPL(name, line) static void WFG_TEST_JOIN(test_, line)(); static test::Register WFG_TEST_JOIN(register_, line){name, WFG_TEST_JOIN(test_, line)}; static void WFG_TEST_JOIN(test_, line)()
 #define TEST(name) WFG_TEST_IMPL(name, __LINE__)
 #define CHECK(expr) test::Check(static_cast<bool>(expr), #expr, __FILE__, __LINE__)
-#define REQUIRE_OK(expr) ([&]() { auto result = (expr); if (!wfg::IsOk(result)) throw std::runtime_error("expected success: " + wfg::Failure(result).operation); return wfg::Value(result); }())
+#define REQUIRE_OK(expr) ([&]() { auto result = (expr); if (!wfg::IsOk(result)) throw std::runtime_error("expected success: " + std::string(wfg::Failure(result).operation.view())); return wfg::Value(result); }())
 #define REQUIRE_ERROR(expr, expected) do { auto result = (expr); CHECK(!wfg::IsOk(result)); CHECK(wfg::Failure(result).code == (expected)); } while (false)
