@@ -26,6 +26,9 @@ struct Model {
   bool exited{};
   bool fail_exit_signal{};
   bool kill{true};
+  bool fail_terminate{};
+  bool signal_on_terminate{};
+  unsigned positive_pin_waits{};
 };
 Model model;
 BOOL Close(HANDLE handle) { model.closed.push_back(handle); return TRUE; }
@@ -33,10 +36,12 @@ DWORD Pid(HANDLE) { return 42; }
 BOOL Times(HANDLE, FILETIME* created, FILETIME*, FILETIME*, FILETIME*) { *created = FILETIME{100, 0}; return TRUE; }
 DWORD Signal(HANDLE handle, DWORD duration) {
   CHECK(duration <= 50);
+  if (handle == Handle(101) && duration > 0) ++model.positive_pin_waits;
   if (handle == Handle(101) && model.exited) {
     if (model.fail_exit_signal) { SetLastError(ERROR_INVALID_HANDLE); return WAIT_FAILED; }
     return WAIT_OBJECT_0;
   }
+  if (handle == Handle(101) && duration > 0) std::this_thread::sleep_for(std::chrono::milliseconds(duration));
   return WAIT_TIMEOUT;
 }
 BOOL Duplicate(HANDLE, HANDLE, HANDLE, HANDLE* pin, DWORD, BOOL, DWORD) { *pin = Handle(101); return TRUE; }
@@ -52,7 +57,12 @@ BOOL Wait(DEBUG_EVENT* event, DWORD duration) {
 }
 BOOL Continue(DWORD pid, DWORD, DWORD) { CHECK(pid == 42); model.calls.push_back("continue"); if (model.last_event == EXIT_PROCESS_DEBUG_EVENT) model.exited = true; return TRUE; }
 BOOL Detach(DWORD pid) { CHECK(pid == 42); model.calls.push_back("detach"); return TRUE; }
-BOOL Terminate(HANDLE handle, UINT) { CHECK(handle == Handle(101)); model.calls.push_back("abort_pin"); return TRUE; }
+BOOL Terminate(HANDLE handle, UINT) {
+  CHECK(handle == Handle(101)); model.calls.push_back("abort_pin");
+  if (model.fail_terminate) { SetLastError(ERROR_ACCESS_DENIED); return FALSE; }
+  if (model.signal_on_terminate) model.exited = true;
+  return TRUE;
+}
 constexpr wfg::Address ntdll_base = 0x00007FF700000000ULL;
 DWORD FinalPath(HANDLE, wchar_t* buffer, DWORD capacity, DWORD) {
   const std::wstring path = model.system_path ? L"\\\\?\\C:\\Windows\\System32\\ntdll.dll" : L"\\\\?\\C:\\Other\\ntdll.dll";
@@ -178,12 +188,34 @@ TEST("debug.native_direct_resume_refuses_unsafe_mutation_policy") {
   REQUIRE_ERROR(backend.Continue(stopped, Continuation::Handled), ErrorCode::DebugFailure);
   REQUIRE_OK(backend.SetKillOnExit(false)); REQUIRE_OK(backend.Continue(stopped, Continuation::Handled)); REQUIRE_OK(backend.Detach());
 }
-TEST("debug.native_abort_uses_pin_services_exit_and_does_not_close_os_handles") {
+namespace {
+void OnOwnerThread(auto action) {
+  std::exception_ptr failure;
+  std::thread owner([&] { try { action(); } catch (...) { failure = std::current_exception(); } });
+  owner.join(); if (failure) std::rethrow_exception(failure);
+}
+DebugEvent BeginUnsafeAbort(NativeDebugBackend& backend) {
+  auto owned = Owned(); REQUIRE_OK(backend.Attach(owned)); REQUIRE_OK(backend.SetKillOnExit(false));
+  model.events.push_back(Event(CREATE_PROCESS_DEBUG_EVENT)); auto stopped = Waited(backend);
+  REQUIRE_OK(backend.SetKillOnExit(true)); model.events.push_back(Event(EXIT_PROCESS_DEBUG_EVENT)); return stopped;
+}
+void CheckTerminalNoContinuation(NativeDebugBackend& backend, const DebugEvent& stopped) {
+  CHECK(model.kill); CHECK(std::count(model.calls.begin(), model.calls.end(), "continue") == 0);
+  CHECK(std::count(model.calls.begin(), model.calls.end(), "false") == 1); CHECK(model.events.size() == 1);
+  REQUIRE_ERROR(backend.Continue(stopped, Continuation::Handled), ErrorCode::DebugFailure);
+  REQUIRE_ERROR(backend.SetKillOnExit(false), ErrorCode::DebugFailure);
+  REQUIRE_ERROR(backend.Detach(), ErrorCode::DebugFailure);
+  NativeDebugBackend second; auto owned = Owned(); REQUIRE_ERROR(second.Attach(owned), ErrorCode::DebugFailure);
+}
+}
+TEST("debug.native_verified_abort_observes_pin_without_continuing_or_closing_os_handles") {
   model = {};
-  { NativeDebugBackend backend; auto owned = Owned(); REQUIRE_OK(backend.Attach(owned)); REQUIRE_OK(backend.SetKillOnExit(false));
-    model.events.push_back(Event(CREATE_PROCESS_DEBUG_EVENT)); static_cast<void>(Waited(backend)); REQUIRE_OK(backend.SetKillOnExit(true));
-    model.events.push_back(Event(EXIT_PROCESS_DEBUG_EVENT)); REQUIRE_OK(backend.AbortOwnedStartup());
-    CHECK(model.closed.empty()); CHECK(std::find(model.calls.begin(), model.calls.end(), "abort_pin") != model.calls.end()); }
+  model.signal_on_terminate = true;
+  OnOwnerThread([&] {
+    NativeDebugBackend backend; const auto stopped = BeginUnsafeAbort(backend); REQUIRE_OK(backend.AbortOwnedStartup());
+    CHECK(model.closed.empty()); CHECK(std::find(model.calls.begin(), model.calls.end(), "abort_pin") != model.calls.end());
+    CheckTerminalNoContinuation(backend, stopped);
+  });
   CHECK((model.closed == std::vector<HANDLE>{Handle(101)}));
 }
 namespace {
@@ -236,15 +268,12 @@ TEST("debug.native_identifies_remote_breakin_thread_using_target_export") {
 }
 TEST("debug.native_abort_requires_pinned_exit_signal_not_terminate_return") {
   model = {}; model.fail_exit_signal = true;
-  std::exception_ptr failure;
-  std::thread owner([&] {
-    try {
-      NativeDebugBackend backend; auto owned = Owned(); REQUIRE_OK(backend.Attach(owned)); REQUIRE_OK(backend.SetKillOnExit(false));
-      model.events.push_back(Event(CREATE_PROCESS_DEBUG_EVENT)); static_cast<void>(Waited(backend)); REQUIRE_OK(backend.SetKillOnExit(true));
-      model.events.push_back(Event(EXIT_PROCESS_DEBUG_EVENT)); REQUIRE_ERROR(backend.AbortOwnedStartup(), ErrorCode::DebugFailure);
-      CHECK(model.kill);
-    } catch (...) { failure = std::current_exception(); }
-  }); owner.join(); if (failure) std::rethrow_exception(failure);
+  model.signal_on_terminate = true;
+  OnOwnerThread([&] {
+    NativeDebugBackend backend; const auto stopped = BeginUnsafeAbort(backend);
+    REQUIRE_ERROR(backend.AbortOwnedStartup(), ErrorCode::DebugFailure);
+    CheckTerminalNoContinuation(backend, stopped);
+  });
 }
 TEST("debug.native_only_one_target_per_debug_thread_even_with_two_backends") {
   model = {}; NativeDebugBackend first, second; auto owned = Owned();
@@ -252,4 +281,30 @@ TEST("debug.native_only_one_target_per_debug_thread_even_with_two_backends") {
   const auto before = model.calls.size(); REQUIRE_ERROR(second.Attach(owned), ErrorCode::DebugFailure);
   CHECK(model.calls.size() == before); REQUIRE_OK(first.Detach());
   REQUIRE_OK(second.Attach(owned)); REQUIRE_OK(second.SetKillOnExit(false)); REQUIRE_OK(second.Detach());
+}
+TEST("debug.native_failed_termination_nonsignaled_pin_keeps_original_stop_true_and_guard") {
+  model = {}; model.fail_terminate = true;
+  OnOwnerThread([&] {
+    NativeDebugBackend backend; const auto stopped = BeginUnsafeAbort(backend);
+    REQUIRE_ERROR(backend.AbortOwnedStartup(), ErrorCode::AccessDenied);
+    CHECK(model.positive_pin_waits == 0); CheckTerminalNoContinuation(backend, stopped);
+  });
+}
+TEST("debug.native_failed_termination_already_signaled_pin_is_verified_without_continue") {
+  model = {}; model.fail_terminate = true;
+  OnOwnerThread([&] {
+    NativeDebugBackend backend; const auto stopped = BeginUnsafeAbort(backend); model.exited = true;
+    REQUIRE_OK(backend.AbortOwnedStartup()); CheckTerminalNoContinuation(backend, stopped);
+  });
+}
+TEST("debug.native_accepted_termination_nonsignaled_pin_times_out_without_releasing_event") {
+  model = {};
+  OnOwnerThread([&] {
+    NativeDebugBackend backend; const auto stopped = BeginUnsafeAbort(backend); const auto began = backend.Now();
+    REQUIRE_ERROR(backend.AbortOwnedStartup(), ErrorCode::TimedOut);
+    CHECK(model.positive_pin_waits > 0); CheckTerminalNoContinuation(backend, stopped);
+    CHECK(backend.Now() - began < std::chrono::seconds(3));
+    const auto waits = model.positive_pin_waits; REQUIRE_ERROR(backend.AbortOwnedStartup(), ErrorCode::TimedOut);
+    CHECK(model.positive_pin_waits == waits);
+  });
 }

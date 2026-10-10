@@ -34,6 +34,7 @@ struct DebugSessionState {
   std::uint32_t pid{};
   bool attached{};
   bool safe_policy{};
+  bool abort_requested{};
   bool process_created{};
   bool attach_exception_seen{};
 };
@@ -62,14 +63,14 @@ bool DebugSession::Owner() const { return owner_ == std::this_thread::get_id(); 
 DebugSession::~DebugSession() {
   if (Owner() && state_->attached) {
     try {
-      if (state_->safe_policy) static_cast<void>(Detach());
+      if (state_->safe_policy && !state_->abort_requested) static_cast<void>(Detach());
       else static_cast<void>(AbortOwnedStartup());
     } catch (...) {}
   }
   state_->held_sequence.store(0);
 }
 Result<Unit> DebugSession::Attach(const OwnedProcess& process) {
-  if (!Owner() || state_->attached || !process.native_handle() || process.pid() == 0) return DebugFailure("attach_state");
+  if (!Owner() || state_->attached || state_->abort_requested || !process.native_handle() || process.pid() == 0) return DebugFailure("attach_state");
   if (cancellation_.stop_requested()) return DebugFailure("attach_cancelled", ErrorCode::TimedOut);
   auto attached = backend_.Attach(process);
   if (!IsOk(attached)) return Failure(attached);
@@ -87,7 +88,7 @@ Result<Unit> DebugSession::Attach(const OwnedProcess& process) {
   return Unit{};
 }
 Result<DebugStop> DebugSession::WaitStopped(Deadline deadline) {
-  if (!Owner() || !state_->attached || state_->held || !state_->safe_policy) return DebugFailure("wait_state");
+  if (!Owner() || !state_->attached || state_->abort_requested || state_->held || !state_->safe_policy) return DebugFailure("wait_state");
   while (backend_.Now() < deadline.value && !cancellation_.stop_requested()) {
     auto waited = backend_.Wait(Slice(deadline, backend_.Now()));
     if (!IsOk(waited)) return Failure(waited);
@@ -112,7 +113,7 @@ Result<DebugStop> DebugSession::WaitStopped(Deadline deadline) {
   return DebugFailure("debug_wait_deadline", ErrorCode::TimedOut);
 }
 Result<Unit> DebugSession::SetKillOnExit(bool enabled) {
-  if (!Owner() || !state_->attached || (enabled && !state_->held)) return DebugFailure("policy_state");
+  if (!Owner() || !state_->attached || state_->abort_requested || (enabled && !state_->held)) return DebugFailure("policy_state");
   if (enabled && cancellation_.stop_requested()) return DebugFailure("mutation_cancelled", ErrorCode::TimedOut);
   const auto result = backend_.SetKillOnExit(enabled);
   if (IsOk(result)) state_->safe_policy = !enabled;
@@ -122,7 +123,7 @@ bool DebugSession::Holds(const DebugStop& stop) const noexcept {
   return Owner() && state_->attached && state_->held.has_value() && stop.active() && stop.state_.lock() == state_;
 }
 Result<Unit> DebugSession::Continue(DebugStop& stop, Continuation continuation) {
-  if (!Holds(stop) || !state_->safe_policy || continuation != state_->continuation) return DebugFailure("continue_state");
+  if (!Holds(stop) || state_->abort_requested || !state_->safe_policy || continuation != state_->continuation) return DebugFailure("continue_state");
   return ReleaseHeld();
 }
 Result<Unit> DebugSession::ReleaseHeld() {
@@ -139,7 +140,7 @@ Result<Unit> DebugSession::Detach() {
   return Detach({backend_.Now() + std::chrono::seconds(2)});
 }
 Result<Unit> DebugSession::Detach(Deadline deadline) {
-  if (!Owner() || !state_->attached || !state_->safe_policy) return DebugFailure("detach_state");
+  if (!Owner() || !state_->attached || state_->abort_requested || !state_->safe_policy) return DebugFailure("detach_state");
   if (backend_.Now() >= deadline.value) return Error{ErrorCode::TimedOut, Stage::detach, "debug_detach_deadline"};
   auto released = ReleaseHeld();
   if (!IsOk(released)) return Failure(released);
@@ -167,6 +168,7 @@ Result<Unit> DebugSession::Detach(Deadline deadline) {
 }
 Result<Unit> DebugSession::AbortOwnedStartup() {
   if (!Owner() || !state_->attached) return DebugFailure("abort_state");
+  state_->abort_requested = true;
   const auto result = backend_.AbortOwnedStartup();
   if (IsOk(result)) {
     state_->attached = false;
@@ -183,7 +185,8 @@ struct NativeDebugBackend::State {
   bool safe_policy{};
   bool process_created{};
   bool attach_exception_seen{};
-  bool aborting{};
+  bool abort_requested{};
+  std::optional<Deadline> abort_deadline;
   std::uint32_t initial_tid{};
   std::optional<DebugEvent> held;
   Address breakpoint{};
@@ -288,7 +291,8 @@ Result<Unit> NativeDebugBackend::Attach(const OwnedProcess& process) {
   if (state_->pin) CloseHandle(state_->pin);
   state_->pin = pin;
   state_->pid = process.pid(); state_->attached = true; state_->safe_policy = false;
-  state_->process_created = false; state_->attach_exception_seen = false; state_->aborting = false;
+  state_->process_created = false; state_->attach_exception_seen = false; state_->abort_requested = false;
+  state_->abort_deadline.reset();
   state_->initial_tid = 0; state_->breakpoint = 0; state_->remote_breakin = 0;
   return Unit{};
 #else
@@ -296,7 +300,7 @@ Result<Unit> NativeDebugBackend::Attach(const OwnedProcess& process) {
 #endif
 }
 Result<Unit> NativeDebugBackend::SetKillOnExit(bool enabled) {
-  if (!state_->Owner() || !state_->attached || (enabled && !state_->held)) return DebugFailure("native_policy_state");
+  if (!state_->Owner() || !state_->attached || state_->abort_requested || (enabled && !state_->held)) return DebugFailure("native_policy_state");
 #ifdef _WIN32
   if (!DebugSetProcessKillOnExit(enabled ? TRUE : FALSE)) return NativeFailure("DebugSetProcessKillOnExit");
   state_->safe_policy = !enabled;
@@ -306,7 +310,7 @@ Result<Unit> NativeDebugBackend::SetKillOnExit(bool enabled) {
 #endif
 }
 Result<std::optional<DebugEvent>> NativeDebugBackend::Wait(std::chrono::milliseconds slice) {
-  if (!state_->Owner() || !state_->attached || state_->held || (!state_->safe_policy && !state_->aborting) ||
+  if (!state_->Owner() || !state_->attached || state_->abort_requested || state_->held || !state_->safe_policy ||
       slice.count() < 0 || slice > std::chrono::milliseconds(50)) return DebugFailure("native_wait_state");
 #ifdef _WIN32
   DEBUG_EVENT native{};
@@ -326,7 +330,7 @@ Result<std::optional<DebugEvent>> NativeDebugBackend::Wait(std::chrono::millisec
     const auto file = native.u.LoadDll.hFile;
     const DebugFileHandle file_owner(file);
     const auto base = reinterpret_cast<Address>(native.u.LoadDll.lpBaseOfDll);
-    if (!state_->aborting && native.dwProcessId == state_->pid && IsSystemNtdll(state_->pin, base, file)) {
+    if (native.dwProcessId == state_->pid && IsSystemNtdll(state_->pin, base, file)) {
       RemoteMemory memory(state_->pin);
       state_->breakpoint = TargetExport(memory, base, "DbgBreakPoint");
       state_->remote_breakin = TargetExport(memory, base, "DbgUiRemoteBreakin");
@@ -336,7 +340,7 @@ Result<std::optional<DebugEvent>> NativeDebugBackend::Wait(std::chrono::millisec
     event.exception_status = native.u.Exception.ExceptionRecord.ExceptionCode;
     event.exception_address = reinterpret_cast<Address>(native.u.Exception.ExceptionRecord.ExceptionAddress);
     event.first_chance = native.u.Exception.dwFirstChance != 0;
-    event.attach_breakpoint_identity = !state_->aborting && event.pid == state_->pid && state_->process_created && !state_->attach_exception_seen &&
+    event.attach_breakpoint_identity = event.pid == state_->pid && state_->process_created && !state_->attach_exception_seen &&
       event.exception_status == EXCEPTION_BREAKPOINT && event.first_chance && state_->breakpoint != 0 &&
       event.exception_address == state_->breakpoint && (event.tid == state_->initial_tid || RemoteBreakinThread(event.tid, state_->remote_breakin));
     state_->attach_exception_seen = true;
@@ -350,7 +354,7 @@ Result<std::optional<DebugEvent>> NativeDebugBackend::Wait(std::chrono::millisec
 #endif
 }
 Result<Unit> NativeDebugBackend::Continue(const DebugEvent& event, Continuation continuation) {
-  if (!state_->Owner() || !state_->attached || !state_->held || (!state_->safe_policy && !state_->aborting) ||
+  if (!state_->Owner() || !state_->attached || state_->abort_requested || !state_->held || !state_->safe_policy ||
       event.pid != state_->pid || event.tid != state_->held->tid ||
       event.kind != state_->held->kind || event.exception_status != state_->held->exception_status ||
       event.exception_address != state_->held->exception_address ||
@@ -361,7 +365,7 @@ Result<Unit> NativeDebugBackend::Continue(const DebugEvent& event, Continuation 
   state_->held.reset();
   if (event.kind == DebugEventKind::ProcessExited) {
     state_->attached = false;
-    if (!state_->aborting) active_debugger = nullptr;
+    active_debugger = nullptr;
   }
   return Unit{};
 #else
@@ -369,7 +373,7 @@ Result<Unit> NativeDebugBackend::Continue(const DebugEvent& event, Continuation 
 #endif
 }
 Result<Unit> NativeDebugBackend::Detach() {
-  if (!state_->Owner() || !state_->attached || state_->held || !state_->safe_policy) return DebugFailure("native_detach_state");
+  if (!state_->Owner() || !state_->attached || state_->abort_requested || state_->held || !state_->safe_policy) return DebugFailure("native_detach_state");
 #ifdef _WIN32
   if (!DebugActiveProcessStop(state_->pid)) return NativeFailure("DebugActiveProcessStop", Stage::detach);
   state_->attached = false;
@@ -382,24 +386,19 @@ Result<Unit> NativeDebugBackend::Detach() {
 Result<Unit> NativeDebugBackend::AbortOwnedStartup() {
   if (!state_->Owner() || !state_->attached) return DebugFailure("native_abort_state");
 #ifdef _WIN32
-  if (!TerminateProcess(state_->pin, ERROR_PROCESS_ABORTED) && WaitForSingleObject(state_->pin, 0) != WAIT_OBJECT_0) return NativeFailure("abort_owned_startup");
-  state_->aborting = true;
-  const Deadline cleanup{Now() + std::chrono::seconds(2)};
-  while (state_->attached && Now() < cleanup.value) {
-    if (state_->held) {
-      const auto event = *state_->held;
-      const auto continuation = event.kind == DebugEventKind::Exception && !event.attach_breakpoint_identity ? Continuation::NotHandled : Continuation::Handled;
-      auto continued = Continue(event, continuation);
-      if (!IsOk(continued)) return Failure(continued);
-    } else {
-      auto waited = Wait(Slice(cleanup, Now()));
-      if (!IsOk(waited)) return Failure(waited);
-    }
-  }
-  if (state_->attached) return DebugFailure("abort_cleanup_deadline", ErrorCode::TimedOut);
+  state_->abort_requested = true;
+  if (!state_->abort_deadline) state_->abort_deadline = Deadline{Now() + std::chrono::seconds(2)};
+  const auto cleanup = *state_->abort_deadline;
+  if (Now() >= cleanup.value) return DebugFailure("abort_owned_exit_deadline", ErrorCode::TimedOut);
+  const bool accepted = TerminateProcess(state_->pin, ERROR_PROCESS_ABORTED) != FALSE;
+  const auto termination_error = accepted ? Error{} : NativeFailure("abort_owned_startup");
+  const auto observed = WaitForSingleObject(state_->pin, 0);
+  if (observed == WAIT_OBJECT_0) { state_->attached = false; return Unit{}; }
+  if (!accepted) return termination_error;
+  if (observed != WAIT_TIMEOUT) return NativeFailure("abort_owned_exit_wait");
   while (Now() < cleanup.value) {
     const auto signaled = WaitForSingleObject(state_->pin, static_cast<DWORD>(Slice(cleanup, Now()).count()));
-    if (signaled == WAIT_OBJECT_0) { active_debugger = nullptr; return Unit{}; }
+    if (signaled == WAIT_OBJECT_0) { state_->attached = false; return Unit{}; }
     if (signaled != WAIT_TIMEOUT) return NativeFailure("abort_owned_exit_wait");
   }
   return DebugFailure("abort_owned_exit_deadline", ErrorCode::TimedOut);

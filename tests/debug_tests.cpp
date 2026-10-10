@@ -34,7 +34,7 @@ public:
     continued.push_back({event, continuation}); return Unit{};
   }
   Result<Unit> Detach() override { calls.push_back("detach"); if (detach_failures-- > 0) return DebugError(); detached = true; return Unit{}; }
-  Result<Unit> AbortOwnedStartup() override { calls.push_back("abort"); aborted = true; return Unit{}; }
+  Result<Unit> AbortOwnedStartup() override { calls.push_back("abort"); if (fail_abort) return DebugError(); aborted = true; return Unit{}; }
   mutable std::chrono::steady_clock::time_point now{};
   std::chrono::milliseconds now_step{};
   std::chrono::milliseconds last_slice{};
@@ -43,6 +43,7 @@ public:
   std::deque<DebugEvent> events;
   std::vector<std::pair<DebugEvent, Continuation>> continued;
   bool denied{}, fail_policy{}, fail_wait{}, fail_continue{}, detached{}, aborted{}, kill{true};
+  bool fail_abort{};
   int detach_failures{};
 };
 DebugEvent Event(DebugEventKind kind = DebugEventKind::Other) { return {kind, 42, 7}; }
@@ -301,4 +302,15 @@ TEST("debug.held_capability_binds_exact_session_and_checks_without_continuing") 
   bool worker_held{true}; std::thread worker([&] { worker_held = fixture.session.Holds(stop); }); worker.join(); CHECK(!worker_held);
   auto moved = std::move(stop); CHECK(!fixture.session.Holds(stop)); CHECK(fixture.session.Holds(moved));
   REQUIRE_OK(fixture.session.Continue(moved, Continuation::Handled)); CHECK(!fixture.session.Holds(moved));
+}
+TEST("debug.failed_abort_retains_session_capability_and_refuses_false_resume_or_detach") {
+  Fixture fixture; REQUIRE_OK(fixture.session.Attach(fixture.owned)); fixture.backend.events.push_back(Event()); auto stop = fixture.Stop();
+  REQUIRE_OK(fixture.session.SetKillOnExit(true)); fixture.backend.fail_abort = true;
+  REQUIRE_ERROR(fixture.session.AbortOwnedStartup(), ErrorCode::DebugFailure);
+  CHECK(stop.active()); CHECK(fixture.session.Holds(stop)); CHECK(fixture.backend.kill);
+  const auto before = fixture.backend.calls.size();
+  REQUIRE_ERROR(fixture.session.SetKillOnExit(false), ErrorCode::DebugFailure);
+  REQUIRE_ERROR(fixture.session.Continue(stop, Continuation::Handled), ErrorCode::DebugFailure);
+  REQUIRE_ERROR(fixture.session.Detach(), ErrorCode::DebugFailure);
+  CHECK(fixture.backend.calls.size() == before); CHECK(fixture.backend.continued.empty());
 }
