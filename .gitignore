@@ -1,0 +1,73 @@
+# Private investigation material and internal planning
+/evidence/
+/artifacts/
+/docs/superpowers/
+/docs/bug-reports/
+
+# Generated build, release, and local diagnostic output
+/build/
+/dist/
+/diagnostics/
+/support-bundles/
+__pycache__/
+*.pyc
+.vs/
+
+# Local configuration; the documented config/FrameGenFix.toml stays tracked
+/FrameGenFix.toml
+
+# AI/agent instructions and local tool state
+AGENTS*.md
+CLAUDE*.md
+GEMINI*.md
+SKILL.md
+.agent/
+.ai/
+.agents/
+.codex/
+.claude/
+.gemini/
+.planning/
+.superpowers/
+.serena/
+.cursor/
+.cursorrules
+.github/copilot-instructions.md
+.github/agents/
+.github/instructions/
+.github/prompts/
+.aider*
+.continue/
+.opencode/
+
+# Secret files and credentials
+.env
+.env.*
+*.env
+!.env.example
+!.env.sample
+secrets/
+.secrets/
+.ssh/
+.aws/
+.azure/
+.netrc
+.npmrc
+.pypirc
+credentials.json
+credentials.local.json
+service-account*.json
+*.pem
+*.key
+*.p12
+*.pfx
+*.keystore
+id_rsa
+id_ed25519
+*.secret
+*.secrets
+*.token
+.tokens/
+
+# Public docs, example config, and permitted fixtures are intentionally tracked.
+# Planned staged/CI secret scanning checks contents; ignore rules match paths only.
