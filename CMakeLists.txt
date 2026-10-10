@@ -21,7 +21,7 @@ add_custom_target(wfg_build_identity
   VERBATIM)
 
 add_library(wfg_core STATIC src/pe.cpp src/compatibility.cpp src/configuration.cpp src/diagnostics.cpp src/windows_process.cpp
-  src/debug_session.cpp)
+  src/debug_session.cpp src/transaction.cpp)
 add_dependencies(wfg_core wfg_build_identity)
 target_include_directories(wfg_core PUBLIC include "${WFG_GENERATED_DIRECTORY}")
 target_link_libraries(wfg_core PRIVATE bcrypt advapi32 psapi shlwapi xmllite ole32 wintrust crypt32 version)
@@ -46,6 +46,13 @@ foreach(group IN ITEMS pe compatibility process debug configuration diagnostics)
   set_tests_properties(wfg_${group} PROPERTIES LABELS ${group})
 endforeach()
 set_tests_properties(wfg_configuration PROPERTIES LABELS "configuration;config")
+
+add_executable(wfg_transaction_tests tests/test_main.cpp tests/transaction_tests.cpp)
+target_include_directories(wfg_transaction_tests PRIVATE include tests)
+target_link_libraries(wfg_transaction_tests PRIVATE wfg_core)
+target_compile_options(wfg_transaction_tests PRIVATE /W4 /permissive-)
+add_test(NAME wfg_transaction COMMAND wfg_transaction_tests --filter transaction)
+set_tests_properties(wfg_transaction PROPERTIES LABELS transaction)
 
 add_executable(wfg_debug_win32_boundary tests/test_main.cpp tests/fixtures/debug_win32_backend.cpp src/pe.cpp)
 target_include_directories(wfg_debug_win32_boundary PRIVATE include tests)

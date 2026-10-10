@@ -196,7 +196,7 @@ struct EnvironmentSnapshot {
 };
 
 enum class Status { Applied, RoutingAlreadyPresent, AlreadyRunning, UnsupportedBuild, UnexpectedImports, UntrustedInterposer, StartupTooLate, AccessDenied, RolledBack, StartupAborted, LaunchFailed, TimedOut, ConfigurationInvalid, DllConflict };
-enum class TransactionOutcome { NotStarted, Committed, RolledBack, Failed };
+enum class TransactionOutcome { NotStarted, Committed, RolledBack, Failed, Aborted };
 enum class DetachOutcome { NotStarted, Detached, Failed };
 struct SanitizedDiagnosticRecord { ErrorCode code{}; Stage stage{Stage::Launch}; std::string operation; std::chrono::system_clock::time_point time{}; };
 struct RunResult { Status status{Status::LaunchFailed}; TransactionOutcome transaction{TransactionOutcome::NotStarted}; DetachOutcome detach{DetachOutcome::NotStarted}; SanitizedDiagnosticRecord diagnostic; };
