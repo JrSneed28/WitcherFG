@@ -21,7 +21,7 @@ add_custom_target(wfg_build_identity
   VERBATIM)
 
 add_library(wfg_core STATIC src/pe.cpp src/compatibility.cpp src/configuration.cpp src/diagnostics.cpp src/windows_process.cpp
-  src/debug_session.cpp src/transaction.cpp)
+  src/debug_session.cpp src/transaction.cpp src/runtime_observation.cpp)
 add_dependencies(wfg_core wfg_build_identity)
 target_include_directories(wfg_core PUBLIC include "${WFG_GENERATED_DIRECTORY}")
 target_link_libraries(wfg_core PRIVATE bcrypt advapi32 psapi shlwapi xmllite ole32 wintrust crypt32 version)
@@ -34,14 +34,14 @@ target_link_libraries(wfg_launcher PRIVATE wfg_core)
 target_compile_options(wfg_launcher PRIVATE /W4 /permissive-)
 
 add_executable(wfg_tests tests/test_main.cpp tests/pe_tests.cpp tests/core_tests.cpp tests/compatibility_tests.cpp
-  tests/configuration_tests.cpp tests/diagnostics_tests.cpp tests/process_tests.cpp tests/debug_tests.cpp)
+  tests/configuration_tests.cpp tests/diagnostics_tests.cpp tests/process_tests.cpp tests/debug_tests.cpp tests/observation_tests.cpp)
 target_compile_definitions(wfg_tests PRIVATE WFG_CONFIG_SNAPSHOT)
 target_include_directories(wfg_tests PRIVATE include tests)
 target_link_libraries(wfg_tests PRIVATE wfg_core)
 target_compile_options(wfg_tests PRIVATE /W4 /permissive-)
 
 enable_testing()
-foreach(group IN ITEMS pe compatibility process debug configuration diagnostics)
+foreach(group IN ITEMS pe compatibility process debug configuration diagnostics observation)
   add_test(NAME wfg_${group} COMMAND wfg_tests --filter ${group})
   set_tests_properties(wfg_${group} PROPERTIES LABELS ${group})
 endforeach()
