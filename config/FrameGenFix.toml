@@ -1,0 +1,13 @@
+# Optional: copy beside WitcherFG.exe. Defaults are shown explicitly.
+schema_version = 1
+
+[logging]
+level = "error"
+file_logging = true
+max_file_mib = 2
+retained_files = 5
+
+[diagnostics]
+runtime_observation = false
+sample_interval_ms = 1000
+observation_seconds = 30

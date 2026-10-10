@@ -1,0 +1,119 @@
+[[compatibility]]
+component = "Xbox PC executable, menu 5.01 / package 5.0.4.0"
+status = "Verified"
+scope = "diagnostic_probe"
+native_release_status = "Pending"
+evidence_method = "Local diagnostic startup probe, measured state and player confirmation"
+evidence_date = "2026-10-10"
+game_identity = "Xbox CDPROJEKTSA.Witcher3GOTY 5.0.4.0; menu 5.01"
+details = "Measured fingerprints and temporary four-import redirection."
+
+[[compatibility]]
+component = "NVIDIA RTX 5070 Ti"
+status = "Verified"
+scope = "diagnostic_probe"
+native_release_status = "Pending"
+evidence_method = "Local diagnostic startup probe, measured state and player confirmation"
+evidence_date = "2026-10-10"
+game_identity = "Xbox CDPROJEKTSA.Witcher3GOTY 5.0.4.0; menu 5.01"
+details = "Local Dynamic FG probe; visible world and smoother motion confirmed after manual RT reset."
+
+[[compatibility]]
+component = "NVIDIA driver 617.42"
+status = "Verified"
+scope = "diagnostic_probe"
+native_release_status = "Pending"
+evidence_method = "Local diagnostic startup probe, measured state and player confirmation"
+evidence_date = "2026-10-10"
+game_identity = "Xbox CDPROJEKTSA.Witcher3GOTY 5.0.4.0; menu 5.01"
+details = "Local probe used the original NVIDIA profile."
+
+[[compatibility]]
+component = "Windows 11 Pro build 26200, 2560 × 1440"
+status = "Verified"
+scope = "diagnostic_probe"
+native_release_status = "Pending"
+evidence_method = "Local diagnostic startup probe, measured state and player confirmation"
+evidence_date = "2026-10-10"
+game_identity = "Xbox CDPROJEKTSA.Witcher3GOTY 5.0.4.0; menu 5.01"
+details = "Measured local environment; other resolutions/window modes are untested."
+
+[[compatibility]]
+component = "Native WitcherFG launcher or installer ZIP"
+status = "Pending"
+scope = "native_release"
+native_release_status = "Pending"
+evidence_method = "None for native player release"
+evidence_date = ""
+game_identity = "Initial record: Xbox package 5.0.4.0 only"
+details = "Native code and synthetic lifecycle tests exist; packaged game/player acceptance remains Pending."
+
+[[compatibility]]
+component = "Other NVIDIA GPUs"
+status = "Untested"
+scope = "native_release"
+native_release_status = "Pending"
+evidence_method = "None for native player release"
+evidence_date = ""
+game_identity = "Initial record: Xbox package 5.0.4.0 only"
+details = "No extrapolation from the RTX 5070 Ti probe."
+
+[[compatibility]]
+component = "AMD GPUs"
+status = "Untested"
+scope = "native_release"
+native_release_status = "Pending"
+evidence_method = "None for native player release"
+evidence_date = ""
+game_identity = "Initial record: Xbox package 5.0.4.0 only"
+details = "No support claim; no AMD FG backend is supplied."
+
+[[compatibility]]
+component = "Intel GPUs"
+status = "Untested"
+scope = "native_release"
+native_release_status = "Pending"
+evidence_method = "None for native player release"
+evidence_date = ""
+game_identity = "Initial record: Xbox package 5.0.4.0 only"
+details = "No support claim; no Intel FG backend is supplied."
+
+[[compatibility]]
+component = "Steam executable"
+status = "Untested"
+scope = "native_release"
+native_release_status = "Pending"
+evidence_method = "None for native player release"
+evidence_date = ""
+game_identity = "Initial record: Xbox package 5.0.4.0 only"
+details = "Initial compiled Xbox eligibility does not authorize this store/build."
+
+[[compatibility]]
+component = "Epic/GOG executables"
+status = "Untested"
+scope = "native_release"
+native_release_status = "Pending"
+evidence_method = "None for native player release"
+evidence_date = ""
+game_identity = "Initial record: Xbox package 5.0.4.0 only"
+details = "Initial compiled Xbox eligibility does not authorize these stores/builds."
+
+[[compatibility]]
+component = "Other NVIDIA driver versions"
+status = "Untested"
+scope = "native_release"
+native_release_status = "Pending"
+evidence_method = "None for native player release"
+evidence_date = ""
+game_identity = "Initial record: Xbox package 5.0.4.0 only"
+details = "Not independently verified."
+
+[[compatibility]]
+component = "Other upscaler/FG mods, Vortex, other mod managers"
+status = "Untested"
+scope = "native_release"
+native_release_status = "Pending"
+evidence_method = "None for native player release"
+evidence_date = ""
+game_identity = "Initial record: Xbox package 5.0.4.0 only"
+details = "No named/versioned coexistence or manager test exists."
