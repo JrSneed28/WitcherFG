@@ -212,7 +212,8 @@ Result<PeImage> InspectPe(const IMemory& memory, Address base) {
   return image;
 }
 
-Result<ImportSlot> FindImport(const IMemory& memory, const PeImage& image, std::string_view module, std::string_view name) {
+namespace {
+Result<ImportSlot> FindImportBy(const IMemory& memory, const PeImage& image, std::string_view module, std::string_view name, std::optional<PeOrdinal> ordinal) {
   DataDirectory directory{};
   auto valid = Directory(image, 1, directory);
   if (!IsOk(valid)) return Failure(valid);
@@ -250,13 +251,14 @@ Result<ImportSlot> FindImport(const IMemory& memory, const PeImage& image, std::
       }
       if ((Value(thunk) & (1ULL << 63)) != 0) {
         if ((Value(thunk) & 0x7fffffffffff0000ULL) != 0) return Fail(ErrorCode::MalformedImage, "import_ordinal");
-        continue;
+        if (!matching_module || !ordinal || (Value(thunk) & 0xffff) != ordinal->value) continue;
+      } else {
+        if (!InImage(image, Value(thunk), 3)) return Fail(ErrorCode::MalformedImage, "import_name");
+        if (!matching_module) continue;
+        auto import_name = ReadString(memory, image, static_cast<std::uint64_t>(Value(thunk)) + 2);
+        if (!IsOk(import_name)) return Failure(import_name);
+        if (ordinal || Value(import_name) != name) continue;
       }
-      if (!InImage(image, Value(thunk), 3)) return Fail(ErrorCode::MalformedImage, "import_name");
-      if (!matching_module) continue;
-      auto import_name = ReadString(memory, image, static_cast<std::uint64_t>(Value(thunk)) + 2);
-      if (!IsOk(import_name)) return Failure(import_name);
-      if (Value(import_name) != name) continue;
       if (found) return Fail(ErrorCode::MalformedImage, "duplicate_import");
       auto slot_address = At(image, slot_rva, 8);
       if (!IsOk(slot_address)) return Failure(slot_address);
@@ -270,8 +272,18 @@ Result<ImportSlot> FindImport(const IMemory& memory, const PeImage& image, std::
   if (!descriptor_terminated) return Fail(ErrorCode::MalformedImage, "unterminated_imports");
   return found ? Result<ImportSlot>(result) : Result<ImportSlot>(Fail(ErrorCode::MalformedImage, "import_not_found"));
 }
+}
 
+Result<ImportSlot> FindImport(const IMemory& memory, const PeImage& image, std::string_view module, std::string_view name) { return FindImportBy(memory,image,module,name,std::nullopt); }
+Result<ImportSlot> FindImport(const IMemory& memory, const PeImage& image, std::string_view module, PeOrdinal ordinal) { return FindImportBy(memory,image,module,{},ordinal); }
 Result<ExportEntry> FindExport(const IMemory& memory, const PeImage& image, std::string_view name) { return ExportBy(memory, image, name, std::nullopt); }
+Result<ExportEntry> FindExport(const IMemory& memory, const PeImage& image, PeOrdinal ordinal) { return ExportBy(memory,image,{},ordinal.value); }
+Result<Unit> BindExportOrdinal(const IMemory& memory,const PeImage& image,std::string_view name,PeOrdinal ordinal) {
+  const auto named=FindExport(memory,image,name);if(!IsOk(named))return Failure(named);
+  const auto numbered=FindExport(memory,image,ordinal);if(!IsOk(numbered))return Failure(numbered);
+  if(Value(named).rva!=Value(numbered).rva||Value(named).forwarder!=Value(numbered).forwarder)return Fail(ErrorCode::MalformedImage,"ordinal_name_binding");
+  return Unit{};
+}
 
 Result<Address> ResolveNativeExport(const IMemory& memory, std::span<const ModuleImage> modules, std::string_view module, std::string_view name) {
   std::vector<std::string> chain;

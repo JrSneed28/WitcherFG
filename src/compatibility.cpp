@@ -86,7 +86,7 @@ const CompatibilityRecord& SupportedBuild() {
       "CDPROJEKTSA.Witcher3GOTY", "5.0.4.0", 0x8664, 0x6AC55CE6U, 0x658F000U,
       {"2.14.1", 652928U, Hex("8c87c9499461da561edd529aa9bf7831d67d7b94ebb1c1a5ed54ef4934e1ea4c")},
       {{{0x1CB0384U, 32U, Hex("bea2f23fae85c0d5ae5a517bb573945525addd04bb52ce4ae239b7da944b7c09")}, {0x1CB061DU, 32U, Hex("88f7cb6bdd8c6d3285de7ab6688c00d98d10d189e2906136aa8432b5afe3e736")}}},
-      {{{"d3d12.dll", "D3D12CreateDevice", "d3d12.dll", 0x2B52450U}, {"dxgi.dll", "CreateDXGIFactory1", "dxgi.dll", 0x2B524D0U}, {"dxgi.dll", "CreateDXGIFactory2", "dxgi.dll", 0x2B524D8U}, {"dxgi.dll", "CreateDXGIFactory", "dxgi.dll", 0x2B524E0U}}},
+      {{{"d3d12.dll", "D3D12CreateDevice", "d3d12.dll", 0x2B52450U, PeOrdinal{101}}, {"dxgi.dll", "CreateDXGIFactory1", "dxgi.dll", 0x2B524D0U}, {"dxgi.dll", "CreateDXGIFactory2", "dxgi.dll", 0x2B524D8U}, {"dxgi.dll", "CreateDXGIFactory", "dxgi.dll", 0x2B524E0U}}},
       0x5A75F30U, 0x302F568U};
   return record;
 }
@@ -119,8 +119,14 @@ Result<ValidatedBuild> ValidateBuild(const IMemory& memory, const RuntimeInvento
   bool all_interposer = true;
   for (std::size_t index = 0; index < record.mappings.size(); ++index) {
     const auto& required = record.mappings[index];
-    const auto imported = FindImport(memory, Value(executable), required.import_module, required.import_name);
+    const auto imported = required.import_ordinal ? FindImport(memory,Value(executable),required.import_module,*required.import_ordinal) :
+      FindImport(memory, Value(executable), required.import_module, required.import_name);
     if (!IsOk(imported)) return Failure(imported);
+    if(required.import_ordinal) {
+      const auto named_import=FindImport(memory,Value(executable),required.import_module,required.import_name);
+      if(IsOk(named_import))return Fail(ErrorCode::MalformedImage,"ambiguous_import_selector");
+      if(Failure(named_import).code!=ErrorCode::MalformedImage||Failure(named_import).operation.view()!="import_not_found")return Failure(named_import);
+    }
     if (Value(imported).rva != required.rva) return Fail(ErrorCode::UnsupportedBuild, "import_rva");
     const auto* native = NativeModule(inventory, required.native_module);
     if (native == nullptr) return Fail(ErrorCode::UntrustedInterposer, "native_module_trust");
@@ -131,6 +137,11 @@ Result<ValidatedBuild> ValidateBuild(const IMemory& memory, const RuntimeInvento
       const auto image = InspectPe(memory, module.module.image.base);
       if (!IsOk(image)) return Failure(image);
       native_images.push_back({module.module.name, Value(image)});
+    }
+    if(required.import_ordinal) {
+      const auto native_image=InspectPe(memory,native->module.image.base);if(!IsOk(native_image))return Failure(native_image);
+      const auto binding=BindExportOrdinal(memory,Value(native_image),required.import_name,*required.import_ordinal);
+      if(!IsOk(binding))return Failure(binding);
     }
     const auto original = ResolveNativeExport(memory, native_images, required.native_module, required.import_name);
     if (!IsOk(original)) return Failure(original);

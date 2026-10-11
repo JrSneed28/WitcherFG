@@ -101,6 +101,7 @@ inline wfg::CompatibilityRecord Compatibility() {
        {0x840, 32, Hash("cfd2f1fad75a1978da0a444883db7251414b139f31f5a04704c291fdb0e175e6")}}};
   for (unsigned i = 0; i < 4; ++i)
     c.mappings[i] = {"fixture-native.dll", Names[i], "fixture-native.dll", 0x2000 + i * 0x1000};
+  c.mappings[0].import_ordinal=wfg::PeOrdinal{101};
   c.factory_manager_rva = 0x900;
   c.factory_member_offset = 8;
   return c;

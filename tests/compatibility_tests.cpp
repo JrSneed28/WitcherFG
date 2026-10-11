@@ -48,6 +48,44 @@ TEST("compatibility.production_record_has_exact_reviewed_values") {
   }
 }
 
+TEST("compatibility.ordinal_record_keeps_four_mandatory_slots") {
+  CHECK(wfg::SupportedBuild().mappings[0].import_ordinal.has_value());
+  CHECK(wfg::SupportedBuild().mappings[0].import_ordinal->value==101);
+  for(std::size_t i=1;i<4;++i)CHECK(!wfg::SupportedBuild().mappings[i].import_ordinal.has_value());
+  SupportedRuntimeFixture f;const auto v=REQUIRE_OK(wfg::ValidateBuild(f.memory,f.inventory,f.SyntheticBuild()));
+  CHECK(v.mappings.size()==4);CHECK(v.mappings[0].rva==0x2b52450);CHECK(f.memory.write_count()==0);CHECK(f.memory.protect_count()==0);
+}
+TEST("compatibility.ordinal_native_binding_mismatch_refuses_before_changes") {
+  SupportedRuntimeFixture f;
+  // Native name is now ordinal102 while the imported101 points at a different entry.
+  f.memory.Put<std::uint32_t>(0x00007FF700000214ULL,2);
+  f.memory.Put<std::uint32_t>(0x00007FF700000284ULL,0x610);
+  f.memory.Put<std::uint16_t>(0x00007FF7000002c0ULL,1);
+  const auto outcome=wfg::ValidateBuild(f.memory,f.inventory,f.SyntheticBuild());
+  REQUIRE_ERROR(outcome,wfg::ErrorCode::MalformedImage);CHECK(wfg::Failure(outcome).operation.view()=="ordinal_name_binding");
+  CHECK(f.memory.write_count()==0);CHECK(f.memory.protect_count()==0);
+}
+TEST("compatibility.ordinal_missing_wrong_rva_and_mixed_selector_refuse") {
+  for(int change=0;change<4;++change){SupportedRuntimeFixture f;auto record=f.SyntheticBuild();
+    switch(change){case 0:f.memory.Put<std::uint64_t>(f.inventory.executable.image.base+0x1000,0x8000000000000066ULL);break;
+      case 1:record.mappings[0].rva+=8;break;case 2:f.memory.Put<std::uint64_t>(f.inventory.executable.image.base+0x1000,0);break;
+      case 3:f.memory.Put<std::uint64_t>(f.inventory.executable.image.base+0x1008,0x600);break;}
+    const auto outcome=wfg::ValidateBuild(f.memory,f.inventory,record);CHECK(!wfg::IsOk(outcome));
+    if(change==3)CHECK(wfg::Failure(outcome).operation.view()=="ambiguous_import_selector");
+    CHECK(f.memory.write_count()==0);CHECK(f.memory.protect_count()==0);
+  }
+}
+TEST("compatibility.ordinal_binding_keeps_trusted_forwarder_resolution") {
+  for(const bool trusted:{true,false}){SupportedRuntimeFixture f;
+    RuntimeFixtureDetail::Text(f.memory,0x00007FF700000400ULL,"dxcore.CreateDXGIFactory1");
+    f.memory.Put<std::uint32_t>(0x00007FF700000280ULL,0x400);
+    f.SetImportPointer("D3D12CreateDevice",0x00007FF720000600ULL);
+    f.inventory.trusted_system_modules[2].trusted_system=trusted;
+    const auto outcome=wfg::ValidateBuild(f.memory,f.inventory,f.SyntheticBuild());
+    CHECK(wfg::IsOk(outcome)==trusted);CHECK(f.memory.write_count()==0);CHECK(f.memory.protect_count()==0);
+  }
+}
+
 TEST("compatibility.supported_runtime_authorizes_native_routing") {
   auto fixture = SupportedRuntimeFixture();
   const auto build = fixture.SyntheticBuild();

@@ -26,7 +26,7 @@ void *Exports(unsigned first) {
   auto *p = VirtualAlloc(nullptr, 8192, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
   Must(p != nullptr, "export_alloc");
   Headers(p, 8192, true);
-  Put<unsigned>(p, 0x210, 1);
+  Put<unsigned>(p, 0x210, first==10?101U:1U);
   Put<unsigned>(p, 0x214, 4);
   Put<unsigned>(p, 0x218, 4);
   Put<unsigned>(p, 0x21c, 0x280);
@@ -67,7 +67,7 @@ Layout Create() {
     Put<unsigned>(p, d, 0x600 + i * 16);
     Put<unsigned>(p, d + 12, 0x500);
     Put<unsigned>(p, d + 16, 0x2000 + i * 0x1000);
-    Put<std::uint64_t>(p, 0x600 + i * 16, 0xa00 + i * 40);
+    Put<std::uint64_t>(p, 0x600 + i * 16, i==0?0x8000000000000065ULL:0xa00ULL+i*40);
     Text(p, 0xa02 + i * 40, Names[i]);
     l.slots[i] = l.image + 0x2000 + i * 0x1000;
     l.originals[i] = l.native + 0x1000 + i * 16;

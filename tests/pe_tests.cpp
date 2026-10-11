@@ -53,6 +53,48 @@ TEST("pe.noncertificate_directories_keep_image_bounds") {
   }
 }
 
+TEST("pe.ordinal_import_is_explicit_and_never_name_fallback") {
+  auto image=FixturePe::OrdinalImport();const auto pe=REQUIRE_OK(wfg::InspectPe(image.memory,image.base));
+  const auto slot=REQUIRE_OK(wfg::FindImport(image.memory,pe,"DXGI.DLL",wfg::PeOrdinal{101}));
+  CHECK(slot.rva==0x2B524D8);CHECK(slot.current_pointer==0x1234567812345678ULL);
+  REQUIRE_ERROR(wfg::FindImport(image.memory,pe,"dxgi.dll","CreateDXGIFactory2"),wfg::ErrorCode::MalformedImage);
+  REQUIRE_ERROR(wfg::FindImport(image.memory,pe,"other.dll",wfg::PeOrdinal{101}),wfg::ErrorCode::MalformedImage);
+  REQUIRE_ERROR(wfg::FindImport(image.memory,pe,"dxgi.dll",wfg::PeOrdinal{100}),wfg::ErrorCode::MalformedImage);
+  REQUIRE_ERROR(wfg::FindImport(image.memory,pe,"dxgi.dll",wfg::PeOrdinal{0}),wfg::ErrorCode::MalformedImage);
+  CHECK(image.memory.write_count()==0);CHECK(image.memory.protect_count()==0);
+}
+TEST("pe.ordinal_import_rejects_reserved_bits_and_named_impostor") {
+  for(const auto token:{0x8000000000010065ULL,0x8000000100000065ULL,0xffff000000000065ULL,0x340ULL}){
+    auto image=FixturePe::OrdinalImport(token);const auto pe=REQUIRE_OK(wfg::InspectPe(image.memory,image.base));
+    REQUIRE_ERROR(wfg::FindImport(image.memory,pe,"dxgi.dll",wfg::PeOrdinal{101}),wfg::ErrorCode::MalformedImage);
+  }
+}
+TEST("pe.ordinal_import_rejects_duplicate_bound_and_truncated_tables") {
+  auto duplicate=FixturePe::OrdinalImport();auto bytes=wfg::Value(duplicate.memory.Read(duplicate.base,0x2B525D8));
+  FixturePe::Put<std::uint64_t>(bytes,0x328,0x8000000000000065ULL);
+  FixturePe::Image image{duplicate.base,FakeMemory(duplicate.base,std::move(bytes))};
+  auto pe=REQUIRE_OK(wfg::InspectPe(image.memory,image.base));
+  REQUIRE_ERROR(wfg::FindImport(image.memory,pe,"dxgi.dll",wfg::PeOrdinal{101}),wfg::ErrorCode::MalformedImage);
+  auto bound=FixturePe::BoundImportWithoutOriginalNames();pe=REQUIRE_OK(wfg::InspectPe(bound.memory,bound.base));
+  REQUIRE_ERROR(wfg::FindImport(bound.memory,pe,"dxgi.dll",wfg::PeOrdinal{101}),wfg::ErrorCode::MalformedImage);
+  auto truncated=FixturePe::ImportThunkOutsideImage();pe=REQUIRE_OK(wfg::InspectPe(truncated.memory,truncated.base));
+  CHECK(!wfg::IsOk(wfg::FindImport(truncated.memory,pe,"dxgi.dll",wfg::PeOrdinal{101})));
+  auto unterminated=FixturePe::UnterminatedImports();pe=REQUIRE_OK(wfg::InspectPe(unterminated.memory,unterminated.base));
+  REQUIRE_ERROR(wfg::FindImport(unterminated.memory,pe,"dxgi.dll",wfg::PeOrdinal{101}),wfg::ErrorCode::MalformedImage);
+  auto short_read=FixturePe::OrdinalImport();pe=REQUIRE_OK(wfg::InspectPe(short_read.memory,short_read.base));short_read.memory.SetShortReads();
+  REQUIRE_ERROR(wfg::FindImport(short_read.memory,pe,"dxgi.dll",wfg::PeOrdinal{101}),wfg::ErrorCode::UnreadableMemory);
+}
+TEST("pe.ordinal_export_binding_uses_same_image_entry_and_strict_bounds") {
+  auto image=FixturePe::ExportImage("D3D12CreateDevice",0x600,{},101);const auto pe=REQUIRE_OK(wfg::InspectPe(image.memory,image.base));
+  CHECK(REQUIRE_OK(wfg::FindExport(image.memory,pe,wfg::PeOrdinal{101})).rva==0x600);
+  REQUIRE_OK(wfg::BindExportOrdinal(image.memory,pe,"D3D12CreateDevice",wfg::PeOrdinal{101}));
+  REQUIRE_ERROR(wfg::BindExportOrdinal(image.memory,pe,"Other",wfg::PeOrdinal{101}),wfg::ErrorCode::MalformedImage);
+  REQUIRE_ERROR(wfg::FindExport(image.memory,pe,wfg::PeOrdinal{100}),wfg::ErrorCode::MalformedImage);
+  REQUIRE_ERROR(wfg::FindExport(image.memory,pe,wfg::PeOrdinal{102}),wfg::ErrorCode::MalformedImage);
+  auto forwarded=FixturePe::ExportImage("D3D12CreateDevice",0,"other.Target",101);const auto fp=REQUIRE_OK(wfg::InspectPe(forwarded.memory,forwarded.base));
+  REQUIRE_OK(wfg::BindExportOrdinal(forwarded.memory,fp,"D3D12CreateDevice",wfg::PeOrdinal{101}));
+}
+
 TEST("pe.named_import_survives_aslr") {
   auto image = FixturePe::SupportedHeaders(0x00007FF600000000ULL);
   auto pe = REQUIRE_OK(wfg::InspectPe(image.memory, image.base));

@@ -8,7 +8,7 @@
 namespace wfg {
 
 struct CodeFingerprint { Rva rva{}; std::uint32_t length{}; Hash256 sha256{}; };
-struct MappingRecord { std::string import_module; std::string import_name; std::string native_module; Rva rva{}; };
+struct MappingRecord { std::string import_module; std::string import_name; std::string native_module; Rva rva{}; std::optional<PeOrdinal> import_ordinal{}; };
 struct InterposerRequirement { std::string version; std::uint64_t length{}; Hash256 sha256{}; };
 struct CompatibilityRecord {
   std::string package_name;

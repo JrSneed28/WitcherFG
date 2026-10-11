@@ -28,6 +28,12 @@ inline Image DirectoryBeyondImage() {
   Put<std::uint32_t>(copy, 0x98 + 0x70 + 8, 0x3000000);
   return {image.base, FakeMemory(image.base, std::move(copy))};
 }
+inline Image OrdinalImport(std::uint64_t token=0x8000000000000065ULL) {
+  auto image=SupportedHeaders(0x00007FF600000000ULL);
+  auto bytes=wfg::Value(image.memory.Read(image.base,0x2B525D8));
+  Put<std::uint64_t>(bytes,0x320,token);
+  return {image.base,FakeMemory(image.base,std::move(bytes))};
+}
 inline Image TruncatedHeaders() {
   return {0x00007FF600000000ULL, FakeMemory(0x00007FF600000000ULL, std::vector<std::byte>(0x20))};
 }
