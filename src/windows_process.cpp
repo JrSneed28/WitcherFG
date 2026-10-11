@@ -20,6 +20,7 @@
 #include <cstring>
 #include <filesystem>
 #include <limits>
+#include <map>
 #include <thread>
 
 namespace wfg {
@@ -163,41 +164,111 @@ Result<Unit> RegisteredApplication(const std::wstring& full_name) {
   if (matches != 1) return Fail(ErrorCode::UnsupportedBuild, "registered_aumid", Stage::Discover);
   return Unit{};
 }
-Result<std::wstring> ManifestExecutable(const std::wstring& root) {
-  const auto manifest = root + L"\\AppxManifest.xml";
-  auto file = Hold(CreateFileW(manifest.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
+struct PackageElement {
+  std::wstring name;
+  std::wstring uri;
+  std::wstring parent;
+  UINT depth{};
+  std::map<std::wstring, std::wstring> attributes;
+  std::wstring_view Attribute(const wchar_t* key) const {
+    const auto found = attributes.find(key);
+    return found == attributes.end() ? std::wstring_view{} : found->second;
+  }
+};
+Result<std::vector<PackageElement>> ReadPackageXml(const std::wstring& path) {
+  auto file = Hold(CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
   LARGE_INTEGER length{};
-  if (file.get() == INVALID_HANDLE_VALUE || !GetFileSizeEx(file.get(), &length)) return Fail(ErrorCode::AccessDenied, "package_manifest", Stage::Discover, GetLastError());
-  if (length.QuadPart <= 0 || length.QuadPart > 1024 * 1024) return Fail(ErrorCode::UnsupportedBuild, "manifest_size", Stage::Discover);
+  if (file.get() == INVALID_HANDLE_VALUE || !GetFileSizeEx(file.get(), &length)) return Fail(ErrorCode::AccessDenied, "package_document", Stage::Discover, GetLastError());
+  FILE_ATTRIBUTE_TAG_INFO attributes{};
+  if (!GetFileInformationByHandleEx(file.get(), FileAttributeTagInfo, &attributes, sizeof(attributes)) || (attributes.FileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY))) return Fail(ErrorCode::UnsupportedBuild, "package_document_type", Stage::Discover);
+  if (length.QuadPart <= 0 || length.QuadPart > 1024 * 1024) return Fail(ErrorCode::UnsupportedBuild, "package_document_size", Stage::Discover);
+  std::vector<BYTE> bytes(static_cast<std::size_t>(length.QuadPart));
+  DWORD read{};
+  if (!ReadFile(file.get(), bytes.data(), static_cast<DWORD>(bytes.size()), &read, nullptr) || read != bytes.size()) return Fail(ErrorCode::AccessDenied, "package_document_read", Stage::Discover, GetLastError());
+  // Parse exactly the bytes from this retained non-reparse, write/delete-denying handle.
   Microsoft::WRL::ComPtr<IStream> stream;
-  if (FAILED(SHCreateStreamOnFileEx(manifest.c_str(), STGM_READ | STGM_SHARE_DENY_WRITE, FILE_ATTRIBUTE_NORMAL, FALSE, nullptr, &stream))) return Fail(ErrorCode::AccessDenied, "manifest_stream", Stage::Discover);
+  stream.Attach(SHCreateMemStream(bytes.data(), static_cast<UINT>(bytes.size())));
+  if (!stream) return Fail(ErrorCode::AccessDenied, "package_document_stream", Stage::Discover);
   Microsoft::WRL::ComPtr<IXmlReader> reader;
-  if (FAILED(CreateXmlReader(__uuidof(IXmlReader), reinterpret_cast<void**>(reader.GetAddressOf()), nullptr)) || FAILED(reader->SetProperty(XmlReaderProperty_DtdProcessing, DtdProcessing_Prohibit)) || FAILED(reader->SetProperty(XmlReaderProperty_MaxElementDepth, 32)) || FAILED(reader->SetInput(stream.Get()))) return Fail(ErrorCode::UnsupportedBuild, "manifest_parser", Stage::Discover);
-  std::wstring executable;
+  if (FAILED(CreateXmlReader(__uuidof(IXmlReader), reinterpret_cast<void**>(reader.GetAddressOf()), nullptr)) || FAILED(reader->SetProperty(XmlReaderProperty_DtdProcessing, DtdProcessing_Prohibit)) || FAILED(reader->SetProperty(XmlReaderProperty_MaxElementDepth, 32)) || FAILED(reader->SetInput(stream.Get()))) return Fail(ErrorCode::UnsupportedBuild, "package_document_parser", Stage::Discover);
+  std::vector<PackageElement> elements;
+  std::vector<std::wstring> ancestors;
   XmlNodeType type{};
   HRESULT status{};
   unsigned nodes{};
   while ((status = reader->Read(&type)) == S_OK) {
-    if (++nodes > 100000) return Fail(ErrorCode::UnsupportedBuild, "manifest_nodes", Stage::Discover);
+    if (++nodes > 100000) return Fail(ErrorCode::UnsupportedBuild, "package_document_nodes", Stage::Discover);
     if (type != XmlNodeType_Element) continue;
     const wchar_t* local{};
     const wchar_t* uri{};
-    if (FAILED(reader->GetLocalName(&local, nullptr)) || FAILED(reader->GetNamespaceUri(&uri, nullptr))) return Fail(ErrorCode::UnsupportedBuild, "manifest_element", Stage::Discover);
-    if (std::wstring_view(local) != L"Application" || std::wstring_view(uri) != L"http://schemas.microsoft.com/appx/manifest/foundation/windows10") continue;
-    if (reader->MoveToAttributeByName(L"Id", nullptr) != S_OK) continue;
-    const wchar_t* id{};
-    if (FAILED(reader->GetValue(&id, nullptr)) || std::wstring_view(id) != Application) { reader->MoveToElement(); continue; }
-    reader->MoveToElement();
-    if (!executable.empty() || reader->MoveToAttributeByName(L"Executable", nullptr) != S_OK) return Fail(ErrorCode::UnsupportedBuild, "manifest_executable", Stage::Discover);
-    const wchar_t* value{};
-    if (FAILED(reader->GetValue(&value, nullptr))) return Fail(ErrorCode::UnsupportedBuild, "manifest_executable", Stage::Discover);
-    executable = value;
-    reader->MoveToElement();
+    UINT depth{};
+    if (FAILED(reader->GetLocalName(&local, nullptr)) || !local || FAILED(reader->GetNamespaceUri(&uri, nullptr)) || !uri || FAILED(reader->GetDepth(&depth)) || depth > 32 || depth > ancestors.size()) return Fail(ErrorCode::UnsupportedBuild, "package_document_element", Stage::Discover);
+    ancestors.resize(depth);
+    PackageElement element{local, uri, depth ? ancestors.back() : L"", depth, {}};
+    ancestors.push_back(element.name);
+    auto attribute_status = reader->MoveToFirstAttribute();
+    unsigned attribute_count{};
+    while (attribute_status == S_OK) {
+      const wchar_t* key{}; const wchar_t* value{}; const wchar_t* attribute_uri{};
+      if (++attribute_count > 128 || FAILED(reader->GetLocalName(&key, nullptr)) || !key || FAILED(reader->GetValue(&value, nullptr)) || !value || FAILED(reader->GetNamespaceUri(&attribute_uri, nullptr)) || !attribute_uri) return Fail(ErrorCode::UnsupportedBuild, "package_document_attribute", Stage::Discover);
+      if (*attribute_uri == L'\0' && !element.attributes.emplace(key, value).second) return Fail(ErrorCode::UnsupportedBuild, "package_document_duplicate", Stage::Discover);
+      attribute_status = reader->MoveToNextAttribute();
+    }
+    if (attribute_status != S_FALSE || FAILED(reader->MoveToElement())) return Fail(ErrorCode::UnsupportedBuild, "package_document_attribute", Stage::Discover);
+    elements.push_back(std::move(element));
   }
-  if (status != S_FALSE || executable.empty() || executable.size() >= MaxPath || executable.front() == L'\\' || executable.find(L':') != executable.npos || executable.find(L'/') != executable.npos) return Fail(ErrorCode::UnsupportedBuild, "manifest_executable", Stage::Discover);
+  if (status != S_FALSE || elements.empty()) return Fail(ErrorCode::UnsupportedBuild, "package_document_xml", Stage::Discover);
+  return elements;
+}
+bool PackageIdentityMatches(const PackageElement& element, const process_detail::RegisteredPackageMetadata& expected, bool require_architecture) {
+  if (element.Attribute(L"Name") != expected.name || element.Attribute(L"Publisher") != expected.publisher || element.Attribute(L"Version") != expected.version || element.Attribute(L"ResourceId") != expected.resource_id) return false;
+  const auto architecture = element.Attribute(L"ProcessorArchitecture");
+  if ((require_architecture || element.attributes.contains(L"ProcessorArchitecture")) && architecture != expected.architecture) return false;
+  return !element.attributes.contains(L"Architecture") || element.Attribute(L"Architecture") == expected.architecture;
+}
+Result<std::wstring> ManifestExecutable(const std::wstring& root, const process_detail::RegisteredPackageMetadata& registered) {
+  if (registered.name != PackageName || registered.publisher.empty() || registered.version != L"5.0.4.0" || registered.architecture != L"x64") return Fail(ErrorCode::UnsupportedBuild, "registered_document_identity", Stage::Discover);
+  const auto document = ReadPackageXml(root + L"\\AppxManifest.xml");
+  if (!IsOk(document)) return Failure(document);
+  constexpr std::wstring_view ns = L"http://schemas.microsoft.com/appx/manifest/foundation/windows10";
+  const auto& elements = Value(document);
+  if (elements.front().name != L"Package" || elements.front().uri != ns || elements.front().depth != 0) return Fail(ErrorCode::UnsupportedBuild, "manifest_root", Stage::Discover);
+  unsigned identity_count{}, applications_count{}, match_count{};
+  std::wstring executable, entry_point;
+  for (const auto& element : elements) {
+    if (element.name == L"Identity") {
+      if (++identity_count != 1 || element.depth != 1 || element.parent != L"Package" || element.uri != ns || !PackageIdentityMatches(element, registered, true)) return Fail(ErrorCode::UnsupportedBuild, "manifest_identity", Stage::Discover);
+    } else if (element.name == L"Applications") {
+      if (++applications_count != 1 || element.depth != 1 || element.parent != L"Package" || element.uri != ns) return Fail(ErrorCode::UnsupportedBuild, "manifest_applications", Stage::Discover);
+    } else if (element.name == L"Application") {
+      if (element.depth != 2 || element.parent != L"Applications" || element.uri != ns) return Fail(ErrorCode::UnsupportedBuild, "manifest_application_shape", Stage::Discover);
+      if (element.Attribute(L"Id") != Application) continue;
+      if (++match_count != 1) return Fail(ErrorCode::UnsupportedBuild, "manifest_application_duplicate", Stage::Discover);
+      executable = element.Attribute(L"Executable");
+      entry_point = element.Attribute(L"EntryPoint");
+    }
+  }
+  if (identity_count != 1 || applications_count != 1 || match_count != 1 || executable.empty() || executable.size() >= MaxPath || executable.front() == L'\\' || executable.find(L':') != executable.npos || executable.find(L'/') != executable.npos) return Fail(ErrorCode::UnsupportedBuild, "manifest_executable", Stage::Discover);
   for (const auto& part : std::filesystem::path(executable)) if (part == L".." || part == L".") return Fail(ErrorCode::UnsupportedBuild, "manifest_traversal", Stage::Discover);
-  if (!Equal(std::filesystem::path(executable).filename().wstring(), L"witcher3.exe")) return Fail(ErrorCode::UnsupportedBuild, "manifest_target", Stage::Discover);
-  return root + L"\\" + executable;
+  if (Equal(std::filesystem::path(executable).filename().wstring(), L"witcher3.exe")) return root + L"\\" + executable;
+  if (!Equal(executable, L"GameLaunchHelper.exe") || entry_point != L"Windows.FullTrustApplication") return Fail(ErrorCode::UnsupportedBuild, "manifest_target", Stage::Discover);
+  const auto config = ReadPackageXml(root + L"\\MicrosoftGame.Config");
+  if (!IsOk(config)) return Failure(config);
+  const auto& game = Value(config);
+  if (game.front().name != L"Game" || !game.front().uri.empty() || game.front().depth != 0 || game.front().Attribute(L"configVersion") != L"1") return Fail(ErrorCode::UnsupportedBuild, "game_config_root", Stage::Discover);
+  unsigned config_identity_count{}, list_count{}, target_count{};
+  constexpr std::wstring_view target = L"bin\\Gaming.Desktop.x64\\witcher3.exe";
+  for (const auto& element : game) {
+    if (element.name == L"Identity") {
+      if (++config_identity_count != 1 || element.depth != 1 || element.parent != L"Game" || !element.uri.empty() || !PackageIdentityMatches(element, registered, false)) return Fail(ErrorCode::UnsupportedBuild, "game_config_identity", Stage::Discover);
+    } else if (element.name == L"ExecutableList") {
+      if (++list_count != 1 || element.depth != 1 || element.parent != L"Game" || !element.uri.empty()) return Fail(ErrorCode::UnsupportedBuild, "game_config_list", Stage::Discover);
+    } else if (element.name == L"Executable") {
+      if (++target_count != 1 || element.depth != 2 || element.parent != L"ExecutableList" || !element.uri.empty() || element.Attribute(L"TargetDeviceFamily") != L"PC" || !Equal(element.Attribute(L"Name"), target)) return Fail(ErrorCode::UnsupportedBuild, "game_config_target", Stage::Discover);
+    }
+  }
+  if (config_identity_count != 1 || list_count != 1 || target_count != 1) return Fail(ErrorCode::UnsupportedBuild, "game_config_missing", Stage::Discover);
+  return root + L"\\" + std::wstring(target);
 }
 
 class ReadMemory : public IMemory {
@@ -263,6 +334,9 @@ struct PackageIdentity::State {
   std::uint32_t session{};
   std::weak_ptr<IProcessBackend> observer;
 };
+Result<std::wstring> process_detail::ResolvePackageExecutable(const std::wstring& root, const RegisteredPackageMetadata& registered) {
+  return ManifestExecutable(root, registered);
+}
 std::string PackageIdentity::name() const { return Safe(PackageName); }
 std::string PackageIdentity::version() const { return Safe(state_->version); }
 std::string PackageIdentity::family() const { return Safe(Family); }
@@ -336,16 +410,18 @@ Result<PackageIdentity> DiscoverPackage() {
   const auto full_name = RegisteredFullName();
   if (!IsOk(full_name)) return Failure(full_name);
   UINT32 size{};
-  if (PackageIdFromFullName(Value(full_name).c_str(), 0, &size, nullptr) != ERROR_INSUFFICIENT_BUFFER || size > 65536) return Fail(ErrorCode::UnsupportedBuild, "package_metadata", Stage::Discover);
+  if (PackageIdFromFullName(Value(full_name).c_str(), PACKAGE_INFORMATION_FULL, &size, nullptr) != ERROR_INSUFFICIENT_BUFFER || size < sizeof(PACKAGE_ID) || size > 65536) return Fail(ErrorCode::UnsupportedBuild, "package_metadata", Stage::Discover);
   std::vector<std::byte> bytes(size);
-  if (PackageIdFromFullName(Value(full_name).c_str(), 0, &size, reinterpret_cast<BYTE*>(bytes.data())) != ERROR_SUCCESS) return Fail(ErrorCode::UnsupportedBuild, "package_metadata", Stage::Discover);
+  if (PackageIdFromFullName(Value(full_name).c_str(), PACKAGE_INFORMATION_FULL, &size, reinterpret_cast<BYTE*>(bytes.data())) != ERROR_SUCCESS || size < sizeof(PACKAGE_ID) || size > bytes.size()) return Fail(ErrorCode::UnsupportedBuild, "package_metadata", Stage::Discover);
   const auto* id = reinterpret_cast<PACKAGE_ID*>(bytes.data());
-  if (std::wstring_view(id->name) != PackageName || id->processorArchitecture != PROCESSOR_ARCHITECTURE_AMD64) return Fail(ErrorCode::UnsupportedBuild, "package_architecture", Stage::Discover);
+  if (!id->name || !id->publisher || !id->resourceId || std::wstring_view(id->name) != PackageName || id->processorArchitecture != PROCESSOR_ARCHITECTURE_AMD64) return Fail(ErrorCode::UnsupportedBuild, "package_architecture", Stage::Discover);
   const auto root = RegisteredPath(Value(full_name));
   if (!IsOk(root)) return Failure(root);
   const auto application = RegisteredApplication(Value(full_name));
   if (!IsOk(application)) return Failure(application);
-  const auto executable = ManifestExecutable(Value(root));
+  const auto version = std::to_wstring(id->version.Major) + L"." + std::to_wstring(id->version.Minor) + L"." + std::to_wstring(id->version.Build) + L"." + std::to_wstring(id->version.Revision);
+  const process_detail::RegisteredPackageMetadata registered{id->name, id->publisher, version, id->resourceId, L"x64"};
+  const auto executable = process_detail::ResolvePackageExecutable(Value(root), registered);
   if (!IsOk(executable)) return Failure(executable);
   const auto user = User(GetCurrentProcess());
   if (!IsOk(user)) return Failure(user);
@@ -365,7 +441,7 @@ Result<PackageIdentity> DiscoverPackage() {
   state->root = Value(root);
   state->executable = Value(canonical_executable);
   state->user = Value(user);
-  state->version = std::to_wstring(id->version.Major) + L"." + std::to_wstring(id->version.Minor) + L"." + std::to_wstring(id->version.Build) + L"." + std::to_wstring(id->version.Revision);
+  state->version = version;
   return PackageIdentity(std::move(state));
 }
 

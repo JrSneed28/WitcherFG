@@ -8,12 +8,76 @@
 #define NOMINMAX
 #include <windows.h>
 #include <filesystem>
+#include <fstream>
 
 namespace {
 std::unique_ptr<wfg::ProcessObserver> Observer(wfg::Result<std::unique_ptr<wfg::ProcessObserver>> result) {
   CHECK(wfg::IsOk(result));
   return std::move(std::get<std::unique_ptr<wfg::ProcessObserver>>(result));
 }
+}
+
+namespace {
+struct PackageDocuments {
+  std::filesystem::path root;
+  wfg::process_detail::RegisteredPackageMetadata identity{L"CDPROJEKTSA.Witcher3GOTY", L"CN=Test Publisher", L"5.0.4.0", L"TEST", L"x64"};
+  std::string manifest = R"(<Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"><Identity Name="CDPROJEKTSA.Witcher3GOTY" Publisher="CN=Test Publisher" Version="5.0.4.0" ResourceId="TEST" ProcessorArchitecture="x64"/><Applications><Application Id="bin.Gaming.Desktop.x64.witcher3" Executable="GameLaunchHelper.exe" EntryPoint="Windows.FullTrustApplication"/></Applications></Package>)";
+  std::string config = R"(<Game configVersion="1"><Identity Name="CDPROJEKTSA.Witcher3GOTY" Publisher="CN=Test Publisher" Version="5.0.4.0" ResourceId="TEST"/><ExecutableList><Executable Name="bin\Gaming.Desktop.x64\witcher3.exe" TargetDeviceFamily="PC"/></ExecutableList></Game>)";
+  PackageDocuments() {
+    const auto nonce = std::chrono::steady_clock::now().time_since_epoch().count();
+    for (unsigned i=0;i<10;++i) {
+      root=std::filesystem::temp_directory_path()/("wfg-package-"+std::to_string(GetCurrentProcessId())+"-"+std::to_string(nonce)+"-"+std::to_string(i));
+      if(std::filesystem::create_directory(root))return;
+    }
+    throw std::runtime_error("package fixture directory");
+  }
+  ~PackageDocuments(){std::error_code error;std::filesystem::remove_all(root,error);}
+  static void Replace(std::string& text,std::string_view from,std::string_view to){const auto at=text.find(from);CHECK(at!=std::string::npos);text.replace(at,from.size(),to);}
+  wfg::Result<std::wstring> Resolve(bool write_config=true){
+    {std::ofstream file(root/L"AppxManifest.xml",std::ios::binary);file<<manifest;CHECK(file.good());}
+    if(write_config){std::ofstream file(root/L"MicrosoftGame.Config",std::ios::binary);file<<config;CHECK(file.good());}
+    return wfg::process_detail::ResolvePackageExecutable(root.wstring(),identity);
+  }
+};
+}
+
+TEST("process.package_helper_resolves_exact_pc_game_target") {
+  PackageDocuments f;
+  CHECK(REQUIRE_OK(f.Resolve())==(f.root/L"bin\\Gaming.Desktop.x64\\witcher3.exe").wstring());
+}
+TEST("process.package_direct_manifest_retains_valid_resolution_without_config") {
+  PackageDocuments f;PackageDocuments::Replace(f.manifest,"GameLaunchHelper.exe","bin\\Gaming.Desktop.x64\\witcher3.exe");
+  CHECK(REQUIRE_OK(f.Resolve(false))==(f.root/L"bin\\Gaming.Desktop.x64\\witcher3.exe").wstring());
+}
+TEST("process.package_helper_requires_config_and_exact_helper_shape") {
+  PackageDocuments missing;CHECK(!wfg::IsOk(missing.Resolve(false)));
+  for(const auto replacement:{"OtherHelper.exe","sub\\GameLaunchHelper.exe","..\\GameLaunchHelper.exe","C:\\GameLaunchHelper.exe"}){
+    PackageDocuments f;PackageDocuments::Replace(f.manifest,"GameLaunchHelper.exe",replacement);CHECK(!wfg::IsOk(f.Resolve()));
+  }
+  PackageDocuments f;PackageDocuments::Replace(f.manifest,"Windows.FullTrustApplication","Other.EntryPoint");CHECK(!wfg::IsOk(f.Resolve()));
+}
+TEST("process.package_identity_is_bound_to_registration") {
+  for(const auto field:{"Name=\"CDPROJEKTSA.Witcher3GOTY\"","Publisher=\"CN=Test Publisher\"","Version=\"5.0.4.0\"","ResourceId=\"TEST\""}){
+    PackageDocuments f;PackageDocuments::Replace(f.config,field,"Changed=\"invalid\"");CHECK(!wfg::IsOk(f.Resolve()));
+    PackageDocuments direct;PackageDocuments::Replace(direct.manifest,"GameLaunchHelper.exe","bin\\Gaming.Desktop.x64\\witcher3.exe");PackageDocuments::Replace(direct.manifest,field,"Changed=\"invalid\"");CHECK(!wfg::IsOk(direct.Resolve(false)));
+  }
+}
+TEST("process.package_rejects_unsupported_registered_metadata") {
+  for(unsigned field=0;field<5;++field){PackageDocuments f;if(field==0)f.identity.name=L"other";if(field==1)f.identity.publisher.clear();if(field==2)f.identity.version=L"5.0.5.0";if(field==3)f.identity.resource_id=L"other";if(field==4)f.identity.architecture=L"arm64";CHECK(!wfg::IsOk(f.Resolve()));}
+}
+TEST("process.package_config_target_cannot_escape_or_switch_game") {
+  for(const auto target:{"..\\witcher3.exe","C:\\witcher3.exe","/witcher3.exe","bin/Gaming.Desktop.x64/witcher3.exe","bin\\other\\witcher3.exe","bin\\Gaming.Desktop.x64\\other.exe","bin\\Gaming.Desktop.x64\\.\\witcher3.exe","bin\\Gaming.Desktop.x64\\witcher3.exe:stream"}){
+    PackageDocuments f;PackageDocuments::Replace(f.config,"bin\\Gaming.Desktop.x64\\witcher3.exe",target);CHECK(!wfg::IsOk(f.Resolve()));
+  }
+}
+TEST("process.package_duplicate_and_misnested_identity_target_refuse") {
+  for(const auto insert:{"<Identity Name=\"duplicate\"/>","<ExecutableList/>","<Executable Name=\"bin\\Gaming.Desktop.x64\\witcher3.exe\" TargetDeviceFamily=\"PC\"/>"}){PackageDocuments f;PackageDocuments::Replace(f.config,"</Game>",std::string(insert)+"</Game>");CHECK(!wfg::IsOk(f.Resolve()));}
+  PackageDocuments f;PackageDocuments::Replace(f.config,"</ExecutableList>","<Executable Name=\"bin\\Gaming.Desktop.x64\\witcher3.exe\" TargetDeviceFamily=\"PC\"/></ExecutableList>");CHECK(!wfg::IsOk(f.Resolve()));
+  PackageDocuments m;PackageDocuments::Replace(m.manifest,"</Applications>","<Application Id=\"bin.Gaming.Desktop.x64.witcher3\" Executable=\"GameLaunchHelper.exe\" EntryPoint=\"Windows.FullTrustApplication\"/></Applications>");CHECK(!wfg::IsOk(m.Resolve()));
+}
+TEST("process.package_malformed_dtd_oversized_and_wrong_namespace_refuse") {
+  for(unsigned variant=0;variant<7;++variant){PackageDocuments f;if(variant==0)f.config+="<broken";if(variant==1)f.config="<!DOCTYPE Game [<!ENTITY target 'witcher3.exe'>]>"+f.config;if(variant==2)f.config=std::string(1024*1024+1,' ');if(variant==3)PackageDocuments::Replace(f.config,"<Game ","<Game xmlns=\"urn:unexpected\" ");if(variant==4)PackageDocuments::Replace(f.config,"configVersion=\"1\"","configVersion=\"2\"");if(variant==5)PackageDocuments::Replace(f.config,"TargetDeviceFamily=\"PC\"","TargetDeviceFamily=\"XboxOne\"");if(variant==6)PackageDocuments::Replace(f.config,"<Identity ","<Identity ProcessorArchitecture=\"arm64\" ");CHECK(!wfg::IsOk(f.Resolve()));}
+  PackageDocuments direct;PackageDocuments::Replace(direct.manifest,"GameLaunchHelper.exe","bin\\Gaming.Desktop.x64\\witcher3.exe");direct.manifest="<!DOCTYPE Package [<!ENTITY x 'y'>]>"+direct.manifest;CHECK(!wfg::IsOk(direct.Resolve(false)));
 }
 
 TEST("process.native_read_into_exact_short_guard_and_overflow") {

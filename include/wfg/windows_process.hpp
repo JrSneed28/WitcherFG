@@ -92,6 +92,15 @@ Result<RuntimeInventory> InventoryObservedProcess(const ObservedProcess& process
 EnvironmentSnapshot ObserveEnvironment(const ObservedProcess* process);
 
 namespace process_detail {
+// Read-only package-document resolution; does not confer process or write authority.
+struct RegisteredPackageMetadata {
+  std::wstring name;
+  std::wstring publisher;
+  std::wstring version;
+  std::wstring resource_id;
+  std::wstring architecture;
+};
+Result<std::wstring> ResolvePackageExecutable(const std::wstring& root, const RegisteredPackageMetadata& registered);
 #ifdef WFG_LIFECYCLE_TESTING
 // Disposable-child test core only. No package eligibility bypass in production.
 Result<std::unique_ptr<IWritableMemory>> OpenLifecycleMemory(const OwnedProcess&);
