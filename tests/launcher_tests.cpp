@@ -11,16 +11,22 @@ Error Fault(ErrorCode code=ErrorCode::LaunchFailed,Stage stage=Stage::activation
 struct Backend final : IDebugBackend {
   std::chrono::steady_clock::time_point now{};
   int attaches{},policies{},continues{},detaches{},aborts{},detach_failures{};
-  bool kill{true},held{},fail_attach{},fail_first_false{},fail_true{},fail_abort{},exited{};
-  void* pin{};
+  bool kill{true},held{},fault_observed{},fail_attach{},fail_first_false{},fail_true{},fail_abort{},exited{};
+  void* pin{};int waits{},safe_continues_before_fault{},unhandled{};std::vector<DebugEvent> events;
   std::chrono::steady_clock::time_point Now() const override{return now;}
   Result<Unit> Attach(const OwnedProcess& owner) override{++attaches;pin=owner.native_handle();return fail_attach?Result<Unit>{Fault(ErrorCode::AccessDenied,Stage::debug_attach)}:Result<Unit>{Unit{}};}
   Result<Unit> SetKillOnExit(bool enabled) override{
     ++policies;if((policies==1&&fail_first_false)||(enabled&&fail_true))return Fault(ErrorCode::DebugFailure,Stage::debug_attach);
     kill=enabled;return Unit{};
   }
-  Result<std::optional<DebugEvent>> Wait(std::chrono::milliseconds slice) override{now+=slice;held=true;return std::optional<DebugEvent>{{DebugEventKind::DllLoaded,42,7}};}
-  Result<Unit> Continue(const DebugEvent&,Continuation) override{++continues;CHECK(!kill);held=false;return Unit{};}
+  Result<std::optional<DebugEvent>> Wait(std::chrono::milliseconds slice) override{
+    now+=slice;held=true;++waits;
+    if(!events.empty()&&static_cast<std::size_t>(waits)<=events.size())return std::optional<DebugEvent>{events[static_cast<std::size_t>(waits-1)]};
+    if(waits==1)return std::optional<DebugEvent>{{DebugEventKind::ProcessCreated,42,7}};
+    if(waits==2)return std::optional<DebugEvent>{{DebugEventKind::Exception,42,7,0x80000003,0x1234,true,true}};
+    return std::optional<DebugEvent>{{DebugEventKind::DllLoaded,42,7}};
+  }
+  Result<Unit> Continue(const DebugEvent&,Continuation c) override{++continues;if(c==Continuation::NotHandled)++unhandled;CHECK(!kill);held=false;return Unit{};}
   Result<Unit> Detach() override{++detaches;if(detach_failures-->0)return Fault(ErrorCode::DebugFailure,Stage::detach);return Unit{};}
   Result<Unit> AbortOwnedStartup() override{++aborts;if(fail_abort)return Fault(ErrorCode::DebugFailure,Stage::debug_attach);exited=true;return Unit{};}
 };
@@ -56,7 +62,7 @@ struct Memory final : IWritableMemory {
   }
   Result<Unit> Write(Address address,std::span<const std::byte> bytes) override{
     ++writes;CHECK(backend.kill&&backend.held);
-    if(fail_write||(fail_once&&writes==1))return Fault(ErrorCode::MutationFailure,Stage::import_transaction);
+    if(fail_write||(fail_once&&writes==1)){if(!backend.fault_observed){backend.safe_continues_before_fault=backend.continues;backend.fault_observed=true;}return Fault(ErrorCode::MutationFailure,Stage::import_transaction);}
     runtime.memory.Put(address,bytes);return Unit{};
   }
   Result<std::uint32_t> Protect(Address address,std::size_t,std::uint32_t protection) override{
@@ -86,7 +92,7 @@ struct Fixture final : ILaunchEnvironment {
   std::optional<Error> config_error,discover_error,inventory_error,collect_error,observe_error;
   EnvironmentSnapshot host;
   int configurations{},discoveries{},installed{},activated{},pins{},memory_opens{},inventories{},observations{},collections{};
-  int handle{};void* memory_pin{};bool expire_inventory{},cancel_observation{};int missing_inventories{};int unresolved_inventories{};bool binding_sequence{};
+  int handle{};void* memory_pin{};bool expire_inventory{},cancel_observation{};int missing_inventories{};int unresolved_inventories{};bool binding_sequence{};bool cancel_inventory{},deadline_child{};std::chrono::milliseconds inventory_elapsed{};int first_inventory_wait{};
   std::vector<Deadline> guards;std::stop_source* active_cancel{};int active_guard{};
   Fixture(){storage.active_guard=&active_guard;}
   std::span<const std::string_view> Arguments()const override{return args;}
@@ -105,7 +111,7 @@ struct Fixture final : ILaunchEnvironment {
   Result<std::unique_ptr<IWritableMemory>> Memory(const OwnedProcess& owner)override{++memory_opens;memory_pin=owner.native_handle();CHECK(memory_pin==&handle);return std::unique_ptr<IWritableMemory>(new MemoryView(memory));}
   IDebugBackend& Debugger()override{return backend;}
   Result<RuntimeInventory> Inventory(const OwnedProcess& owner,const IMemory&)override{
-    ++inventories;CHECK(backend.held);CHECK(owner.native_handle()==memory_pin&&memory_pin==backend.pin);
+    ++inventories;if(inventories==1)first_inventory_wait=backend.waits;backend.now+=inventory_elapsed;if(cancel_inventory)active_cancel->request_stop();CHECK(backend.held);CHECK(owner.native_handle()==memory_pin&&memory_pin==backend.pin);
     if(binding_sequence){if(unresolved_inventories-->0){CHECK(memory.writes==0&&memory.protects==0);runtime.SetAllImportsUnresolved();}else runtime.SetAllImportsToNative();}
     if(expire_inventory)backend.now+=std::chrono::seconds(61);
     if(missing_inventories-->0)return Fault(ErrorCode::ModuleNotReady,Stage::dependencies);
@@ -117,7 +123,7 @@ struct Fixture final : ILaunchEnvironment {
     if(cancel_observation)active_cancel->request_stop();ObservationReport report;report.cancelled=cancel_observation;return report;
   }
   Result<Unit> Collect(const EffectiveConfig&)override{++collections;backend.now+=std::chrono::milliseconds(750);if(collect_error)return *collect_error;return Unit{};}
-  [[noreturn]] void ExitHelper()noexcept override{std::_Exit(backend.kill&&backend.continues==0&&backend.detaches==0&&storage.writes==0?91:92);}
+  [[noreturn]] void ExitHelper()noexcept override{if(deadline_child)std::_Exit(77);std::_Exit(backend.kill&&backend.continues==backend.safe_continues_before_fault&&backend.detaches==0&&storage.writes==0?91:92);}
 };
 void Refusal(Fixture& f,Status status){const auto result=RunLauncher(f,{});if(result.status!=status)std::fprintf(stderr,"Status expected=%d actual=%d operation=%s\n",static_cast<int>(status),static_cast<int>(result.status),result.failure?std::string(result.failure->operation.view()).c_str():"none");CHECK(result.status==status);CHECK(result.failure);CHECK(!result.next_action.empty());CHECK(!result.diagnostic.operation.empty());CHECK(f.memory.writes==0);}
 }
@@ -167,7 +173,7 @@ TEST("launcher.registration_failure_and_collector_failure_are_explicit"){
 TEST("launcher.not_started_error_and_verified_rollback_are_not_success"){
   Fixture capture;capture.memory.bad_capture=true;const auto refused=RunLauncher(capture,{});CHECK(refused.status==Status::LaunchFailed);CHECK(refused.transaction==TransactionOutcome::NotStarted);CHECK(refused.failure);CHECK(capture.memory.writes==0);
   Fixture rollback;rollback.memory.fail_once=true;const auto reverted=RunLauncher(rollback,{});CHECK(reverted.status==Status::RolledBack);CHECK(reverted.transaction==TransactionOutcome::RolledBack);CHECK(rollback.backend.detaches>0&&!rollback.backend.kill);
-  Fixture aborted;aborted.memory.fail_write=true;const auto stopped=RunLauncher(aborted,{});CHECK(stopped.status==Status::StartupAborted);CHECK(stopped.transaction==TransactionOutcome::Aborted);CHECK(aborted.backend.exited);CHECK(aborted.backend.continues==0);
+  Fixture aborted;aborted.memory.fail_write=true;const auto stopped=RunLauncher(aborted,{});CHECK(stopped.status==Status::StartupAborted);CHECK(stopped.transaction==TransactionOutcome::Aborted);CHECK(aborted.backend.exited);CHECK(aborted.backend.continues==aborted.backend.safe_continues_before_fault);
 }
 TEST("launcher.detach_retries_without_repatch_and_log_failure_preserves_commit"){
   Fixture f;f.backend.detach_failures=2;f.storage.fail=true;const auto result=RunLauncher(f,{});CHECK(result.status==Status::Applied);CHECK(result.diagnostic_file_failed);CHECK(f.backend.detaches==3);CHECK(f.memory.writes==4);CHECK(f.storage.console.find("\"configuration\"")!=std::string::npos);
@@ -285,4 +291,36 @@ TEST("launcher.binding_unresolved_is_bounded_and_never_writes") {
   Fixture f;f.binding_sequence=true;f.unresolved_inventories=2000;
   const auto result=RunLauncher(f,{});
   CHECK(result.status==Status::TimedOut);CHECK(f.inventories>1);CHECK(f.memory.writes==0&&f.memory.protects==0);CHECK(result.detach==DetachOutcome::Detached);CHECK(!f.storage.summary.empty());
+}
+
+TEST("launcher.startup_handshake_skips_replayed_events") {
+  Fixture f;f.backend.events={
+    {DebugEventKind::ProcessCreated,42,7},{DebugEventKind::DllLoaded,42,7},{DebugEventKind::ThreadCreated,42,8},
+    {DebugEventKind::Exception,42,8,0x80000003,0x1234,true,true}};
+  const auto result=RunLauncher(f,{});CHECK(result.status==Status::Applied);CHECK(f.first_inventory_wait==4);CHECK(f.inventories==1);CHECK(f.memory.writes==4);
+}
+TEST("launcher.deadline_cancellation_child") {
+  char mode[32]{};if(!GetEnvironmentVariableA("WFG_DEADLINE_CHILD",mode,sizeof(mode)))return;
+  Fixture f;f.cancel_inventory=true;f.deadline_child=true;
+  const bool early=std::string_view(mode)=="early",exhausted=std::string_view(mode)=="exhausted";
+  f.inventory_elapsed=std::chrono::milliseconds(early?100:exhausted?63000:61000);if(early)f.backend.detach_failures=2;
+  const auto result=RunLauncher(f,{});CHECK(!exhausted);CHECK(result.status==Status::TimedOut);CHECK(result.detach==DetachOutcome::Detached);CHECK(!f.storage.summary.empty());CHECK(f.memory.writes==0&&f.memory.protects==0);CHECK(f.backend.detaches==(early?3:1));CHECK(f.backend.now.time_since_epoch()<=std::chrono::milliseconds(early?2200:62000));
+}
+TEST("launcher.deadline_cancellation_keeps_bounded_cleanup") {
+  wchar_t executable[32768]{};CHECK(GetModuleFileNameW(nullptr,executable,32768)>0);
+  for(const auto* mode:{L"early",L"late",L"exhausted"}) {
+    CHECK(SetEnvironmentVariableW(L"WFG_DEADLINE_CHILD",mode));std::wstring command=L"\""+std::wstring(executable)+L"\" --filter launcher.deadline_cancellation_child";
+    STARTUPINFOW startup{sizeof(startup)};PROCESS_INFORMATION process{};
+    const bool created=CreateProcessW(executable,command.data(),nullptr,nullptr,FALSE,CREATE_NO_WINDOW,nullptr,nullptr,&startup,&process)!=FALSE;
+    SetEnvironmentVariableW(L"WFG_DEADLINE_CHILD",nullptr);CHECK(created);const auto waited=WaitForSingleObject(process.hProcess,10000);DWORD code{};if(waited!=WAIT_OBJECT_0)TerminateProcess(process.hProcess,94);CHECK(GetExitCodeProcess(process.hProcess,&code));CloseHandle(process.hThread);CloseHandle(process.hProcess);CHECK(waited==WAIT_OBJECT_0);CHECK(code==(std::wstring_view(mode)==L"exhausted"?77U:0U));
+  }
+}
+
+TEST("launcher.startup_handshake_unrelated_exception_is_not_swallowed") {
+  Fixture f;f.backend.events={{DebugEventKind::ProcessCreated,42,7},{DebugEventKind::Exception,42,8,0xc0000005,0x5555,true,false}};
+  const auto result=RunLauncher(f,{});CHECK(result.status==Status::TimedOut);CHECK(f.inventories==0);CHECK(f.backend.unhandled==1);CHECK(f.memory.writes==0&&f.memory.protects==0);
+}
+TEST("launcher.startup_handshake_target_exit_never_inspects") {
+  Fixture f;f.backend.events={{DebugEventKind::ProcessCreated,42,7},{DebugEventKind::ProcessExited,42,7}};
+  const auto result=RunLauncher(f,{});CHECK(result.failure);CHECK(result.failure->code==ErrorCode::NoMatchingProcess);CHECK(f.inventories==0);CHECK(f.memory.writes==0&&f.memory.protects==0);
 }

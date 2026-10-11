@@ -149,7 +149,7 @@ RunResult RunLauncher(ILaunchEnvironment& env,std::stop_token external) {
     if(session->Safety()==DebugSafety::AttachedSafe) {
       // A cancelled/expired inspection gets only its bounded cleanup grace.
       auto limit=total.value;
-      if(cancellation.stop_requested())limit=std::min(limit,env.Now()+std::chrono::seconds(2));
+      if(cancellation.stop_requested())limit=std::min(limit+std::chrono::seconds(2),env.Now()+std::chrono::seconds(2));
       else if(env.Now()>=limit)limit+=std::chrono::seconds(2);
       const auto detached=session->Detach({limit});
       if(!IsOk(detached)){result.detach=DetachOutcome::Failed;env.ExitHelper();}
@@ -266,11 +266,21 @@ RunResult RunLauncher(ILaunchEnvironment& env,std::stop_token external) {
       return finish();
     }
     event(stage,EventCode::StageCompleted,"debug_attach_completed");
+    bool attach_ready{};
     for(;;) {
       stage=Stage::dependencies;
       if(expired()){refuse(Timeout(stage));return finish();}
       auto stopped=session->WaitStopped(total);if(!IsOk(stopped)){refuse(Failure(stopped));return finish();}
       auto& stop=std::get<DebugStop>(stopped);
+      if(!attach_ready) {
+        const auto& held=stop.event();
+        attach_ready=held.kind==DebugEventKind::Exception&&held.attach_breakpoint_identity&&stop.continuation()==Continuation::Handled;
+        if(!attach_ready) {
+          const auto continued=session->Continue(stop,stop.continuation());
+          if(!IsOk(continued)){refuse(Failure(continued));return finish();}
+          continue;
+        }
+      }
       event(stage,EventCode::Initialization,"dependencies_entered");
       const auto inventory=env.Inventory(*owned,*memory);
       if(expired()){refuse(Timeout(stage));return finish();}

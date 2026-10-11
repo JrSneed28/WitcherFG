@@ -1111,6 +1111,15 @@ Result<Unit> ValidateStartupInventory(const RuntimeInventory& inventory) {
   if (inventory.executable.image.base == 0 || inventory.interposer.loaded_module.image.base == 0 || !d3d12 || !dxgi) return Fail(ErrorCode::ModuleNotReady, "startup_modules_missing", Stage::dependencies);
   return Unit{};
 }
+Result<RuntimeInventory> CompleteStartupInventory(std::span<const std::string> module_names,
+  const std::function<Result<RuntimeInventory>()>& inspect) {
+  for (const auto* required : {"d3d12.dll", "dxgi.dll", "sl.interposer.dll"}) {
+    if (std::none_of(module_names.begin(), module_names.end(), [&](const auto& name) { return EqualAscii(name, required); }))
+      return Fail(ErrorCode::ModuleNotReady, "startup_modules_missing", Stage::dependencies);
+  }
+  // Presence only decides when to inspect. It never supplies trust evidence.
+  return inspect();
+}
 Result<Unit> ReadIntoHandle(void* handle, Address address, std::span<std::byte> bytes) {
   if (!handle || bytes.size() > std::numeric_limits<Address>::max() - address) return Fail(ErrorCode::UnreadableMemory, "read_overflow");
   SIZE_T received{};
@@ -1326,6 +1335,19 @@ Result<RuntimeInventory> Inventory(HANDLE process, std::uint32_t pid, std::uint6
   if (!EnumProcessModulesEx(process, modules.data(), static_cast<DWORD>(modules.size() * sizeof(HMODULE)), &needed, LIST_MODULES_64BIT) || needed > modules.size() * sizeof(HMODULE) || needed % sizeof(HMODULE) != 0) return Fail(ErrorCode::AccessDenied, "module_enumeration", Stage::dependencies, GetLastError());
   if (needed == 0) return Fail(ErrorCode::ModuleNotReady, "startup_modules_missing", Stage::dependencies);
   modules.resize(needed / sizeof(HMODULE));
+  std::vector<std::wstring> module_paths;
+  std::vector<std::string> module_names;
+  module_paths.reserve(modules.size()); module_names.reserve(modules.size());
+  for (const auto module : modules) {
+    std::wstring path(MaxPath, L'\0');
+    const auto length = GetModuleFileNameExW(process, module, path.data(), static_cast<DWORD>(path.size()));
+    if (length == 0 || length >= path.size() - 1) return Fail(ErrorCode::AccessDenied, "module_path", Stage::dependencies);
+    path.resize(length);
+    auto basename = Safe(std::filesystem::path(path).filename().wstring());
+    if (basename.empty()) return Fail(ErrorCode::DllConflict, "module_basename", Stage::dependencies);
+    module_paths.push_back(std::move(path)); module_names.push_back(std::move(basename));
+  }
+  return process_detail::CompleteStartupInventory(module_names, [&]() -> Result<RuntimeInventory> {
   wchar_t system_buffer[MAX_PATH]{};
   if (!GetSystemDirectoryW(system_buffer, MAX_PATH)) return Fail(ErrorCode::AccessDenied, "system_directory", Stage::dependencies);
   const auto system_probe = OpenFile(std::wstring(system_buffer) + L"\\kernel32.dll");
@@ -1338,13 +1360,10 @@ Result<RuntimeInventory> Inventory(HANDLE process, std::uint32_t pid, std::uint6
   std::vector<LoadedDependency> loaded_dependencies;
   std::vector<Pin> qualified_content_pins;
   bool have_executable{}, have_interposer{};
-  for (const auto module : modules) {
-    std::wstring path(MaxPath, L'\0');
-    const auto length = GetModuleFileNameExW(process, module, path.data(), static_cast<DWORD>(path.size()));
-    if (length == 0 || length >= path.size() - 1) return Fail(ErrorCode::AccessDenied, "module_path", Stage::dependencies);
-    path.resize(length);
-    const auto basename = Safe(std::filesystem::path(path).filename().wstring());
-    if (basename.empty()) return Fail(ErrorCode::DllConflict, "module_basename", Stage::dependencies);
+  for (std::size_t index = 0; index < modules.size(); ++index) {
+    const auto module = modules[index];
+    const auto& path = module_paths[index];
+    const auto& basename = module_names[index];
     const auto base = reinterpret_cast<Address>(module);
     const auto module_executable = CanonicalExecutable(path);
     if (!IsOk(module_executable)) return Failure(module_executable);
@@ -1462,6 +1481,7 @@ Result<RuntimeInventory> Inventory(HANDLE process, std::uint32_t pid, std::uint6
   const auto startup = process_detail::ValidateStartupInventory(inventory);
   if (!IsOk(startup)) return Failure(startup);
   return inventory;
+  });
 }
 }
 Result<RuntimeInventory> InventoryProcess(const OwnedProcess& process, const IMemory& memory) {

@@ -542,3 +542,19 @@ TEST("process.owned_observation_duplicate_keeps_identity_and_reduces_rights") {
   auto stale=wfg::VerifiedIdentityTestFactory::Owned(GetCurrentProcess(),[](void*) noexcept {},GetCurrentProcessId(),creation+1);
   REQUIRE_ERROR(wfg::DuplicateObservedProcess(stale),wfg::ErrorCode::IdentityChanged);
 }
+
+TEST("process.startup_readiness_skips_full_qualification_until_present") {
+  SupportedRuntimeFixture f;unsigned inspections{};
+  const auto inspect=[&]() -> wfg::Result<wfg::RuntimeInventory> {++inspections;return f.inventory;};
+  std::vector<std::string> names{"witcher3.exe","d3d12.dll","dxgi.dll"};
+  const auto missing=wfg::process_detail::CompleteStartupInventory(names,inspect);
+  REQUIRE_ERROR(missing,wfg::ErrorCode::ModuleNotReady);CHECK(inspections==0);
+  names.push_back("SL.INTERPOSER.DLL");const auto ready=wfg::process_detail::CompleteStartupInventory(names,inspect);
+  CHECK(wfg::IsOk(ready));CHECK(inspections==1);
+}
+TEST("process.startup_readiness_requires_each_provider_and_preserves_failure") {
+  const std::array<std::string,3> all{"d3d12.dll","dxgi.dll","sl.interposer.dll"};
+  unsigned inspections{};const auto inspect=[&]() -> wfg::Result<wfg::RuntimeInventory> {++inspections;return wfg::Error{wfg::ErrorCode::UntrustedInterposer,wfg::Stage::dependencies,"fixture_provider_untrusted"};};
+  for(std::size_t omit=0;omit<all.size();++omit){std::vector<std::string> names;for(std::size_t i=0;i<all.size();++i)if(i!=omit)names.push_back(all[i]);const auto missing=wfg::process_detail::CompleteStartupInventory(names,inspect);REQUIRE_ERROR(missing,wfg::ErrorCode::ModuleNotReady);}
+  CHECK(inspections==0);const auto untrusted=wfg::process_detail::CompleteStartupInventory(all,inspect);REQUIRE_ERROR(untrusted,wfg::ErrorCode::UntrustedInterposer);CHECK(inspections==1);
+}

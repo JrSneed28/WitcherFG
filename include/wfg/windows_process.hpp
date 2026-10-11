@@ -4,6 +4,7 @@
 
 #include <memory>
 #include <filesystem>
+#include <functional>
 
 namespace wfg {
 
@@ -92,6 +93,8 @@ Result<RuntimeInventory> InventoryObservedProcess(const ObservedProcess& process
 EnvironmentSnapshot ObserveEnvironment(const ObservedProcess* process);
 
 namespace process_detail {
+Result<RuntimeInventory> CompleteStartupInventory(std::span<const std::string> module_names,
+  const std::function<Result<RuntimeInventory>()>& inspect);
 // Read-only package-document resolution; does not confer process or write authority.
 struct RegisteredPackageMetadata {
   std::wstring name;
