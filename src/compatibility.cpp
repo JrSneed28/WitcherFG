@@ -117,6 +117,7 @@ Result<ValidatedBuild> ValidateBuild(const IMemory& memory, const RuntimeInvento
   result.executable_base = Value(executable).base;
   bool all_native = true;
   bool all_interposer = true;
+  bool all_unresolved = true;
   for (std::size_t index = 0; index < record.mappings.size(); ++index) {
     const auto& required = record.mappings[index];
     const auto imported = required.import_ordinal ? FindImport(memory,Value(executable),required.import_module,*required.import_ordinal) :
@@ -149,12 +150,21 @@ Result<ValidatedBuild> ValidateBuild(const IMemory& memory, const RuntimeInvento
     if (!IsOk(replacement_export) || Value(replacement_export).forwarder) return Fail(ErrorCode::UnexpectedImports, "interposer_export");
     Address replacement{};
     if (!Add(inventory.interposer.loaded_module.image.base, Value(replacement_export).rva, replacement)) return Fail(ErrorCode::UnexpectedImports, "interposer_export");
-    if (Value(imported).current_pointer == Value(original)) all_interposer = false;
-    else if (Value(imported).current_pointer == replacement) all_native = false;
+    if (Value(imported).current_pointer == Value(original)) { all_interposer = false; all_unresolved = false; }
+    else if (Value(imported).current_pointer == replacement) { all_native = false; all_unresolved = false; }
+    else if (Value(imported).current_pointer == Value(imported).lookup_token) { all_native = false; all_interposer = false; }
     else return Fail(ErrorCode::UnexpectedImports, "import_provenance");
     result.mappings[index] = {Value(imported).address, Value(original), replacement, required.rva};
   }
   for (std::size_t left = 0; left < result.mappings.size(); ++left) for (std::size_t right = left + 1; right < result.mappings.size(); ++right) if (result.mappings[left].slot == result.mappings[right].slot) return Fail(ErrorCode::UnexpectedImports, "duplicate_slot");
+  if (all_unresolved) {
+    // A held early loader event can expose valid INT tokens in every IAT slot.
+    // Retry only this complete state after every build/provider guard succeeded.
+    const auto factory = CheckFactory(memory, result);
+    if (!IsOk(factory)) return Failure(factory);
+    if (Value(factory) != FactoryState::NotCreated) return Fail(ErrorCode::StartupTooLate, "factory_created");
+    return Fail(ErrorCode::ModuleNotReady, "import_binding_not_ready");
+  }
   if (!all_native && !all_interposer) return Fail(ErrorCode::UnexpectedImports, "mixed_routing");
   result.routing = all_interposer ? Routing::AlreadyPresent : Routing::Native;
   return result;

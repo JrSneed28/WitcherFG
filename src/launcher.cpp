@@ -287,7 +287,15 @@ RunResult RunLauncher(ILaunchEnvironment& env,std::stop_token external) {
       const auto conflicts=ClassifyLoaderConflicts(Value(inventory),env.Compatibility());
       if(!IsOk(conflicts)){refuse(Failure(conflicts));return finish();}
       const auto validated=ValidateBuild(*memory,Value(inventory),env.Compatibility());
-      if(!IsOk(validated)){refuse(Failure(validated));return finish();}
+      if(!IsOk(validated)) {
+        if(Failure(validated).code==ErrorCode::ModuleNotReady&&Failure(validated).operation.view()=="import_binding_not_ready") {
+          if(expired()){refuse(Timeout(stage));return finish();}
+          const auto continued=session->Continue(stop,stop.continuation());
+          if(!IsOk(continued)){refuse(Failure(continued));return finish();}
+          continue;
+        }
+        refuse(Failure(validated));return finish();
+      }
       event(stage,EventCode::StageCompleted,"build_validation_completed");
       if(expired()){refuse(Timeout(stage));return finish();}
       if(Value(validated).routing==Routing::AlreadyPresent) {result.status=Status::RoutingAlreadyPresent;record.outcome=RunOutcome::RoutingAlreadyPresent;record.hook_state=HookState::RoutingAlreadyPresent;break;}

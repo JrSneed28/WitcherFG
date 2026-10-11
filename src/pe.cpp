@@ -264,7 +264,7 @@ Result<ImportSlot> FindImportBy(const IMemory& memory, const PeImage& image, std
       if (!IsOk(slot_address)) return Failure(slot_address);
       auto pointer = ReadValue<std::uint64_t>(memory, Value(slot_address));
       if (!IsOk(pointer)) return Failure(pointer);
-      result = {static_cast<Rva>(slot_rva), Value(slot_address), Value(pointer)};
+      result = {static_cast<Rva>(slot_rva), Value(slot_address), Value(pointer), Value(thunk)};
       found = true;
     }
     if (!thunk_terminated) return Fail(ErrorCode::MalformedImage, "unterminated_thunks");

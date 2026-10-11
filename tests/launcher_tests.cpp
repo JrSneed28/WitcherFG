@@ -86,7 +86,7 @@ struct Fixture final : ILaunchEnvironment {
   std::optional<Error> config_error,discover_error,inventory_error,collect_error,observe_error;
   EnvironmentSnapshot host;
   int configurations{},discoveries{},installed{},activated{},pins{},memory_opens{},inventories{},observations{},collections{};
-  int handle{};void* memory_pin{};bool expire_inventory{},cancel_observation{};int missing_inventories{};
+  int handle{};void* memory_pin{};bool expire_inventory{},cancel_observation{};int missing_inventories{};int unresolved_inventories{};bool binding_sequence{};
   std::vector<Deadline> guards;std::stop_source* active_cancel{};int active_guard{};
   Fixture(){storage.active_guard=&active_guard;}
   std::span<const std::string_view> Arguments()const override{return args;}
@@ -106,6 +106,7 @@ struct Fixture final : ILaunchEnvironment {
   IDebugBackend& Debugger()override{return backend;}
   Result<RuntimeInventory> Inventory(const OwnedProcess& owner,const IMemory&)override{
     ++inventories;CHECK(backend.held);CHECK(owner.native_handle()==memory_pin&&memory_pin==backend.pin);
+    if(binding_sequence){if(unresolved_inventories-->0){CHECK(memory.writes==0&&memory.protects==0);runtime.SetAllImportsUnresolved();}else runtime.SetAllImportsToNative();}
     if(expire_inventory)backend.now+=std::chrono::seconds(61);
     if(missing_inventories-->0)return Fault(ErrorCode::ModuleNotReady,Stage::dependencies);
     if(inventory_error)return *inventory_error;return runtime.inventory;
@@ -273,4 +274,15 @@ TEST("launcher.collect_completion_uses_actual_elapsed_time") {
   Fixture fixture;fixture.args={"--collect-support"};CHECK(RunLauncherToConsole(fixture,{})==0);
   CompletionUtc(fixture.storage.console);CHECK(fixture.storage.console.find("\"elapsed_ms\":750")!=std::string::npos);
   CHECK(fixture.storage.summary.empty());
+}
+
+TEST("launcher.binding_progresses_only_after_resolved_next_stop") {
+  Fixture f;f.binding_sequence=true;f.unresolved_inventories=1;
+  const auto result=RunLauncher(f,{});
+  CHECK(result.status==Status::Applied);CHECK(f.inventories==2);CHECK(f.memory.writes==4);CHECK(result.detach==DetachOutcome::Detached);
+}
+TEST("launcher.binding_unresolved_is_bounded_and_never_writes") {
+  Fixture f;f.binding_sequence=true;f.unresolved_inventories=2000;
+  const auto result=RunLauncher(f,{});
+  CHECK(result.status==Status::TimedOut);CHECK(f.inventories>1);CHECK(f.memory.writes==0&&f.memory.protects==0);CHECK(result.detach==DetachOutcome::Detached);CHECK(!f.storage.summary.empty());
 }

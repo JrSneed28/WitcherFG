@@ -35,6 +35,8 @@ public:
   wfg::CompatibilityRecord SyntheticBuild() const;
   void SetImportPointer(std::string_view name, wfg::Address value);
   void SetAllImportsToInterposer();
+  void SetAllImportsUnresolved();
+  void SetAllImportsToNative();
   void SetManager(wfg::Address value);
   void SetFactory(wfg::Address value);
   void MakeManagerUnreadable();
@@ -172,3 +174,16 @@ inline void SupportedRuntimeFixture::EnableInterposerForwarder() { RuntimeFixtur
 inline void SupportedRuntimeFixture::AddApplicationLocalLoader(std::string basename, std::string version, bool recognized_official) { inventory.application_local_loaders.push_back({std::move(basename), std::move(version), true, recognized_official}); }
 inline void SupportedRuntimeFixture::Mutate(Mutation mutation) { switch (mutation) { case Mutation::Package: inventory.package_name = "other"; break; case Mutation::Version: inventory.package_version = "1"; break; case Mutation::Machine: memory.Put<std::uint16_t>(executable_base_ + 0x84, 0x14c); break; case Mutation::Timestamp: memory.Put<std::uint32_t>(executable_base_ + 0x88, 1U); break; case Mutation::ImageSize: memory.Put<std::uint32_t>(executable_base_ + 0xd0, 0x1234U); break; case Mutation::InterposerVersion: inventory.interposer.version = "0"; break; case Mutation::InterposerLength: ++inventory.interposer.length; break; case Mutation::InterposerHash: inventory.interposer.sha256[0] ^= std::byte{1}; break; case Mutation::Signer: inventory.interposer.trusted_nvidia_signer = false; break; case Mutation::Correspondence: inventory.interposer.backing_image_matches_loaded_module = false; break; case Mutation::FirstHash: memory.Put<std::byte>(executable_base_ + 0x1CB0384, std::byte{1}); break; case Mutation::SecondHash: memory.Put<std::byte>(executable_base_ + 0x1CB061D, std::byte{1}); break; } }
 inline wfg::Address SupportedRuntimeFixture::InterposerExport(std::string_view name) const { return interposer_exports_.at(std::string(name)); }
+
+// Diagnostic-1's measured loader-form tokens, with valid ordinary INT names.
+inline void SupportedRuntimeFixture::SetAllImportsUnresolved() {
+  constexpr std::array<wfg::Address,4> tokens{0x8000000000000065ULL,0x4171a64,0x4171a7a,0x4171a90};
+  const auto& mappings=wfg::SupportedBuild().mappings;
+  for(std::size_t i=0;i<tokens.size();++i) {
+    const auto thunk=i==0?0x1000ULL:0x1200ULL+(i-1)*8;
+    memory.Put(executable_base_+thunk,tokens[i]);
+    if(i) {memory.Put<std::uint16_t>(executable_base_+tokens[i],0);RuntimeFixtureDetail::Text(memory,executable_base_+tokens[i]+2,mappings[i].import_name);}
+    SetImportPointer(mappings[i].import_name,tokens[i]);
+  }
+}
+inline void SupportedRuntimeFixture::SetAllImportsToNative() {for(const auto& [name,slot]:slots_)memory.Put(slot,native_exports_.at(name));}

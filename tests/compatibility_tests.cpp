@@ -307,3 +307,39 @@ TEST("compatibility.official_loader_without_authenticated_signature_refuses") {
   CHECK(fixture.memory.write_count() == 0);
   CHECK(fixture.memory.protect_count() == 0);
 }
+
+namespace {
+using namespace wfg;
+TEST("compatibility.binding_native_control_preserves_measured_int") {
+  SupportedRuntimeFixture f;f.SetAllImportsUnresolved();f.SetAllImportsToNative();
+  CHECK(IsOk(ValidateBuild(f.memory,f.inventory,f.SyntheticBuild())));
+}
+TEST("compatibility.binding_all_four_exact_loader_tokens_are_not_ready") {
+  SupportedRuntimeFixture f;f.SetAllImportsUnresolved();
+  const auto pending=ValidateBuild(f.memory,f.inventory,f.SyntheticBuild());
+  REQUIRE_ERROR(pending,ErrorCode::ModuleNotReady);
+  CHECK(Failure(pending).operation.view()=="import_binding_not_ready");
+  CHECK(f.memory.write_count()==0&&f.memory.protect_count()==0);
+  f.SetAllImportsToNative();CHECK(IsOk(ValidateBuild(f.memory,f.inventory,f.SyntheticBuild())));
+}
+TEST("compatibility.binding_partial_or_foreign_tokens_are_terminal") {
+  for(unsigned index=0;index<4;++index)for(unsigned mode=0;mode<3;++mode) {
+    SupportedRuntimeFixture f;const auto mapping=f.SyntheticBuild().mappings[index];
+    auto bytes=f.memory.Read(f.inventory.executable.image.base+mapping.rva,8);CHECK(IsOk(bytes));Address native{};std::memcpy(&native,Value(bytes).data(),8);
+    f.SetAllImportsUnresolved();f.SetImportPointer(mapping.import_name,mode==0?native:mode==1?f.InterposerExport(mapping.import_name):f.foreign_hook);
+    const auto refused=ValidateBuild(f.memory,f.inventory,f.SyntheticBuild());REQUIRE_ERROR(refused,ErrorCode::UnexpectedImports);
+    CHECK(f.memory.write_count()==0&&f.memory.protect_count()==0);
+  }
+}
+TEST("compatibility.binding_readiness_preserves_factory_and_identity_guards") {
+  SupportedRuntimeFixture created;created.SetAllImportsUnresolved();created.SetFactory(created.native_factory);
+  const auto late=ValidateBuild(created.memory,created.inventory,created.SyntheticBuild());REQUIRE_ERROR(late,ErrorCode::StartupTooLate);
+  SupportedRuntimeFixture unreadable;unreadable.SetAllImportsUnresolved();unreadable.MakeFactoryUnreadable();
+  const auto bad=ValidateBuild(unreadable.memory,unreadable.inventory,unreadable.SyntheticBuild());REQUIRE_ERROR(bad,ErrorCode::UnreadableMemory);
+  SupportedRuntimeFixture identity;identity.SetAllImportsUnresolved();identity.Mutate(Mutation::FirstHash);
+  const auto mismatch=ValidateBuild(identity.memory,identity.inventory,identity.SyntheticBuild());REQUIRE_ERROR(mismatch,ErrorCode::UnsupportedBuild);
+  SupportedRuntimeFixture trust;trust.SetAllImportsUnresolved();trust.SetNativeTrusted(false);
+  const auto untrusted=ValidateBuild(trust.memory,trust.inventory,trust.SyntheticBuild());REQUIRE_ERROR(untrusted,ErrorCode::UntrustedInterposer);
+}
+
+}
