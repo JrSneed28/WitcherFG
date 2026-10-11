@@ -499,6 +499,7 @@ private:
 
 class VerifiedIdentityFactory {
 public:
+  static const std::wstring& RegisteredRoot(const PackageIdentity& package) { return package.state_->root; }
   static Result<OwnedProcess> Owned(const Candidate& candidate, const LaunchIdentity& launch) {
     const auto verified = Verify(candidate, launch);
     if (!IsOk(verified)) return Failure(verified);
@@ -788,6 +789,82 @@ Result<process_detail::FileEvidence> Evidence(HANDLE file, const std::wstring& p
   if (version.empty()) return Fail(ErrorCode::UntrustedInterposer, "file_version", Stage::dependencies);
   return process_detail::FileEvidence{Value(bytes).size(), Value(hash), version, true, nvidia ? DependencySigner::Nvidia : DependencySigner::Microsoft};
 }
+struct RegisteredContentAnchor { std::vector<Pin> pins; std::filesystem::path physical_root; std::uint64_t volume{}; };
+bool RegisteredRootTagAllowed(DWORD attributes,DWORD tag) {
+  return (attributes&FILE_ATTRIBUTE_DIRECTORY)&&((attributes&FILE_ATTRIBUTE_REPARSE_POINT)?tag==IO_REPARSE_TAG_MOUNT_POINT:tag==0);
+}
+bool FixedDrivePath(std::wstring_view path) {
+  if(path.starts_with(L"\\\\?\\"))path.remove_prefix(4);
+  if(path.size()<3||!((path[0]>=L'A'&&path[0]<=L'Z')||(path[0]>=L'a'&&path[0]<=L'z'))||path[1]!=L':'||path[2]!=L'\\')return false;
+  const wchar_t drive[]{path[0],L':',L'\\',L'\0'};return GetDriveTypeW(drive)==DRIVE_FIXED;
+}
+Result<RegisteredContentAnchor> PinRegisteredContentRoot(const std::wstring& root) {
+  if(!FixedDrivePath(root))return Fail(ErrorCode::DllConflict,"content_root_namespace");
+  auto wrapper=Hold(CreateFileW(root.c_str(),FILE_READ_ATTRIBUTES|FILE_LIST_DIRECTORY,FILE_SHARE_READ,nullptr,OPEN_EXISTING,
+    FILE_FLAG_BACKUP_SEMANTICS|FILE_FLAG_OPEN_REPARSE_POINT,nullptr));
+  if(wrapper.get()==INVALID_HANDLE_VALUE)return Fail(ErrorCode::DllConflict,"content_root_pin");
+  FILE_ATTRIBUTE_TAG_INFO attributes{};
+  if(!GetFileInformationByHandleEx(wrapper.get(),FileAttributeTagInfo,&attributes,sizeof(attributes))||
+    !RegisteredRootTagAllowed(attributes.FileAttributes,attributes.ReparseTag))return Fail(ErrorCode::DllConflict,"content_root_tag");
+  // Only the authoritative registered anchor may be a mount point. Keep its
+  // no-follow pin (no write/delete sharing) while resolving and pinning its target.
+  auto resolved=Hold(CreateFileW(root.c_str(),FILE_READ_ATTRIBUTES|FILE_LIST_DIRECTORY,FILE_SHARE_READ,nullptr,OPEN_EXISTING,FILE_FLAG_BACKUP_SEMANTICS,nullptr));
+  if(resolved.get()==INVALID_HANDLE_VALUE)return Fail(ErrorCode::DllConflict,"content_resolved_pin");
+  const auto physical=FinalPath(resolved.get());
+  if(!IsOk(physical)||!FixedDrivePath(Value(physical)))return Fail(ErrorCode::DllConflict,"content_physical_namespace");
+  auto anchor=Hold(CreateFileW(Value(physical).c_str(),FILE_READ_ATTRIBUTES|FILE_LIST_DIRECTORY,FILE_SHARE_READ,nullptr,OPEN_EXISTING,
+    FILE_FLAG_BACKUP_SEMANTICS|FILE_FLAG_OPEN_REPARSE_POINT,nullptr));
+  FILE_ID_INFO identity{};
+  if(anchor.get()==INVALID_HANDLE_VALUE||!SameFile(resolved.get(),anchor.get())||
+    !GetFileInformationByHandleEx(anchor.get(),FileAttributeTagInfo,&attributes,sizeof(attributes))||
+    !(attributes.FileAttributes&FILE_ATTRIBUTE_DIRECTORY)||(attributes.FileAttributes&FILE_ATTRIBUTE_REPARSE_POINT)||
+    !GetFileInformationByHandleEx(anchor.get(),FileIdInfo,&identity,sizeof(identity)))return Fail(ErrorCode::DllConflict,"content_physical_identity");
+  const auto final=FinalPath(anchor.get());
+  if(!IsOk(final)||!Equal(Value(final),Value(physical)))return Fail(ErrorCode::DllConflict,"content_anchor_changed");
+  return RegisteredContentAnchor{{std::move(wrapper),std::move(resolved),std::move(anchor)},Value(final),identity.VolumeSerialNumber};
+}
+Result<Pin> PinRegisteredDebugFile(RegisteredContentAnchor& anchor,HANDLE candidate) {
+  auto path=anchor.physical_root;
+  for(const auto* child:{L"bin",L"Gaming.Desktop.x64"}) {
+    path/=child;
+    auto directory=Hold(CreateFileW(path.c_str(),FILE_READ_ATTRIBUTES|FILE_LIST_DIRECTORY,FILE_SHARE_READ,nullptr,OPEN_EXISTING,
+      FILE_FLAG_BACKUP_SEMANTICS|FILE_FLAG_OPEN_REPARSE_POINT,nullptr));
+    FILE_ATTRIBUTE_TAG_INFO attributes{};FILE_ID_INFO identity{};
+    if(directory.get()==INVALID_HANDLE_VALUE||!GetFileInformationByHandleEx(directory.get(),FileAttributeTagInfo,&attributes,sizeof(attributes))||
+      !(attributes.FileAttributes&FILE_ATTRIBUTE_DIRECTORY)||(attributes.FileAttributes&FILE_ATTRIBUTE_REPARSE_POINT)||
+      !GetFileInformationByHandleEx(directory.get(),FileIdInfo,&identity,sizeof(identity))||identity.VolumeSerialNumber!=anchor.volume)return Fail(ErrorCode::DllConflict,"content_child_pin");
+    const auto physical=FinalPath(directory.get());
+    if(!IsOk(physical)||!Equal(Value(physical),path.wstring()))return Fail(ErrorCode::DllConflict,"content_child_escape");
+    anchor.pins.push_back(std::move(directory));
+  }
+  path/=L"dbghelp.dll";
+  auto file=Hold(CreateFileW(path.c_str(),GENERIC_READ,FILE_SHARE_READ,nullptr,OPEN_EXISTING,FILE_FLAG_OPEN_REPARSE_POINT,nullptr));
+  if(file.get()==INVALID_HANDLE_VALUE||!SameFile(candidate,file.get()))return Fail(ErrorCode::DllConflict,"content_file_identity");
+  FILE_ATTRIBUTE_TAG_INFO attributes{};FILE_ID_INFO identity{};
+  const auto physical=FinalPath(file.get());
+  const auto candidate_path=FinalPath(candidate);
+  if(!GetFileInformationByHandleEx(file.get(),FileAttributeTagInfo,&attributes,sizeof(attributes))||
+    (attributes.FileAttributes&(FILE_ATTRIBUTE_DIRECTORY|FILE_ATTRIBUTE_REPARSE_POINT))||
+    !GetFileInformationByHandleEx(file.get(),FileIdInfo,&identity,sizeof(identity))||identity.VolumeSerialNumber!=anchor.volume||
+    !IsOk(physical)||!Equal(Value(physical),path.wstring())||!IsOk(candidate_path)||!Equal(Value(candidate_path),path.wstring()))return Fail(ErrorCode::DllConflict,"content_file_escape");
+  anchor.pins.push_back(file);return file;
+}
+bool QualifiedBundledDebugHelper(HANDLE candidate, const PackageIdentity& package,std::vector<Pin>* retained=nullptr) {
+  if(package.name()!="CDPROJEKTSA.Witcher3GOTY"||package.version()!="5.0.4.0")return false;
+  auto anchor=PinRegisteredContentRoot(VerifiedIdentityFactory::RegisteredRoot(package));if(!IsOk(anchor))return false;
+  auto& backing=std::get<RegisteredContentAnchor>(anchor);
+  const auto file=PinRegisteredDebugFile(backing,candidate);if(!IsOk(file))return false;
+  LARGE_INTEGER length{};if(!GetFileSizeEx(Value(file).get(),&length)||length.QuadPart!=1138120)return false;
+  const auto path=backing.physical_root/L"bin\\Gaming.Desktop.x64\\dbghelp.dll";
+  const auto evidence=Evidence(Value(file).get(),path.wstring(),false);
+  if(!IsOk(evidence))return false;
+  std::array<std::byte,4096> header{};LARGE_INTEGER beginning{};DWORD read{};
+  if(!SetFilePointerEx(Value(file).get(),beginning,nullptr,FILE_BEGIN)||
+    !ReadFile(Value(file).get(),header.data(),static_cast<DWORD>(header.size()),&read,nullptr)||read!=header.size()||
+    !process_detail::QualifiesBundledDebugHelper(Value(evidence),header,package.name(),package.version(),L"bin\\Gaming.Desktop.x64\\dbghelp.dll"))return false;
+  if(retained)retained->insert(retained->end(),backing.pins.begin(),backing.pins.end());
+  return true;
+}
 class NativeEnvironmentBackend final : public process_detail::IEnvironmentBackend {
 public:
   Result<process_detail::OsBuild> QueryOsBuild() override {
@@ -1045,6 +1122,31 @@ Result<FileEvidence> InspectFile(const std::wstring& path, bool require_nvidia) 
   if (!IsOk(file)) return Failure(file);
   return Evidence(Value(file).get(), path, require_nvidia);
 }
+bool QualifiesBundledDebugHelper(const FileEvidence& evidence, std::span<const std::byte> header,
+  std::string_view package, std::string_view version, std::wstring_view relative_path) {
+  constexpr std::array<unsigned char,32> digest{0x74,0x60,0x51,0x82,0x55,0xf4,0xc0,0x24,0xb8,0x1f,0x17,0x1e,0xf7,0xf5,0xc0,0x67,
+    0x1b,0x0a,0x2b,0x1d,0x64,0xf5,0x09,0xca,0xc8,0x48,0xc6,0xc8,0xda,0x7b,0xa2,0x41};
+  if(package!="CDPROJEKTSA.Witcher3GOTY"||version!="5.0.4.0"||!Equal(relative_path,L"bin\\Gaming.Desktop.x64\\dbghelp.dll")||
+    !evidence.trusted_signature||evidence.signer!=DependencySigner::Microsoft||evidence.length!=1138120||evidence.version!="6.2.9200.16384")return false;
+  for(std::size_t i=0;i<digest.size();++i)if(evidence.sha256[i]!=std::byte{digest[i]})return false;
+  // This is a typed shape check of one full-hash-qualified file, not a general
+  // PE32 parser or a relaxation of the AMD64 game/module parser.
+  if(header.size()<sizeof(IMAGE_DOS_HEADER)||header.size()>4096)return false;
+  IMAGE_DOS_HEADER dos{};std::memcpy(&dos,header.data(),sizeof(dos));
+  if(dos.e_magic!=IMAGE_DOS_SIGNATURE||dos.e_lfanew<static_cast<LONG>(sizeof(dos)))return false;
+  const auto offset=static_cast<std::size_t>(dos.e_lfanew);
+  if(offset>header.size()||sizeof(IMAGE_NT_HEADERS32)>header.size()-offset)return false;
+  IMAGE_NT_HEADERS32 pe{};std::memcpy(&pe,header.data()+offset,sizeof(pe));
+  return pe.Signature==IMAGE_NT_SIGNATURE&&pe.FileHeader.Machine==IMAGE_FILE_MACHINE_I386&&
+    pe.FileHeader.TimeDateStamp==0x5010a75d&&pe.FileHeader.SizeOfOptionalHeader==sizeof(IMAGE_OPTIONAL_HEADER32)&&
+    pe.OptionalHeader.Magic==IMAGE_NT_OPTIONAL_HDR32_MAGIC&&pe.OptionalHeader.SizeOfImage==0x12c000;
+}
+Result<bool> InspectRegisteredBundledDebugHelper() {
+  const auto package=DiscoverPackage();if(!IsOk(package))return Failure(package);
+  const auto path=std::filesystem::path(VerifiedIdentityFactory::RegisteredRoot(Value(package)))/L"bin\\Gaming.Desktop.x64\\dbghelp.dll";
+  const auto file=OpenFile(path.wstring());if(!IsOk(file))return Failure(file);
+  return QualifiedBundledDebugHelper(Value(file).get(),Value(package));
+}
 Result<Unit> VerifyBackingImage(void* handle, Address base, const std::wstring& path, const IMemory& memory) {
   const auto backing = OpenFile(path);
   if (!IsOk(backing)) return Failure(backing);
@@ -1234,6 +1336,7 @@ Result<RuntimeInventory> Inventory(HANDLE process, std::uint32_t pid, std::uint6
   const auto local_directory = std::filesystem::path(Value(identity).executable).parent_path();
   struct LoadedDependency { std::string basename; Pin file; std::size_t dependency_index; };
   std::vector<LoadedDependency> loaded_dependencies;
+  std::vector<Pin> qualified_content_pins;
   bool have_executable{}, have_interposer{};
   for (const auto module : modules) {
     std::wstring path(MaxPath, L'\0');
@@ -1317,6 +1420,9 @@ Result<RuntimeInventory> Inventory(HANDLE process, std::uint32_t pid, std::uint6
     if (basename.empty()) return Fail(ErrorCode::DllConflict, "local_loader_basename", Stage::dependencies);
     const auto file = OpenFile(entry.wstring());
     if (!IsOk(file)) return Failure(file);
+    // The exact package's original Microsoft x86 debug helper is benign data
+    // for this AMD64 game. Unknown dbghelp/proxy files still take the guard below.
+    if(Equal(entry.filename().wstring(),L"dbghelp.dll")&&QualifiedBundledDebugHelper(Value(file).get(),Value(package),&qualified_content_pins))continue;
     const auto loaded = std::find_if(loaded_dependencies.begin(), loaded_dependencies.end(), [&](const LoadedDependency& identity) { return identity.basename == basename && SameFile(identity.file.get(), Value(file).get()); });
     if (loaded != loaded_dependencies.end()) {
       const auto& dependency = inventory.dependencies[loaded->dependency_index];

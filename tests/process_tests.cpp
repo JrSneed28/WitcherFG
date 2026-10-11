@@ -9,8 +9,26 @@
 #include <windows.h>
 #include <filesystem>
 #include <fstream>
+#include <cstring>
 
 namespace {
+struct BundledDebugHelperFacts {
+  wfg::process_detail::FileEvidence file{1138120, {}, "6.2.9200.16384", true, wfg::DependencySigner::Microsoft};
+  std::vector<std::byte> header=std::vector<std::byte>(512);
+  std::string package="CDPROJEKTSA.Witcher3GOTY",version="5.0.4.0";
+  std::wstring path=L"bin\\Gaming.Desktop.x64\\dbghelp.dll";
+  BundledDebugHelperFacts() {
+    constexpr std::string_view hash="7460518255f4c024b81f171ef7f5c0671b0a2b1d64f509cac848c6c8da7ba241";
+    const auto hex=[](char c){return c<='9'?c-'0':c-'a'+10;};
+    for(std::size_t i=0;i<file.sha256.size();++i)file.sha256[i]=std::byte((hex(hash[i*2])<<4)|hex(hash[i*2+1]));
+    Put<std::uint16_t>(0,IMAGE_DOS_SIGNATURE);Put<std::uint32_t>(60,128);
+    Put<std::uint32_t>(128,IMAGE_NT_SIGNATURE);Put<std::uint16_t>(132,IMAGE_FILE_MACHINE_I386);
+    Put<std::uint32_t>(136,0x5010a75d);Put<std::uint16_t>(148,sizeof(IMAGE_OPTIONAL_HEADER32));
+    Put<std::uint16_t>(152,IMAGE_NT_OPTIONAL_HDR32_MAGIC);Put<std::uint32_t>(208,0x12c000);
+  }
+  template<class T>void Put(std::size_t offset,T value){std::memcpy(header.data()+offset,&value,sizeof(value));}
+  bool Qualifies()const{return wfg::process_detail::QualifiesBundledDebugHelper(file,header,package,version,path);}
+};
 std::unique_ptr<wfg::ProcessObserver> Observer(wfg::Result<std::unique_ptr<wfg::ProcessObserver>> result) {
   CHECK(wfg::IsOk(result));
   return std::move(std::get<std::unique_ptr<wfg::ProcessObserver>>(result));
@@ -371,6 +389,40 @@ TEST("process.prelaunch_failure_and_unexpired_launch_keep_exact_sideeffect_count
   operations.preparation_time = std::chrono::milliseconds(9);
   REQUIRE_OK(wfg::process_detail::ActivateBeforeDeadline(operations, {operations.Now() + std::chrono::milliseconds(10)}));
   CHECK(operations.launch_calls == 1);
+}
+
+TEST("process.bundled_debug_helper_requires_exact_trusted_file_identity") {
+  CHECK(BundledDebugHelperFacts{}.Qualifies());
+  for(int change=0;change<7;++change){BundledDebugHelperFacts f;
+    switch(change){case 0:f.file.trusted_signature=false;break;case 1:f.file.signer.reset();break;
+      case 2:f.file.signer=wfg::DependencySigner::Nvidia;break;case 3:f.file.sha256[0]^=std::byte{1};break;
+      case 4:++f.file.length;break;case 5:f.file.version="6.2.9200.16385";break;case 6:f.file.sha256={};break;}
+    CHECK(!f.Qualifies());
+  }
+}
+TEST("process.bundled_debug_helper_is_bound_to_known_package_relative_path") {
+  for(const auto& package:{"", "other", "CDPROJEKTSA.Witcher3GOTY_other"}){BundledDebugHelperFacts f;f.package=package;CHECK(!f.Qualifies());}
+  for(const auto& version:{"", "5.0.3.0", "5.0.4.1"}){BundledDebugHelperFacts f;f.version=version;CHECK(!f.Qualifies());}
+  for(const auto* path:{L"dbghelp.dll",L"bin\\Gaming.Desktop.x64\\dxgi.dll",L"other\\Gaming.Desktop.x64\\dbghelp.dll",L"bin\\Gaming.Desktop.x64\\..\\dbghelp.dll",L"C:\\bin\\Gaming.Desktop.x64\\dbghelp.dll",L"bin/Gaming.Desktop.x64/dbghelp.dll"}){BundledDebugHelperFacts f;f.path=path;CHECK(!f.Qualifies());}
+  BundledDebugHelperFacts f;f.path=L"BIN\\GAMING.DESKTOP.X64\\DBGHELP.DLL";CHECK(f.Qualifies());
+}
+TEST("process.bundled_debug_helper_rejects_wrong_or_truncated_pe_shape") {
+  for(int change=0;change<8;++change){BundledDebugHelperFacts f;
+    switch(change){case 0:f.Put<std::uint16_t>(0,0);break;case 1:f.Put<std::uint32_t>(60,0xffffffff);break;
+      case 2:f.Put<std::uint32_t>(128,0);break;case 3:f.Put<std::uint16_t>(132,IMAGE_FILE_MACHINE_AMD64);break;
+      case 4:f.Put<std::uint32_t>(136,0);break;case 5:f.Put<std::uint16_t>(148,0);break;
+      case 6:f.Put<std::uint16_t>(152,IMAGE_NT_OPTIONAL_HDR64_MAGIC);break;case 7:f.Put<std::uint32_t>(208,0x13c000);break;}
+    CHECK(!f.Qualifies());
+  }
+  for(const auto size:{0u,63u,128u,151u,375u}){BundledDebugHelperFacts f;f.header.resize(size);CHECK(!f.Qualifies());}
+}
+TEST("process.bundled_debug_helper_does_not_relax_other_proxy_classification") {
+  for(const auto* name:{"dbghelp.dll","dxgi.dll","d3d12.dll","version.dll"}){
+    wfg::RuntimeInventory inventory;inventory.application_local_loaders.push_back({name,"",false,false});
+    REQUIRE_ERROR(wfg::ClassifyLoaderConflicts(inventory,wfg::SupportedBuild()),wfg::ErrorCode::DllConflict);
+    inventory.application_local_loaders[0].trusted_signature=true;
+    REQUIRE_ERROR(wfg::ClassifyLoaderConflicts(inventory,wfg::SupportedBuild()),wfg::ErrorCode::DllConflict);
+  }
 }
 
 TEST("process.local_iteration_failure_is_dependency_refusal_not_exception") {

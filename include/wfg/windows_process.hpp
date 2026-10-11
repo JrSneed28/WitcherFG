@@ -145,6 +145,10 @@ struct FileEvidence {
   std::optional<DependencySigner> signer;
 };
 Result<FileEvidence> InspectFile(const std::wstring& path, bool require_nvidia);
+// Read-only evidence policy; it grants no package/process/mutation capability.
+bool QualifiesBundledDebugHelper(const FileEvidence& evidence, std::span<const std::byte> header,
+  std::string_view package, std::string_view version, std::wstring_view relative_path);
+Result<bool> InspectRegisteredBundledDebugHelper();
 Result<Unit> ReadIntoHandle(void* handle, Address address, std::span<std::byte> bytes);
 Result<Unit> VerifyBackingImage(void* handle, Address base, const std::wstring& path, const IMemory& memory);
 Observed<DependencyRole> IdentifyDependencyRole(const IMemory& memory, const PeImage& image, const FileEvidence& evidence, std::string_view basename);
