@@ -114,7 +114,7 @@ struct Fixture final : ILaunchEnvironment {
     ++inventories;if(inventories==1)first_inventory_wait=backend.waits;backend.now+=inventory_elapsed;if(cancel_inventory)active_cancel->request_stop();CHECK(backend.held);CHECK(owner.native_handle()==memory_pin&&memory_pin==backend.pin);
     if(binding_sequence){if(unresolved_inventories-->0){CHECK(memory.writes==0&&memory.protects==0);runtime.SetAllImportsUnresolved();}else runtime.SetAllImportsToNative();}
     if(expire_inventory)backend.now+=std::chrono::seconds(61);
-    if(missing_inventories-->0)return Fault(ErrorCode::ModuleNotReady,Stage::dependencies);
+    if(missing_inventories-->0)return Error{ErrorCode::ModuleNotReady,Stage::dependencies,"startup_modules_missing",5U};
     if(inventory_error)return *inventory_error;return runtime.inventory;
   }
   const CompatibilityRecord& Compatibility()const override{return compatibility;}
@@ -287,6 +287,27 @@ TEST("launcher.binding_progresses_only_after_resolved_next_stop") {
   const auto result=RunLauncher(f,{});
   CHECK(result.status==Status::Applied);CHECK(f.inventories==2);CHECK(f.memory.writes==4);CHECK(result.detach==DetachOutcome::Detached);
 }
+TEST("launcher.presence_gate_retries_do_not_consume_the_qualification_budget") {
+  // CompleteStartupInventory refuses startup_modules_missing BEFORE inspect() runs, so those
+  // passes cost a module-path scan and the two path-only conflict guards -- no Authenticode, no
+  // catalog enumeration, no backing-image compare. They are not what the qualification budget
+  // exists to bound, and charging them broke the real target: the live run refused
+  // dependencies_qualification_budget after 12.6 s with the interposer never observed, while the
+  // successful live runs had taken 8.8-55.9 s. The game simply needs more than twelve debug
+  // events before Streamline is loaded. Only passes that actually qualified may be charged.
+  Fixture few; few.missing_inventories=20;
+  const auto applied=RunLauncher(few,{});
+  CHECK(applied.status==Status::Applied);
+  CHECK(few.inventories==21);
+  CHECK(few.memory.writes==4);
+
+  Fixture many; many.missing_inventories=2000;
+  const auto deadline=RunLauncher(many,{});
+  CHECK(deadline.status==Status::TimedOut);
+  CHECK(many.memory.writes==0&&many.memory.protects==0);
+  // It must run out of clock, never out of budget.
+  CHECK(many.storage.summary.find("dependencies_qualification_budget")==std::string::npos);
+}
 TEST("launcher.binding_unresolved_is_bounded_and_never_writes") {
   // "Bounded" previously meant only "the 60 s deadline eventually fires". Each pass re-runs the
   // whole qualification from scratch -- Authenticode plus catalog enumeration and a backing-image
@@ -296,7 +317,7 @@ TEST("launcher.binding_unresolved_is_bounded_and_never_writes") {
   // opaque TimedOut instead of a prompt diagnosable refusal. Assert a real upper bound.
   Fixture f;f.binding_sequence=true;f.unresolved_inventories=2000;
   const auto result=RunLauncher(f,{});
-  CHECK(result.status==Status::TimedOut);CHECK(f.inventories>1&&f.inventories<=12);
+  CHECK(result.status==Status::TimedOut);CHECK(f.inventories>1&&f.inventories<=13);
   CHECK(f.memory.writes==0&&f.memory.protects==0);CHECK(result.detach==DetachOutcome::Detached);CHECK(!f.storage.summary.empty());
 }
 

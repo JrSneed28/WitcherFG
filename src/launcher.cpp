@@ -293,12 +293,19 @@ RunResult RunLauncher(ILaunchEnvironment& env,std::stop_token external) {
           continue;
         }
       }
-      if(++qualification_passes>MaxQualificationPasses){refuse(QualificationBudget(stage));return finish();}
       event(stage,EventCode::Initialization,"dependencies_entered");
       const auto inventory=env.Inventory(*owned,*memory);
       if(expired()){refuse(Timeout(stage));return finish();}
+      // Charge the budget only for passes that actually qualified. CompleteStartupInventory
+      // refuses startup_modules_missing BEFORE inspect() runs, so such a pass costs a module
+      // path scan and the two path-only conflict guards -- none of the Authenticode, catalog
+      // enumeration or backing-image comparison the budget exists to bound. A real target
+      // produces many of those events before Streamline is loaded, so charging them refused
+      // long before the game could possibly be ready.
+      if(IsOk(inventory)||Failure(inventory).operation.view()!="startup_modules_missing") ++qualification_passes;
       if(!IsOk(inventory)) {
         if(Failure(inventory).code==ErrorCode::ModuleNotReady) {
+          if(qualification_passes>MaxQualificationPasses){refuse(QualificationBudget(stage));return finish();}
           const auto continued=session->Continue(stop,stop.continuation());
           if(!IsOk(continued)){refuse(Failure(continued));return finish();}
           continue;
@@ -313,6 +320,7 @@ RunResult RunLauncher(ILaunchEnvironment& env,std::stop_token external) {
       if(!IsOk(validated)) {
         if(Failure(validated).code==ErrorCode::ModuleNotReady&&Failure(validated).operation.view()=="import_binding_not_ready") {
           if(expired()){refuse(Timeout(stage));return finish();}
+          if(qualification_passes>MaxQualificationPasses){refuse(QualificationBudget(stage));return finish();}
           const auto continued=session->Continue(stop,stop.continuation());
           if(!IsOk(continued)){refuse(Failure(continued));return finish();}
           continue;
