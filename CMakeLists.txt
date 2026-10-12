@@ -1,6 +1,20 @@
 cmake_minimum_required(VERSION 3.24)
 project(WitcherFG LANGUAGES CXX)
 
+# Warnings are errors for every target by default. This was previously supplied only on the
+# configure command line, which meant the release manifest could not evidence the policy and a
+# non-/WX build of identical sources produced an identical input_digest. Declaring it as a cache
+# entry here makes it the committed default AND records it in CMakeCache.txt, where
+# tools/release.py now reads it. Override deliberately with -DCMAKE_COMPILE_WARNING_AS_ERROR=OFF.
+set(CMAKE_COMPILE_WARNING_AS_ERROR ON CACHE BOOL "Treat compiler warnings as errors")
+
+# The qualified configuration is the Visual Studio 18 2026 generator targeting x64. Any other
+# generator is unverified for this project rather than forbidden, so say so once, loudly.
+if(NOT CMAKE_GENERATOR STREQUAL "Visual Studio 18 2026")
+  message(WARNING "Unqualified generator '${CMAKE_GENERATOR}'. The supported configuration is "
+                  "'Visual Studio 18 2026' with -A x64; release qualification requires it.")
+endif()
+
 if(NOT MSVC OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
   message(FATAL_ERROR "WitcherFG requires 64-bit MSVC")
 endif()

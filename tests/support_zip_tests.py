@@ -55,20 +55,24 @@ class SupportZipTests(unittest.TestCase):
             self.assertEqual(hashlib.sha256(payload).hexdigest(), manifest["payload_sha256"])
             self.assertNotIn(b"PRIVATE_SECRET", payload)
             self.assertNotIn(b"PRIVATE_ENV_SECRET", payload)
-            if "last-run.json" in names:
-                summary = strict_json(archive.read("last-run.json"))
-                self.assertEqual(summary["failure"]["code"], "WFG-E-BUILD_UNSUPPORTED")
-                self.assertNotIn("action", summary["failure"])
-                self.assertEqual(summary["game"]["package"]["value"], "CDPROJEKTSA.Witcher3GOTY")
-                self.assertEqual(summary["configuration"]["max_file_mib"], 2)
-                self.assertEqual(summary["configuration"]["origins"]["logging.level"], "default")
-            if "events.json" in names:
-                events = strict_json(archive.read("events.json"))["events"]
-                self.assertLessEqual(len(events), 5)
-                for event in events:
-                    self.assertEqual(event["code"], "WFG-E-BUILD_UNSUPPORTED")
-                    self.assertEqual(event["time_utc"], "2026-10-10T12:34:56Z")
-                    self.assertEqual(event["fields"][0]["value"], 4)
+            # Unconditional: BuildSupportPayload always emits both, so a regression that stopped
+            # emitting them would have silently skipped every content and privacy assertion below
+            # rather than failing. The set equality at line 50 cannot catch it either, because the
+            # manifest is regenerated from whatever was actually produced.
+            self.assertIn("last-run.json", names)
+            summary = strict_json(archive.read("last-run.json"))
+            self.assertEqual(summary["failure"]["code"], "WFG-E-BUILD_UNSUPPORTED")
+            self.assertNotIn("action", summary["failure"])
+            self.assertEqual(summary["game"]["package"]["value"], "CDPROJEKTSA.Witcher3GOTY")
+            self.assertEqual(summary["configuration"]["max_file_mib"], 2)
+            self.assertEqual(summary["configuration"]["origins"]["logging.level"], "default")
+            self.assertIn("events.json", names)
+            events = strict_json(archive.read("events.json"))["events"]
+            self.assertLessEqual(len(events), 5)
+            for event in events:
+                self.assertEqual(event["code"], "WFG-E-BUILD_UNSUPPORTED")
+                self.assertEqual(event["time_utc"], "2026-10-10T12:34:56Z")
+                self.assertEqual(event["fields"][0]["value"], 4)
 
 
 if __name__ == "__main__":

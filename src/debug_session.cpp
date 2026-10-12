@@ -37,7 +37,7 @@ struct DebugSessionState {
   bool safe_policy{};
   bool abort_requested{};
   bool process_created{};
-  bool attach_exception_seen{};
+  bool attach_breakpoint_consumed{};
   bool observed_exit{};
 };
 
@@ -85,7 +85,7 @@ Result<Unit> DebugSession::Attach(const OwnedProcess& process) {
   state_->pid = process.pid();
   state_->safe_policy = false;
   state_->process_created = false;
-  state_->attach_exception_seen = false;
+  state_->attach_breakpoint_consumed = false;
   auto policy = backend_.SetKillOnExit(false);
   if (!IsOk(policy)) {
     static_cast<void>(AbortOwnedStartup());
@@ -104,8 +104,10 @@ Result<DebugStop> DebugSession::WaitStopped(Deadline deadline) {
     if (event.pid != state_->pid) return DebugFailure("unexpected_debug_target", ErrorCode::IdentityChanged);
     if (event.kind == DebugEventKind::ProcessCreated) state_->process_created = true;
     const bool initial = event.kind == DebugEventKind::Exception && event.exception_status == 0x80000003U &&
-      event.first_chance && event.attach_breakpoint_identity && state_->process_created && !state_->attach_exception_seen;
-    if (event.kind == DebugEventKind::Exception) state_->attach_exception_seen = true;
+      event.first_chance && event.attach_breakpoint_identity && state_->process_created && !state_->attach_breakpoint_consumed;
+    // Latch on the handshake itself. Latching on any exception let a live game thread's
+    // first-chance exception burn the one-shot before the real attach breakpoint arrived.
+    if (initial) state_->attach_breakpoint_consumed = true;
     state_->continuation = event.kind != DebugEventKind::Exception || initial ? Continuation::Handled : Continuation::NotHandled;
     state_->held = event;
     state_->held_sequence.store(++state_->sequence);
@@ -161,9 +163,9 @@ Result<Unit> DebugSession::Detach(Deadline deadline) {
       const auto event = *Value(waited);
       if (event.pid != state_->pid) return DebugFailure("unexpected_debug_target", ErrorCode::IdentityChanged);
       const bool initial = event.kind == DebugEventKind::Exception && event.exception_status == 0x80000003U && event.first_chance &&
-        event.attach_breakpoint_identity && state_->process_created && !state_->attach_exception_seen;
+        event.attach_breakpoint_identity && state_->process_created && !state_->attach_breakpoint_consumed;
       if (event.kind == DebugEventKind::ProcessCreated) state_->process_created = true;
-      if (event.kind == DebugEventKind::Exception) state_->attach_exception_seen = true;
+      if (initial) state_->attach_breakpoint_consumed = true;
       state_->held = event;
       state_->held_sequence.store(++state_->sequence);
       state_->continuation = event.kind != DebugEventKind::Exception || initial ? Continuation::Handled : Continuation::NotHandled;
@@ -193,7 +195,7 @@ struct NativeDebugBackend::State {
   bool attached{};
   bool safe_policy{};
   bool process_created{};
-  bool attach_exception_seen{};
+  bool attach_breakpoint_consumed{};
   bool abort_requested{};
   std::optional<Deadline> abort_deadline;
   std::uint32_t initial_tid{};
@@ -209,6 +211,12 @@ struct NativeDebugBackend::State {
 
 #ifdef _WIN32
 namespace {
+// Claims the calling thread for one debug target. Detach() and a ProcessExited Continue() clear
+// it; AbortOwnedStartup() deliberately does NOT. An aborted startup is terminal for the thread:
+// after it, Continue, SetKillOnExit, Detach and any fresh Attach all refuse, which is asserted
+// by CheckTerminalNoContinuation in tests/fixtures/debug_win32_backend.cpp. The launcher attaches
+// once per process, so retaining the claim strands no reusable resource. Do not "fix" this into
+// a release without replacing the terminal guard it provides.
 thread_local const NativeDebugBackend* active_debugger{};
 class DebugFileHandle {
 public:
@@ -300,7 +308,7 @@ Result<Unit> NativeDebugBackend::Attach(const OwnedProcess& process) {
   if (state_->pin) CloseHandle(state_->pin);
   state_->pin = pin;
   state_->pid = process.pid(); state_->attached = true; state_->safe_policy = false;
-  state_->process_created = false; state_->attach_exception_seen = false; state_->abort_requested = false;
+  state_->process_created = false; state_->attach_breakpoint_consumed = false; state_->abort_requested = false;
   state_->abort_deadline.reset();
   state_->initial_tid = 0; state_->breakpoint = 0; state_->remote_breakin = 0;
   return Unit{};
@@ -349,10 +357,11 @@ Result<std::optional<DebugEvent>> NativeDebugBackend::Wait(std::chrono::millisec
     event.exception_status = native.u.Exception.ExceptionRecord.ExceptionCode;
     event.exception_address = reinterpret_cast<Address>(native.u.Exception.ExceptionRecord.ExceptionAddress);
     event.first_chance = native.u.Exception.dwFirstChance != 0;
-    event.attach_breakpoint_identity = event.pid == state_->pid && state_->process_created && !state_->attach_exception_seen &&
+    event.attach_breakpoint_identity = event.pid == state_->pid && state_->process_created && !state_->attach_breakpoint_consumed &&
       event.exception_status == EXCEPTION_BREAKPOINT && event.first_chance && state_->breakpoint != 0 &&
       event.exception_address == state_->breakpoint && (event.tid == state_->initial_tid || RemoteBreakinThread(event.tid, state_->remote_breakin));
-    state_->attach_exception_seen = true;
+    // One-shot, but consumed by the handshake rather than by whichever exception arrives first.
+    if (event.attach_breakpoint_identity) state_->attach_breakpoint_consumed = true;
   } else if (native.dwDebugEventCode == EXIT_PROCESS_DEBUG_EVENT) {
     event.kind = DebugEventKind::ProcessExited;
   }

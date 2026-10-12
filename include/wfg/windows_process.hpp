@@ -93,7 +93,10 @@ Result<RuntimeInventory> InventoryObservedProcess(const ObservedProcess& process
 EnvironmentSnapshot ObserveEnvironment(const ObservedProcess* process);
 
 namespace process_detail {
+// conflicts runs on every pass, before the presence gate, so a loader conflict is refused by
+// name instead of retrying silently to the deadline; it must stay cheap enough to repeat.
 Result<RuntimeInventory> CompleteStartupInventory(std::span<const std::string> module_names,
+  const std::function<Result<Unit>()>& conflicts,
   const std::function<Result<RuntimeInventory>()>& inspect);
 // Read-only package-document resolution; does not confer process or write authority.
 struct RegisteredPackageMetadata {

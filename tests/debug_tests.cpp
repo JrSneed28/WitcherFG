@@ -283,12 +283,22 @@ TEST("debug.watchdog_disarm_during_grace_does_not_exit_helper") {
   CHECK(backend.Await(1)); backend.Advance(); CHECK(backend.Await(2)); watchdog.Disarm();
   CHECK(cancellation.stop_requested()); CHECK(backend.exits == 0);
 }
-TEST("debug.attach_breakpoint_window_closes_on_first_unrelated_exception") {
+TEST("debug.attach_breakpoint_survives_earlier_unrelated_exception_but_stays_one_shot") {
+  // Previously an unrelated exception closed the attach window, so the genuine attach
+  // breakpoint that followed was continued NotHandled, attach_ready never became true and the
+  // run refused TimedOut without ever taking inventory. The launcher attaches to an
+  // already-running, un-suspended game, so a live thread can raise an exception first; the
+  // one-shot must be consumed by the handshake, not by whatever arrives before it.
   Fixture fixture; REQUIRE_OK(fixture.session.Attach(fixture.owned));
   fixture.backend.events.push_back(Event(DebugEventKind::ProcessCreated)); auto created = fixture.Stop();
   REQUIRE_OK(fixture.session.Continue(created, Continuation::Handled));
   fixture.backend.events.push_back(Exception(false)); auto application = fixture.Stop();
+  CHECK(application.continuation() == Continuation::NotHandled);
   REQUIRE_OK(fixture.session.Continue(application, Continuation::NotHandled));
+  fixture.backend.events.push_back(Exception(true)); auto handshake = fixture.Stop();
+  CHECK(handshake.continuation() == Continuation::Handled);
+  REQUIRE_OK(fixture.session.Continue(handshake, Continuation::Handled));
+  // Still one-shot: a second attach-identity exception is not a second handshake.
   fixture.backend.events.push_back(Exception(true)); auto later = fixture.Stop();
   CHECK(later.continuation() == Continuation::NotHandled);
 }

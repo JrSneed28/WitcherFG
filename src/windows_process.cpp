@@ -1112,7 +1112,17 @@ Result<Unit> ValidateStartupInventory(const RuntimeInventory& inventory) {
   return Unit{};
 }
 Result<RuntimeInventory> CompleteStartupInventory(std::span<const std::string> module_names,
+  const std::function<Result<Unit>()>& conflicts,
   const std::function<Result<RuntimeInventory>()>& inspect) {
+  // Conflict detection must not sit behind the presence gate. An application-local d3d12.dll or
+  // dxgi.dll proxy can PREVENT sl.interposer.dll from ever loading, so gating on all three being
+  // present meant the conflict guards never ran, application_local_loaders stayed empty and
+  // ClassifyLoaderConflicts affirmatively reported no conflict -- a false negative that turned a
+  // diagnosable DllConflict into an opaque TimedOut for exactly the population most likely to
+  // hit it. These guards compare module paths only, so they stay cheap enough to repeat on every
+  // retry pass; the expensive qualification behind the gate is unchanged.
+  const auto conflicting = conflicts();
+  if (!IsOk(conflicting)) return Failure(conflicting);
   for (const auto* required : {"d3d12.dll", "dxgi.dll", "sl.interposer.dll"}) {
     if (std::none_of(module_names.begin(), module_names.end(), [&](const auto& name) { return EqualAscii(name, required); }))
       return Fail(ErrorCode::ModuleNotReady, "startup_modules_missing", Stage::dependencies);
@@ -1347,7 +1357,6 @@ Result<RuntimeInventory> Inventory(HANDLE process, std::uint32_t pid, std::uint6
     if (basename.empty()) return Fail(ErrorCode::DllConflict, "module_basename", Stage::dependencies);
     module_paths.push_back(std::move(path)); module_names.push_back(std::move(basename));
   }
-  return process_detail::CompleteStartupInventory(module_names, [&]() -> Result<RuntimeInventory> {
   wchar_t system_buffer[MAX_PATH]{};
   if (!GetSystemDirectoryW(system_buffer, MAX_PATH)) return Fail(ErrorCode::AccessDenied, "system_directory", Stage::dependencies);
   const auto system_probe = OpenFile(std::wstring(system_buffer) + L"\\kernel32.dll");
@@ -1356,6 +1365,30 @@ Result<RuntimeInventory> Inventory(HANDLE process, std::uint32_t pid, std::uint6
   if (!IsOk(system_final)) return Failure(system_final);
   const auto system_directory = std::filesystem::path(Value(system_final)).parent_path().wstring();
   const auto local_directory = std::filesystem::path(Value(identity).executable).parent_path();
+  return process_detail::CompleteStartupInventory(module_names,
+    [&]() -> Result<Unit> {
+      // Path-only guards over the modules already loaded. These are the two checks that do not
+      // need sl.interposer.dll to be present, and they name the conflict that keeps it from
+      // loading. No signature, backing-image or export work happens here, so repeating this on
+      // every retry pass costs one open and one final-path resolution per matching module.
+      for (const auto& path : module_paths) {
+        const auto filename = std::filesystem::path(path).filename().wstring();
+        const bool required_native = Equal(filename, L"d3d12.dll") || Equal(filename, L"dxgi.dll");
+        const bool interposer = Equal(filename, L"sl.interposer.dll");
+        if (!required_native && !interposer) continue;
+        const auto file = OpenFile(path);
+        if (!IsOk(file)) return Failure(file);
+        const auto canonical = FinalPath(Value(file).get());
+        if (!IsOk(canonical)) return Failure(canonical);
+        const auto parent = std::filesystem::path(Value(canonical)).parent_path().wstring();
+        if (required_native && !Equal(parent, system_directory))
+          return Fail(ErrorCode::DllConflict, "native_module_location", Stage::dependencies);
+        if (interposer && !Equal(parent, local_directory.wstring()))
+          return Fail(ErrorCode::UntrustedInterposer, "interposer_location", Stage::dependencies);
+      }
+      return Unit{};
+    },
+    [&]() -> Result<RuntimeInventory> {
   struct LoadedDependency { std::string basename; Pin file; std::size_t dependency_index; };
   std::vector<LoadedDependency> loaded_dependencies;
   std::vector<Pin> qualified_content_pins;

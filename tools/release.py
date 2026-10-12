@@ -480,8 +480,15 @@ def _verify_acceptance_tag(tag: str, identity: dict) -> None:
 
 def record_toolchain(build_root: pathlib.Path) -> dict:
     cache = _read(build_root / "CMakeCache.txt").decode("utf-8")
+    # CMAKE_COMPILE_WARNING_AS_ERROR must be captured here or the manifest -- the only durable
+    # machine-readable record of how the candidate was built -- cannot evidence the warning
+    # policy at all. input_digest covers source bytes only, so a /WX build and a non-/WX build
+    # of identical sources produce the same digest and comparing digests cannot tell them apart.
     record = {key: value for key, value in re.findall(
-        r"(?m)^(CMAKE_GENERATOR|CMAKE_GENERATOR_PLATFORM):[^=]+=(.*)$", cache)}
+        r"(?m)^(CMAKE_GENERATOR|CMAKE_GENERATOR_PLATFORM|CMAKE_GENERATOR_INSTANCE"
+        r"|CMAKE_COMPILE_WARNING_AS_ERROR):[^=]+=([^\r\n]*)", cache)}
+    record["warning_as_error"] = record.get("CMAKE_COMPILE_WARNING_AS_ERROR", "").strip().upper() \
+        in {"ON", "TRUE", "YES", "1"}
     compilers = list((build_root / "CMakeFiles").glob("*/CMakeCXXCompiler.cmake"))
     if len(compilers) != 1:
         raise ValueError("ambiguous or missing recorded compiler")

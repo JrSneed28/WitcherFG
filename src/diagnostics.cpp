@@ -18,6 +18,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <objbase.h>
 #endif
 
 namespace wfg {
@@ -624,7 +625,18 @@ Result<Unit> FileLogStorage::WriteSummaryAtomically(std::string_view json) {
   auto destination=local_storage::RelativeOpen(state_->directory(),L"last-run.json",FILE_READ_ATTRIBUTES,FILE_SHARE_READ|FILE_SHARE_DELETE,1);
   if(!destination&&GetLastError()!=ERROR_FILE_NOT_FOUND)return DiagnosticError("summary_destination",GetLastError());
   if(destination&&!local_storage::RegularSingleLink(destination.get()))return DiagnosticError("storage_file_refused",GetLastError());
-  auto temporary=local_storage::RelativeOpen(state_->directory(),L"last-run.json.tmp",GENERIC_WRITE|DELETE|FILE_READ_ATTRIBUTES,0,2);
+  // Name the temporary per write. A force-exit between creation and the rename below leaves the
+  // file behind, and with one fixed name under FILE_CREATE that stale file failed every later
+  // run with ERROR_FILE_EXISTS, so last-run.json was never updated again. An unpredictable name
+  // also removes the planted-link attack the fixed name had to refuse: FILE_CREATE is kept, so
+  // a collision still refuses rather than overwriting. Pattern follows the already-correct
+  // CommitArchiveAtomically in support_storage_windows.cpp.
+  GUID id{};
+  if(FAILED(CoCreateGuid(&id)))return DiagnosticError("summary_name");
+  wchar_t identifier[40]{};
+  if(!StringFromGUID2(id,identifier,40))return DiagnosticError("summary_name");
+  const auto temporary_name=std::wstring(L"last-run-")+identifier+L".tmp";
+  auto temporary=local_storage::RelativeOpen(state_->directory(),temporary_name,GENERIC_WRITE|DELETE|FILE_READ_ATTRIBUTES,0,2);
   if(!temporary)return DiagnosticError("summary_open",GetLastError());
   const auto fail=[&](){const auto error=GetLastError();local_storage::DeleteFileHandle(temporary.get());return DiagnosticError("summary_write",error);};
   if(!local_storage::RegularSingleLink(temporary.get())||!local_storage::WriteBytes(temporary.get(),json)||!FlushFileBuffers(temporary.get()))return fail();

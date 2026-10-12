@@ -6,6 +6,42 @@ Tested on 2026-10-10. After the independent-read and cleanup review fixes, nativ
 
 The earlier full-suite baseline passed 18/18 CTest gates, 214/214 main-runner tests, 25/25 transaction tests, 14/14 native debug-boundary tests, and 44/44 support tests plus independent ZIP checks. Those are retained baseline results; this fixture-only correction reran the changed physical gate rather than the unchanged full suite.
 
+> **Scope note added 2026-10-12. The case rows below are not current evidence for HEAD.**
+>
+> Everything in this document is scoped to source base `e54eeca` with `dirty=true`. HEAD is
+> **10 commits** ahead of that base (`git rev-list --count e54eeca..36479d8`), and the Task 13
+> fix wave adds further changes on top. The document's own re-run rule at the end of this file
+> requires a re-run after "lifecycle, rights, transaction, watchdog, output-lifetime, or
+> **fixture** changes", and that rule has been triggered:
+>
+> - `1eef232` modified `tests/fixture_target.cpp`, `tests/fixtures/lifecycle_protocol.hpp`,
+>   `tests/fixtures/pe_images.hpp` and `tests/fixtures/runtime_images.hpp`, plus `src/pe.cpp`
+>   and `src/compatibility.cpp`.
+> - `9a218b2` modified `tests/fixtures/runtime_images.hpp`, `src/launcher.cpp`,
+>   `src/compatibility.cpp` and `src/pe.cpp`.
+> - `36479d8` modified `src/launcher.cpp` and `src/windows_process.cpp`.
+> - The Task 13 fix wave additionally modified `src/transaction.cpp`, `src/debug_session.cpp`,
+>   `src/diagnostics.cpp`, `src/compatibility.cpp`, `src/windows_process.cpp` and the
+>   transaction and lifecycle-adjacent fixtures.
+>
+> Consequences, stated exactly:
+>
+> - The artifact SHA256s and input digest in "Tested artifacts" **cannot** match HEAD and must
+>   not be cited as the identity of any current build.
+> - The **27 case rows** are not re-established at HEAD. They were produced case-by-case by the
+>   fixture harness at `e54eeca`; no case-by-case re-run exists for HEAD.
+> - The counts in the paragraphs above are also superseded: HEAD registers **19** CTest gates,
+>   not 18, and the main runner reports **248** cases, not 214.
+> - What *is* re-established at HEAD is the lifecycle gate **in aggregate only**. The retained
+>   candidate log records `Start 18: wfg_lifecycle` passing in 21.00 s
+>   (`build/task13-startup-native/candidate.log:158-163`), and the Task 13 fix wave re-ran the
+>   full registered gate set — 19/19 passing, with warnings-as-errors across all 13 targets.
+>   Both are single aggregate CTest entries. `--output-on-failure` prints nothing on success, so
+>   per-case detail is absent from both logs.
+>
+> Treat the rows below as historical until a fresh case-by-case run replaces them.
+
+
 ## Contents
 
 - [Environment and reproduction](#environment-and-reproduction)

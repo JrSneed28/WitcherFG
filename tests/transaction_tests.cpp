@@ -252,8 +252,18 @@ TEST("transaction.every_protection_query_mismatch_refuses_or_rolls_back") {
   Fixture baseline;
   baseline.Apply();
   const int count = baseline.memory.queries;
+  CHECK(count >= 16);
   for (int fault = 1; fault <= count; ++fault) {
-    if (fault == 9) continue;
+    if (fault == 9) {
+      // Query 9 is CheckFactory's readability probe on the factory manager address. The
+      // fixture answers that address from a dedicated branch that returns before
+      // corrupt_query is applied, so corrupting this index is a no-op by construction and
+      // the transaction commits normally. Assert that instead of skipping silently.
+      Fixture unaffected;
+      unaffected.memory.corrupt_query = fault;
+      CHECK(unaffected.Apply().outcome == TransactionOutcome::Committed);
+      continue;
+    }
     Fixture fixture;
     fixture.memory.corrupt_query = fault;
     const auto result = fixture.Apply();
@@ -264,6 +274,27 @@ TEST("transaction.every_protection_query_mismatch_refuses_or_rolls_back") {
   }
 }
 
+TEST("transaction.copy_on_write_iat_page_refuses_before_any_write") {
+  // An IAT page still reporting PAGE_WRITECOPY has not been written by the loader, so its
+  // slots cannot be snapped yet -- that is the mid-snap state ClassifyImports retries, not a
+  // state the transaction may enter. Entering it is unrecoverable: Commit protects the page to
+  // PAGE_READWRITE (which really succeeds and returns previous=8) but VirtualQuery keeps
+  // reporting 8 until the first write, so CheckPage's exact-equality test fails before any
+  // write and the run lands in Recover with protections_restored false. Refuse by name instead.
+  for (const bool shared : {false, true}) {
+    Fixture fixture(shared, 8U);
+    const auto result = fixture.Apply();
+    CHECK(result.outcome == TransactionOutcome::NotStarted);
+    CHECK(result.original_error.has_value());
+    CHECK(result.original_error->operation.view() == "invalid_iat_page");
+    CHECK(result.original_error->stage == Stage::import_transaction);
+    CHECK(fixture.memory.writes == 0 && fixture.memory.protects == 0);
+    CHECK(fixture.memory.pointers == fixture.originals);
+    CHECK(!fixture.backend.kill);
+    HeldAndQuiet(fixture);
+  }
+}
+
 TEST("transaction.every_rollback_fault_retains_guard_and_initiating_error") {
   for (const bool shared : {false, true}) {
     Fixture baseline(shared);
@@ -271,12 +302,20 @@ TEST("transaction.every_rollback_fault_retains_guard_and_initiating_error") {
     const auto restored = baseline.Apply();
     Restored(baseline, restored);
     const int page_count = shared ? 1 : 4;
-    const int first_query = 9 + page_count + 1;
+    // Prologue queries: Capture issues one per mapping (4) plus one per page, CheckFactory
+    // issues one (ReadValue's Readable probe on the factory manager address), and Commit
+    // issues one per page before the injected write fault -- 5 + 2 * page_count in total,
+    // so the rollback phase begins at the next index. The previous constant 9 + page_count
+    // + 1 was fitted to the four-page layout and coincidentally correct only there; for the
+    // shared-page layout it exceeded the total query count and silently emptied the query
+    // loops (kinds 3 and 5). The CHECK(last >= first) below keeps that from recurring.
+    const int first_query = 5 + 2 * page_count + 1;
     for (int kind = 0; kind < 6; ++kind) {
       const int first = kind == 0 ? 3 : kind == 1 ? 10 : kind == 2 ? page_count + 1 :
         kind == 3 ? first_query : kind == 4 ? 10 : first_query;
       const int last = kind == 0 ? baseline.memory.writes : kind == 1 || kind == 4 ? baseline.memory.reads :
         kind == 2 ? baseline.memory.protects : baseline.memory.queries;
+      CHECK(last >= first);
       for (int fault = first; fault <= last; ++fault) {
         Fixture fixture(shared);
         fixture.memory.fail_write = 2;

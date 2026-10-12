@@ -47,11 +47,12 @@ public:
 
 class Memory final : public IWritableMemory {
 public:
-  explicit Memory(Backend& backend, bool shared) : backend(backend) {
+  explicit Memory(Backend& backend, bool shared, std::uint32_t initial = 2U) : backend(backend) {
     for (std::size_t index = 0; index < 4; ++index) {
       slots[index] = 0x10000ULL + (shared ? 0 : index * 0x1000ULL) + index * 8;
       pointers[index] = 0x50000ULL + index * 8;
-      protections[index] = 2U;
+      protections[index] = initial;
+      copy_on_write[index] = initial == 8U;
     }
     shared_pages = shared;
   }
@@ -89,7 +90,9 @@ public:
     ++writes;
     if (!backend.kill || bytes.size() != 8) ordering_violation = true;
     const auto page = PageIndex(address);
-    if (page == 4 || protections[page] != 4U) return Injected("write_not_writable");
+    if (page == 4 || (protections[page] != 4U && !write_granted[page]))
+      return Injected("write_not_writable");
+    if (copy_on_write[page]) { copy_on_write[page] = false; protections[page] = 4U; }
     for (std::size_t index = 0; index < 4; ++index) if (address == slots[index]) {
       if (writes == fail_write || writes == fail_second_write || (fail_rollback && writes > 2)) {
         pointers[index] ^= 0xFFULL;
@@ -111,7 +114,9 @@ public:
     const auto page = PageIndex(address);
     if (page == 4 || dead) return Injected("protect_address");
     const auto original = protections[page];
-    protections[page] = protection;
+    if (copy_on_write[page] && protection == 4U) write_granted[page] = true;
+    else if (!copy_on_write[page] && protection == 8U) write_granted[page] = false;
+    else protections[page] = protection;
     if (protects == fail_protect) return Injected("protect_fault");
     if (protects == wrong_previous) return 8U;
     return original;
@@ -146,11 +151,17 @@ public:
   int factory_after_read{}, change_original_after_read{};
   mutable Address manager{}, factory{};
   bool unreadable_factory{};
+  // Measured on Windows against a SEC_IMAGE mapping: VirtualProtect(PAGE_READWRITE) on an
+  // untouched PAGE_WRITECOPY page succeeds and returns previous=8, but VirtualQuery keeps
+  // reporting 8 until the page is actually written; the write makes the page private and it
+  // then reports 4 permanently -- VirtualProtect(PAGE_WRITECOPY) afterwards succeeds, returns
+  // previous=4, and leaves it reporting 4. copy_on_write/write_granted reproduce that.
+  std::array<bool, 4> copy_on_write{}, write_granted{};
   bool shared_pages{}, executable{}, fail_rollback{}, ordering_violation{}, dead{}, death_seen{};
 };
 
 struct Fixture {
-  explicit Fixture(bool shared = false) : memory(backend, shared) {
+  explicit Fixture(bool shared = false, std::uint32_t initial = 2U) : memory(backend, shared, initial) {
     const auto attached = session.Attach(owned);
     if (!IsOk(attached)) throw std::runtime_error("fixture_attach");
     auto stopped = session.WaitStopped({std::chrono::steady_clock::time_point{} + std::chrono::seconds(1)});

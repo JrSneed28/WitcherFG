@@ -123,7 +123,12 @@ class ReleaseTests(unittest.TestCase):
         for change in changes:
             with self.subTest(change=changes.index(change)):
                 self.rewrite(change)
-                self.assertTrue(release.verify_release(self.archive, self.identity, None))
+                # The first change plants "../private.txt", a path-traversal entry, in the shipped
+                # archive. Asserting only that *some* error occurred would keep passing if the name
+                # allowlist were dropped and an unrelated check happened to fire.
+                self.assertEqual(release.verify_release(self.archive, self.identity, None),
+                                 ([["archive names duplicate, unsafe, missing or outside allowlist"]] * 3 +
+                                  [["payload SHA256 manifest mismatch"]])[changes.index(change)])
 
     def test_executable_tampering_reaches_payload_sha_check(self):
         self.rewrite(lambda p: [(n, d + b"x" if n == "WitcherFG.exe" else d) for n, d in p])
@@ -132,7 +137,8 @@ class ReleaseTests(unittest.TestCase):
 
     def test_corrupt_zip_is_a_verification_error(self):
         self.archive.write_bytes(b"not a zip")
-        self.assertTrue(release.verify_release(self.archive, self.identity, None))
+        self.assertEqual(release.verify_release(self.archive, self.identity, None),
+                         ["archive verification failed: File is not a zip file"])
 
     def test_symlink_and_self_consistent_wrong_license_refuse_verification(self):
         self.package()
@@ -143,7 +149,10 @@ class ReleaseTests(unittest.TestCase):
                 if entry.filename == "WitcherFG.exe":
                     entry.external_attr = 0o120777 << 16
                 archive.writestr(entry, data)
-        self.assertTrue(release.verify_release(self.archive, self.identity, None))
+        # The symlink must be refused *as an entry type*. Truthiness also passed when the
+        # external-attribute check was absent and some unrelated error fired instead.
+        self.assertEqual(release.verify_release(self.archive, self.identity, None),
+                         ["unsupported archive entry type, bounds or compression"])
 
     def test_verifier_refuses_rehashed_wrong_license_config_and_stable_claim(self):
         for name, bad in (("LICENSE", b"wrong license\n"), ("FrameGenFix.toml", b"schema_version=2\n"),
@@ -159,7 +168,10 @@ class ReleaseTests(unittest.TestCase):
                 with zipfile.ZipFile(self.archive, "w") as archive:
                     for item, _ in entries:
                         archive.writestr(item, payload[item.filename])
-                self.assertTrue(release.verify_release(self.archive, self.identity, None))
+                self.assertEqual(release.verify_release(self.archive, self.identity, None),
+                                 [{"LICENSE": "project license mismatch",
+                                   "FrameGenFix.toml": "canonical default configuration mismatch",
+                                   "README.txt": "candidate/version/source ZIP warning missing"}[name]])
 
     def validation(self):
         return {"schema": 1, "version": self.identity["version"],
@@ -313,7 +325,10 @@ class ReleaseTests(unittest.TestCase):
     def test_toolchain_record_contains_actual_compiler_sdk_and_cmake_version(self):
         build = self.root / "build"
         build.mkdir()
-        (build / "CMakeCache.txt").write_text('CMAKE_GENERATOR:INTERNAL=Visual Studio 18 2026\nCMAKE_GENERATOR_PLATFORM:INTERNAL=x64\n', encoding="utf-8")
+        (build / "CMakeCache.txt").write_text(
+            'CMAKE_GENERATOR:INTERNAL=Visual Studio 18 2026\n'
+            'CMAKE_GENERATOR_PLATFORM:INTERNAL=x64\n'
+            'CMAKE_COMPILE_WARNING_AS_ERROR:BOOL=ON\n', encoding="utf-8")
         generated = build / "CMakeFiles/4.2.0"
         generated.mkdir(parents=True)
         (generated / "CMakeCXXCompiler.cmake").write_text('set(CMAKE_CXX_COMPILER_VERSION "19.51.36260.0")\n', encoding="utf-8")
@@ -322,6 +337,26 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(actual["msvc"], "19.51.36260.0")
         self.assertEqual(actual["windows_sdk"], "10.0.28000.0")
         self.assertEqual(actual["cmake"], "4.2.0")
+        # The manifest must be able to evidence the warning policy; input_digest cannot, because
+        # it covers source bytes only and is identical for a /WX and a non-/WX build.
+        self.assertEqual(actual["CMAKE_COMPILE_WARNING_AS_ERROR"], "ON")
+        self.assertIs(actual["warning_as_error"], True)
+
+    def test_toolchain_record_reports_warning_policy_absent_or_off(self):
+        for cache, expected in (("", False), ("CMAKE_COMPILE_WARNING_AS_ERROR:BOOL=OFF\n", False)):
+            with self.subTest(cache=cache):
+                build = self.root / ("build-" + str(len(cache)))
+                build.mkdir()
+                (build / "CMakeCache.txt").write_text(
+                    'CMAKE_GENERATOR:INTERNAL=Visual Studio 18 2026\n' + cache, encoding="utf-8")
+                generated = build / "CMakeFiles/4.2.0"
+                generated.mkdir(parents=True)
+                (generated / "CMakeCXXCompiler.cmake").write_text(
+                    'set(CMAKE_CXX_COMPILER_VERSION "19.51.36260.0")\n', encoding="utf-8")
+                (build / "WitcherFG.vcxproj").write_text(
+                    '<Project><WindowsTargetPlatformVersion>10.0.28000.0</WindowsTargetPlatformVersion></Project>',
+                    encoding="utf-8")
+                self.assertIs(release.record_toolchain(build)["warning_as_error"], expected)
 
     def test_tracked_render_check_detects_drift_without_writing(self):
         shutil.copyfile(ROOT / "README.md", self.root / "README.md")

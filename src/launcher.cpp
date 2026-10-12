@@ -52,6 +52,17 @@ Status FailureStatus(const Error& error) {
   }
 }
 Error Timeout(Stage stage){return {ErrorCode::TimedOut,stage,"launcher_deadline"};}
+// Each qualification pass re-verifies every loaded system module from scratch: Authenticode plus
+// catalog enumeration, and a backing-image byte-compare of the executable section and export
+// directory against live memory. Measured on this host at 6.9 ms per module warm and 17.8 ms
+// cold, so a target with 50-80 modules mapped costs roughly 0.5-1.5 s per pass. Retrying on
+// every debug event until the 60 s deadline therefore spends the entire budget re-verifying
+// identical modules and reports an opaque TimedOut. Twelve passes keeps the worst case within a
+// few seconds while still spanning far more loader events than a snap window needs. Replacing
+// this with per-module evidence cached on file identity, base and SizeOfImage would raise the
+// ceiling, but that caches a trust decision and belongs in its own reviewed change.
+constexpr int MaxQualificationPasses=12;
+Error QualificationBudget(Stage stage){return {ErrorCode::TimedOut,stage,"dependencies_qualification_budget"};}
 std::string HashText(const Hash256& hash){constexpr char digits[]="0123456789abcdef";std::string text;text.reserve(64);for(auto b:hash){const auto v=std::to_integer<unsigned>(b);text+=digits[v>>4];text+=digits[v&15];}return text;}
 void InventoryFacts(DiagnosticRecord& record,const RuntimeInventory& inventory) {
   record.game_package={inventory.package_name,Availability::Observed,"package_manifest",""};
@@ -267,6 +278,7 @@ RunResult RunLauncher(ILaunchEnvironment& env,std::stop_token external) {
     }
     event(stage,EventCode::StageCompleted,"debug_attach_completed");
     bool attach_ready{};
+    int qualification_passes{};
     for(;;) {
       stage=Stage::dependencies;
       if(expired()){refuse(Timeout(stage));return finish();}
@@ -281,6 +293,7 @@ RunResult RunLauncher(ILaunchEnvironment& env,std::stop_token external) {
           continue;
         }
       }
+      if(++qualification_passes>MaxQualificationPasses){refuse(QualificationBudget(stage));return finish();}
       event(stage,EventCode::Initialization,"dependencies_entered");
       const auto inventory=env.Inventory(*owned,*memory);
       if(expired()){refuse(Timeout(stage));return finish();}

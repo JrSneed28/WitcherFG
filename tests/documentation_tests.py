@@ -261,6 +261,26 @@ class PublicDocumentation(unittest.TestCase):
         for row in rows:
             self.assertIn(f"| {row['component']} | {format_matrix_status(row)} | {row['native_release_status']} |", display)
 
+    def test_technical_import_table_matches_the_compatibility_record(self):
+        """The import table carries 4 names, 4 RVAs and the selector form. Nothing tied those
+        values back to src/compatibility.cpp, which is exactly the drift a check like this
+        catches -- the ordinal-101 selector was missing from the table for that reason."""
+        source = (ROOT / "src/compatibility.cpp").read_text(encoding="utf-8")
+        record = re.search(r"\{\{\{\"d3d12\.dll\".*?\}\}\}", source, re.S)
+        self.assertIsNotNone(record, "import record not found in compatibility.cpp")
+        entries = re.findall(
+            r'\{"(?:d3d12|dxgi)\.dll",\s*"(\w+)",\s*"((?:d3d12|dxgi)\.dll)",\s*'
+            r'(0x[0-9A-Fa-f]+)U(?:,\s*PeOrdinal\{(\d+)\})?\}',
+            record.group(0))
+        self.assertEqual(len(entries), 4, entries)
+        table = (ROOT / "docs/TECHNICAL.md").read_text(encoding="utf-8")
+        for name, module, rva, ordinal in entries:
+            expected_selector = f"**Ordinal `{ordinal}`**" if ordinal else "Name"
+            row = (f"| `{name}` | `{module}` | `{rva.replace('0x', '0x').upper().replace('0X', '0x')}` "
+                   f"| {expected_selector} |")
+            self.assertIn(row, table,
+                          f"docs/TECHNICAL.md import row drifted from compatibility.cpp: {row}")
+
     def test_troubleshooting_covers_actual_stable_codes(self):
         path = ROOT / "docs/troubleshooting.md"
         self.assertTrue(path.is_file(), "canonical troubleshooting source missing")
@@ -268,6 +288,10 @@ class PublicDocumentation(unittest.TestCase):
         codes = set(re.findall(r'"(WFG-[EW]-[A-Z_]+)"', source))
         documented = set(re.findall(r"WFG-[EW]-[A-Z_]+", path.read_text(encoding="utf-8")))
         self.assertEqual(codes - documented, set())
+        # Checked in both directions. The table is the canonical public symptom/cause/action
+        # source and is rendered into the offline TROUBLESHOOTING.txt, so a documented code
+        # the launcher never emits tells a player to act on something that cannot happen.
+        self.assertEqual(documented - codes, set())
 
     def test_bug_form_requires_reproducible_nonprivate_fields(self):
         path = ROOT / ".github/ISSUE_TEMPLATE/bug_report.yml"

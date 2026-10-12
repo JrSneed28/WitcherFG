@@ -288,9 +288,16 @@ TEST("launcher.binding_progresses_only_after_resolved_next_stop") {
   CHECK(result.status==Status::Applied);CHECK(f.inventories==2);CHECK(f.memory.writes==4);CHECK(result.detach==DetachOutcome::Detached);
 }
 TEST("launcher.binding_unresolved_is_bounded_and_never_writes") {
+  // "Bounded" previously meant only "the 60 s deadline eventually fires". Each pass re-runs the
+  // whole qualification from scratch -- Authenticode plus catalog enumeration and a backing-image
+  // byte-compare for every loaded system module -- which measures at 6.9 ms per module warm and
+  // 17.8 ms cold, so 50-80 modules cost roughly 0.5-1.5 s per pass. Thousands of passes cannot
+  // fit, and spending the entire budget re-verifying identical modules is what produced an
+  // opaque TimedOut instead of a prompt diagnosable refusal. Assert a real upper bound.
   Fixture f;f.binding_sequence=true;f.unresolved_inventories=2000;
   const auto result=RunLauncher(f,{});
-  CHECK(result.status==Status::TimedOut);CHECK(f.inventories>1);CHECK(f.memory.writes==0&&f.memory.protects==0);CHECK(result.detach==DetachOutcome::Detached);CHECK(!f.storage.summary.empty());
+  CHECK(result.status==Status::TimedOut);CHECK(f.inventories>1&&f.inventories<=12);
+  CHECK(f.memory.writes==0&&f.memory.protects==0);CHECK(result.detach==DetachOutcome::Detached);CHECK(!f.storage.summary.empty());
 }
 
 TEST("launcher.startup_handshake_skips_replayed_events") {

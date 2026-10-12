@@ -231,6 +231,12 @@ DEBUG_EVENT Breakpoint(wfg::Address address = ntdll_base + 0x600, DWORD tid = 7)
   event.u.Exception.ExceptionRecord.ExceptionAddress = reinterpret_cast<void*>(address);
   event.u.Exception.dwFirstChance = 1; return event;
 }
+DEBUG_EVENT OtherException(DWORD code, wfg::Address address = ntdll_base + 0x600, DWORD tid = 7) {
+  auto event = Event(EXCEPTION_DEBUG_EVENT); event.dwThreadId = tid;
+  event.u.Exception.ExceptionRecord.ExceptionCode = code;
+  event.u.Exception.ExceptionRecord.ExceptionAddress = reinterpret_cast<void*>(address);
+  event.u.Exception.dwFirstChance = 1; return event;
+}
 }
 TEST("debug.native_identifies_target_export_not_local_address_and_only_once") {
   model = {}; Ntdll(); NativeDebugBackend backend; auto owned = Owned();
@@ -248,15 +254,40 @@ TEST("debug.native_missing_dll_file_uses_verified_remote_module_path") {
   REQUIRE_OK(backend.Continue(initial, Continuation::Handled)); REQUIRE_OK(backend.Detach());
 }
 TEST("debug.native_rejects_wrong_export_thread_chance_path_and_late_breakpoint") {
-  for (int variant = 0; variant < 5; ++variant) {
+  for (int variant = 0; variant < 4; ++variant) {
     model = {}; Ntdll(); if (variant == 3) model.system_path = false;
     NativeDebugBackend backend; auto owned = Owned(); REQUIRE_OK(backend.Attach(owned)); REQUIRE_OK(backend.SetKillOnExit(false)); InitialEvents(backend);
     auto event = Breakpoint(variant == 0 ? ntdll_base + 0x601 : ntdll_base + 0x600, variant == 1 ? 8U : 7U);
     if (variant == 2) event.u.Exception.dwFirstChance = 0;
-    if (variant == 4) { model.events.push_back(Breakpoint(ntdll_base + 0x601)); auto earlier = Waited(backend); REQUIRE_OK(backend.Continue(earlier, Continuation::NotHandled)); }
     model.events.push_back(event); auto stop = Waited(backend); CHECK(!stop.attach_breakpoint_identity);
     REQUIRE_ERROR(backend.Continue(stop, Continuation::Handled), ErrorCode::DebugFailure);
     REQUIRE_OK(backend.Continue(stop, Continuation::NotHandled)); REQUIRE_OK(backend.Detach());
+  }
+}
+TEST("debug.native_attach_handshake_survives_earlier_exceptions") {
+  // The one-shot latch must be burned by the handshake itself, not by the first exception of
+  // any kind. The launcher attaches with DebugActiveProcess to an already-running, un-suspended
+  // game, so a live thread can win the race with DBG_PRINTEXCEPTION_C from OutputDebugString,
+  // the 0x406D1388 thread-naming exception, an ordinary first-chance probe, or a breakpoint at
+  // some other address. Any of those previously defeated the genuine attach breakpoint that
+  // followed, leaving attach_ready false until the deadline and refusing TimedOut. The identity
+  // check does not rely on ordering: it already pins pid, process_created, EXCEPTION_BREAKPOINT,
+  // first chance, the measured DbgUiRemoteBreakin address and the initial or break-in thread.
+  for (int variant = 0; variant < 4; ++variant) {
+    model = {}; Ntdll(); NativeDebugBackend backend; auto owned = Owned();
+    REQUIRE_OK(backend.Attach(owned)); REQUIRE_OK(backend.SetKillOnExit(false)); InitialEvents(backend);
+    model.events.push_back(variant == 3 ? Breakpoint(ntdll_base + 0x601)
+      : OtherException(variant == 0 ? 0x40010006U : variant == 1 ? 0x406D1388U : 0xC0000005U));
+    auto earlier = Waited(backend); CHECK(!earlier.attach_breakpoint_identity);
+    REQUIRE_OK(backend.Continue(earlier, Continuation::NotHandled));
+    model.events.push_back(Breakpoint());
+    auto initial = Waited(backend); CHECK(initial.attach_breakpoint_identity);
+    REQUIRE_OK(backend.Continue(initial, Continuation::Handled));
+    // One-shot is still one-shot: a second genuine breakpoint is not a second handshake.
+    model.events.push_back(Breakpoint());
+    auto later = Waited(backend); CHECK(!later.attach_breakpoint_identity);
+    REQUIRE_OK(backend.Continue(later, Continuation::NotHandled));
+    REQUIRE_OK(backend.Detach());
   }
 }
 TEST("debug.native_identifies_remote_breakin_thread_using_target_export") {

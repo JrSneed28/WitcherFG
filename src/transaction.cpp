@@ -60,8 +60,15 @@ public:
       const Address page = mapping.slot & ~static_cast<Address>(PageSize - 1);
       const auto region = memory_.Query(mapping.slot);
       if (!IsOk(region)) return AtSlot(Failure(region), slot);
+      // PAGE_WRITECOPY (8) is deliberately NOT accepted. A page still reporting copy-on-write
+      // has not been written by the loader, so the imports on it cannot be snapped yet -- that
+      // is the mid-snap state ClassifyImports retries. Entering the transaction there cannot
+      // succeed: protecting the page to PAGE_READWRITE really succeeds and returns previous=8,
+      // but the page keeps reporting 8 until the first write, so CheckPage's exact-equality
+      // test fails before anything is written and the run lands in Recover with
+      // protections_restored false. Refusing by name keeps that a diagnosable refusal.
       if (!Covers(Value(region), page, PageSize) ||
-          (Value(region).protection != 2 && Value(region).protection != 4 && Value(region).protection != 8))
+          (Value(region).protection != 2 && Value(region).protection != 4))
         return TransactionError("invalid_iat_page", slot);
       std::size_t index{};
       while (index < result_.page_count && result_.pages[index].page != page) ++index;

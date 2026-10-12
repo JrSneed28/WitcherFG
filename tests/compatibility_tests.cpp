@@ -322,14 +322,40 @@ TEST("compatibility.binding_all_four_exact_loader_tokens_are_not_ready") {
   CHECK(f.memory.write_count()==0&&f.memory.protect_count()==0);
   f.SetAllImportsToNative();CHECK(IsOk(ValidateBuild(f.memory,f.inventory,f.SyntheticBuild())));
 }
-TEST("compatibility.binding_partial_or_foreign_tokens_are_terminal") {
+TEST("compatibility.binding_partial_snap_is_retryable_and_foreign_tokens_terminal") {
+  // The four mappings span two import descriptors (one d3d12.dll entry bound by ordinal, three
+  // dxgi.dll entries) and the loader snaps descriptors one at a time, so a state in which some
+  // slots are snapped and others still hold their INT lookup token is the ordinary mid-snap
+  // window -- exactly what the readiness retry exists to tolerate. A slot equal to its lookup
+  // token is unambiguously unsnapped, so routing is not yet determinate and retrying writes
+  // nothing and loses no safety. A pointer that is neither native, interposer, nor the lookup
+  // token is a foreign hook and stays terminal.
   for(unsigned index=0;index<4;++index)for(unsigned mode=0;mode<3;++mode) {
     SupportedRuntimeFixture f;const auto mapping=f.SyntheticBuild().mappings[index];
     auto bytes=f.memory.Read(f.inventory.executable.image.base+mapping.rva,8);CHECK(IsOk(bytes));Address native{};std::memcpy(&native,Value(bytes).data(),8);
     f.SetAllImportsUnresolved();f.SetImportPointer(mapping.import_name,mode==0?native:mode==1?f.InterposerExport(mapping.import_name):f.foreign_hook);
-    const auto refused=ValidateBuild(f.memory,f.inventory,f.SyntheticBuild());REQUIRE_ERROR(refused,ErrorCode::UnexpectedImports);
+    const auto refused=ValidateBuild(f.memory,f.inventory,f.SyntheticBuild());
+    if(mode==2) {
+      REQUIRE_ERROR(refused,ErrorCode::UnexpectedImports);
+      CHECK(Failure(refused).operation.view()=="import_provenance");
+    } else {
+      REQUIRE_ERROR(refused,ErrorCode::ModuleNotReady);
+      CHECK(Failure(refused).operation.view()=="import_binding_not_ready");
+    }
     CHECK(f.memory.write_count()==0&&f.memory.protect_count()==0);
   }
+}
+
+TEST("compatibility.binding_determinate_mixed_routing_stays_terminal") {
+  // With no slot left unsnapped, routing IS determinate, and a mix of native and interposer
+  // pointers must never become a permissible write. That all-or-nothing rule is unchanged.
+  SupportedRuntimeFixture f;const auto mapping=f.SyntheticBuild().mappings[1];
+  f.SetAllImportsToNative();
+  f.SetImportPointer(mapping.import_name,f.InterposerExport(mapping.import_name));
+  const auto refused=ValidateBuild(f.memory,f.inventory,f.SyntheticBuild());
+  REQUIRE_ERROR(refused,ErrorCode::UnexpectedImports);
+  CHECK(Failure(refused).operation.view()=="mixed_routing");
+  CHECK(f.memory.write_count()==0&&f.memory.protect_count()==0);
 }
 TEST("compatibility.binding_readiness_preserves_factory_and_identity_guards") {
   SupportedRuntimeFixture created;created.SetAllImportsUnresolved();created.SetFactory(created.native_factory);

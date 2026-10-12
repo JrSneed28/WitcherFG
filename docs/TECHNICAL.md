@@ -32,12 +32,26 @@ flowchart TD
 | Fingerprint at RVA `0x1CB061D`, 32 bytes | `88f7cb6bdd8c6d3285de7ab6688c00d98d10d189e2906136aa8432b5afe3e736` |
 | Factory guard | Manager pointer RVA `0x5A75F30`, member offset `0x302F568`; must be readable and null |
 
-| Import | Native module | IAT RVA | Replacement |
-| --- | --- | --- | --- |
-| `D3D12CreateDevice` | `d3d12.dll` | `0x2B52450` | Matching export in verified `sl.interposer.dll` |
-| `CreateDXGIFactory1` | `dxgi.dll` | `0x2B524D0` | Matching export in verified `sl.interposer.dll` |
-| `CreateDXGIFactory2` | `dxgi.dll` | `0x2B524D8` | Matching export in verified `sl.interposer.dll` |
-| `CreateDXGIFactory` | `dxgi.dll` | `0x2B524E0` | Matching export in verified `sl.interposer.dll` |
+| Import | Native module | IAT RVA | Import selector | Replacement |
+| --- | --- | --- | --- | --- |
+| `D3D12CreateDevice` | `d3d12.dll` | `0x2B52450` | **Ordinal `101`** | Matching export in verified `sl.interposer.dll` |
+| `CreateDXGIFactory1` | `dxgi.dll` | `0x2B524D0` | Name | Matching export in verified `sl.interposer.dll` |
+| `CreateDXGIFactory2` | `dxgi.dll` | `0x2B524D8` | Name | Matching export in verified `sl.interposer.dll` |
+| `CreateDXGIFactory` | `dxgi.dll` | `0x2B524E0` | Name | Matching export in verified `sl.interposer.dll` |
+
+The four mappings span **two** import descriptors: the single `d3d12.dll` entry and the three
+`dxgi.dll` entries. The Windows loader snaps descriptors one at a time, so a state in which one
+descriptor is snapped and the other still holds its Import Name Table lookup tokens is an
+ordinary transient, and the launcher retries it rather than refusing.
+
+The import selector is part of the record, not a presentation detail. `D3D12CreateDevice` is
+imported **by ordinal**, which was measured from the live game's IAT (its typed INT token is
+`0x8000000000000065` — the ordinal flag or'd with 101). That entry therefore takes a different
+code path: an ordinal lookup, a refusal with `ambiguous_import_selector` if a *named*
+`D3D12CreateDevice` import is also present, and then `BindExportOrdinal` against the verified
+native module. A new compatibility record that measured only the four names and four RVAs would
+silently lose the ordinal binding on the import whose provenance guard is strictest, so record
+the selector form alongside the RVA.
 
 The source record is in [compatibility.cpp](../src/compatibility.cpp). Unknown executables, mixed/unexpected import routing, unresolved trust or conflicting local DLLs refuse before writes. A raw signed-game hash and game ACL changes are not required. The four-import intervention was sufficient in the local probe; the minimum necessary subset is not established.
 

@@ -63,6 +63,41 @@ TEST("process.package_helper_resolves_exact_pc_game_target") {
   PackageDocuments f;
   CHECK(REQUIRE_OK(f.Resolve())==(f.root/L"bin\\Gaming.Desktop.x64\\witcher3.exe").wstring());
 }
+TEST("process.package_manifest_root_must_be_the_foundation_package_element") {
+  // The root guard at the top of ManifestExecutable had no test. Everything downstream -- the
+  // Identity, Applications and Application shape checks -- keys off depth and parent names that
+  // only mean what they appear to mean if the document root really is the windows10 foundation
+  // <Package> element. A bundle manifest or a foreign namespace reaching those checks would be
+  // interpreted against the wrong schema.
+  {
+    // Wrong root element name.
+    PackageDocuments f;
+    PackageDocuments::Replace(f.manifest, "<Package ", "<Bundle ");
+    PackageDocuments::Replace(f.manifest, "</Package>", "</Bundle>");
+    const auto refused = f.Resolve();
+    REQUIRE_ERROR(refused, wfg::ErrorCode::UnsupportedBuild);
+    CHECK(wfg::Failure(refused).operation.view() == "manifest_root");
+  }
+  {
+    // Right element name, wrong namespace.
+    PackageDocuments f;
+    PackageDocuments::Replace(f.manifest,
+      "http://schemas.microsoft.com/appx/manifest/foundation/windows10",
+      "http://schemas.microsoft.com/appx/manifest/bundle/windows10");
+    const auto refused = f.Resolve();
+    REQUIRE_ERROR(refused, wfg::ErrorCode::UnsupportedBuild);
+    CHECK(wfg::Failure(refused).operation.view() == "manifest_root");
+  }
+  {
+    // Foundation <Package> present but nested under another root, so it is not at depth 0.
+    PackageDocuments f;
+    PackageDocuments::Replace(f.manifest, "<Package ", "<Wrapper><Package ");
+    PackageDocuments::Replace(f.manifest, "</Package>", "</Package></Wrapper>");
+    const auto refused = f.Resolve();
+    REQUIRE_ERROR(refused, wfg::ErrorCode::UnsupportedBuild);
+    CHECK(wfg::Failure(refused).operation.view() == "manifest_root");
+  }
+}
 TEST("process.package_direct_manifest_retains_valid_resolution_without_config") {
   PackageDocuments f;PackageDocuments::Replace(f.manifest,"GameLaunchHelper.exe","bin\\Gaming.Desktop.x64\\witcher3.exe");
   CHECK(REQUIRE_OK(f.Resolve(false))==(f.root/L"bin\\Gaming.Desktop.x64\\witcher3.exe").wstring());
@@ -546,15 +581,45 @@ TEST("process.owned_observation_duplicate_keeps_identity_and_reduces_rights") {
 TEST("process.startup_readiness_skips_full_qualification_until_present") {
   SupportedRuntimeFixture f;unsigned inspections{};
   const auto inspect=[&]() -> wfg::Result<wfg::RuntimeInventory> {++inspections;return f.inventory;};
+  const auto clean=[]() -> wfg::Result<wfg::Unit> {return wfg::Unit{};};
   std::vector<std::string> names{"witcher3.exe","d3d12.dll","dxgi.dll"};
-  const auto missing=wfg::process_detail::CompleteStartupInventory(names,inspect);
+  const auto missing=wfg::process_detail::CompleteStartupInventory(names,clean,inspect);
   REQUIRE_ERROR(missing,wfg::ErrorCode::ModuleNotReady);CHECK(inspections==0);
-  names.push_back("SL.INTERPOSER.DLL");const auto ready=wfg::process_detail::CompleteStartupInventory(names,inspect);
+  names.push_back("SL.INTERPOSER.DLL");const auto ready=wfg::process_detail::CompleteStartupInventory(names,clean,inspect);
   CHECK(wfg::IsOk(ready));CHECK(inspections==1);
+}
+TEST("process.startup_readiness_reports_conflicts_before_the_presence_gate") {
+  // The cheap presence check used to run first and short-circuit everything, so a user whose
+  // application-local d3d12.dll or dxgi.dll proxy PREVENTS sl.interposer.dll from loading hit
+  // the gate, no conflict guard ran, application_local_loaders stayed empty, and
+  // ClassifyLoaderConflicts then affirmatively reported no conflict. The launcher retried in
+  // silence to the deadline and refused an opaque TimedOut -- for precisely the population most
+  // likely to hit it, and the spec's unsupported_or_conflicting_refusal row requires a named
+  // refusal before any write. The conflict pre-pass must therefore run even when the gate will
+  // refuse, while still being cheap enough to repeat on every retry pass.
+  SupportedRuntimeFixture f;unsigned inspections{},prechecks{};
+  const auto inspect=[&]() -> wfg::Result<wfg::RuntimeInventory> {++inspections;return f.inventory;};
+  const auto conflicted=[&]() -> wfg::Result<wfg::Unit> {
+    ++prechecks;
+    return wfg::Error{wfg::ErrorCode::DllConflict,wfg::Stage::dependencies,"native_module_location"};
+  };
+  // sl.interposer.dll absent: the presence gate alone would have said startup_modules_missing.
+  std::vector<std::string> names{"witcher3.exe","d3d12.dll","dxgi.dll"};
+  const auto refused=wfg::process_detail::CompleteStartupInventory(names,conflicted,inspect);
+  REQUIRE_ERROR(refused,wfg::ErrorCode::DllConflict);
+  CHECK(wfg::Failure(refused).operation.view()=="native_module_location");
+  CHECK(prechecks==1&&inspections==0);
+  // With no conflict the gate still governs, and the retryable refusal is unchanged.
+  const auto clean=[&]() -> wfg::Result<wfg::Unit> {++prechecks;return wfg::Unit{};};
+  const auto retry=wfg::process_detail::CompleteStartupInventory(names,clean,inspect);
+  REQUIRE_ERROR(retry,wfg::ErrorCode::ModuleNotReady);
+  CHECK(wfg::Failure(retry).operation.view()=="startup_modules_missing");
+  CHECK(prechecks==2&&inspections==0);
 }
 TEST("process.startup_readiness_requires_each_provider_and_preserves_failure") {
   const std::array<std::string,3> all{"d3d12.dll","dxgi.dll","sl.interposer.dll"};
   unsigned inspections{};const auto inspect=[&]() -> wfg::Result<wfg::RuntimeInventory> {++inspections;return wfg::Error{wfg::ErrorCode::UntrustedInterposer,wfg::Stage::dependencies,"fixture_provider_untrusted"};};
-  for(std::size_t omit=0;omit<all.size();++omit){std::vector<std::string> names;for(std::size_t i=0;i<all.size();++i)if(i!=omit)names.push_back(all[i]);const auto missing=wfg::process_detail::CompleteStartupInventory(names,inspect);REQUIRE_ERROR(missing,wfg::ErrorCode::ModuleNotReady);}
-  CHECK(inspections==0);const auto untrusted=wfg::process_detail::CompleteStartupInventory(all,inspect);REQUIRE_ERROR(untrusted,wfg::ErrorCode::UntrustedInterposer);CHECK(inspections==1);
+  const auto clean=[]() -> wfg::Result<wfg::Unit> {return wfg::Unit{};};
+  for(std::size_t omit=0;omit<all.size();++omit){std::vector<std::string> names;for(std::size_t i=0;i<all.size();++i)if(i!=omit)names.push_back(all[i]);const auto missing=wfg::process_detail::CompleteStartupInventory(names,clean,inspect);REQUIRE_ERROR(missing,wfg::ErrorCode::ModuleNotReady);}
+  CHECK(inspections==0);const auto untrusted=wfg::process_detail::CompleteStartupInventory(all,clean,inspect);REQUIRE_ERROR(untrusted,wfg::ErrorCode::UntrustedInterposer);CHECK(inspections==1);
 }

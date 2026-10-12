@@ -7,6 +7,8 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <cstdint>
+#include <optional>
 #include <string>
 #ifdef _WIN32
 #define NOMINMAX
@@ -15,6 +17,26 @@
 #include <sddl.h>
 #include <shlobj.h>
 #endif
+
+namespace {
+// std::getenv raises C4996 under MSVC's secure-CRT deprecation warnings, and this target now
+// builds with warnings as errors like every other target. Read the variable through the Win32
+// API instead of suppressing the diagnostic.
+std::optional<std::string> EnvironmentValue(const char* name) {
+#ifdef _WIN32
+  const auto size = GetEnvironmentVariableA(name, nullptr, 0);
+  if (size == 0) return std::nullopt;
+  std::string value(size, '\0');
+  const auto written = GetEnvironmentVariableA(name, value.data(), size);
+  if (written == 0 || written >= size) return std::nullopt;
+  value.resize(written);
+  return value;
+#else
+  static_cast<void>(name);
+  return std::nullopt;
+#endif
+}
+}  // namespace
 
 namespace {
 wfg::Error SupportError() { return {wfg::ErrorCode::SupportBundleFailure, wfg::Stage::Support, "SupportFixture", {}, {}}; }
@@ -64,8 +86,8 @@ public:
     if (fail_write) return SupportError();
     archive.assign(reinterpret_cast<const char*>(bytes.data()), bytes.size());
     ++commits;
-    const auto* selected = std::getenv("WFG_SUPPORT_FIXTURE");
-    output = selected ? std::filesystem::path(selected) : std::filesystem::temp_directory_path() / "wfg-support-fixture.zip";
+    const auto selected = EnvironmentValue("WFG_SUPPORT_FIXTURE");
+    output = selected ? std::filesystem::path(*selected) : std::filesystem::temp_directory_path() / "wfg-support-fixture.zip";
     std::ofstream file(output, std::ios::binary); file.write(archive.data(), static_cast<std::streamsize>(archive.size()));
     if (!file) return SupportError();
     return output;
@@ -323,7 +345,7 @@ void RefusesBeforeRootOpen(wfg::WindowsSupportStorage& storage) {
   const auto summary = storage.OpenSanitizedSummary();
   REQUIRE_ERROR(summary,wfg::ErrorCode::SupportBundleFailure);
   CHECK(wfg::Failure(summary).operation.view() == "SupportLocalStorageRequired");
-  CHECK(wfg::Failure(summary).native_code == ERROR_NOT_SUPPORTED);
+  CHECK(wfg::Failure(summary).native_code == static_cast<std::uint32_t>(ERROR_NOT_SUPPORTED));
   CHECK(storage.root_open_attempts == 0);
   REQUIRE_ERROR(storage.OpenRecentEvents(),wfg::ErrorCode::SupportBundleFailure);
   CHECK(storage.root_open_attempts == 0);
@@ -333,7 +355,7 @@ void RefusesBeforeRootOpen(wfg::WindowsSupportStorage& storage) {
   const auto collected = wfg::CollectSupport(Inputs(),storage);
   REQUIRE_ERROR(collected,wfg::ErrorCode::SupportBundleFailure);
   CHECK(wfg::Failure(collected).operation.view() == "SupportLocalStorageRequired");
-  CHECK(wfg::Failure(collected).native_code == ERROR_NOT_SUPPORTED);
+  CHECK(wfg::Failure(collected).native_code == static_cast<std::uint32_t>(ERROR_NOT_SUPPORTED));
   CHECK(storage.root_open_attempts == 0);
 }
 }
@@ -555,8 +577,8 @@ TEST("support.native_real_producer_zip_for_independent_python") {
     wfg::WindowsSupportStorage storage(fixture.root);
     const auto bundle = REQUIRE_OK(wfg::CollectSupport(Inputs(),storage));
     CHECK(before == ReadFileText(fixture.root / L"diagnostics" / L"last-run.json"));
-    const auto* selected = std::getenv("WFG_SUPPORT_NATIVE_FIXTURE"); CHECK(selected != nullptr);
-    std::filesystem::copy_file(bundle.local_output,selected,std::filesystem::copy_options::overwrite_existing);
+    const auto selected = EnvironmentValue("WFG_SUPPORT_NATIVE_FIXTURE"); CHECK(selected.has_value());
+    std::filesystem::copy_file(bundle.local_output,*selected,std::filesystem::copy_options::overwrite_existing);
   }
 }
 #endif

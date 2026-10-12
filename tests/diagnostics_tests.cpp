@@ -531,6 +531,27 @@ TEST("diagnostics.rotation_prunes_files_exceeding_a_reduced_size_limit") {
   }
 }
 
+TEST("diagnostics.stale_temporary_does_not_wedge_later_summary_writes") {
+  // Three paths terminate a run without unwinding -- the watchdog's _Exit(124), the environment
+  // helper exit, and TerminateProcess on self -- so neither the fail() cleanup nor the rename
+  // runs and the temporary survives. With one fixed temporary name opened FILE_CREATE, every
+  // later run then failed summary_open with ERROR_FILE_EXISTS and last-run.json was never
+  // updated again. Nothing in the tree cleans the stale file and nothing tells the player to
+  // delete it, so a single force-exit permanently blinded the diagnostics summary.
+  StorageFixture fixture;
+  wfg::FileLogStorage storage(fixture.path / "diagnostics");
+  StorageFixture::Write(fixture.path / "diagnostics" / "last-run.json.tmp", "{\"stale\":true}");
+  CHECK(wfg::IsOk(storage.WriteSummaryAtomically("{\"run\":1}")));
+  CHECK(StorageFixture::Read(fixture.path / "diagnostics" / "last-run.json") == "{\"run\":1}");
+  // Not a one-shot: the next run must still be able to publish its summary.
+  CHECK(wfg::IsOk(storage.WriteSummaryAtomically("{\"run\":2}")));
+  CHECK(StorageFixture::Read(fixture.path / "diagnostics" / "last-run.json") == "{\"run\":2}");
+  // A successful write leaves no temporary of its own behind.
+  unsigned temporaries{};
+  for (const auto& entry : std::filesystem::directory_iterator(fixture.path / "diagnostics"))
+    if (entry.path().filename() != "last-run.json" && entry.path().filename() != "last-run.json.tmp") ++temporaries;
+  CHECK(temporaries == 0);
+}
 TEST("diagnostics.storage_refuses_linked_event_and_temporary_files") {
   StorageFixture fixture;
   const auto outside = fixture.path / "outside.txt";
@@ -539,8 +560,17 @@ TEST("diagnostics.storage_refuses_linked_event_and_temporary_files") {
   std::filesystem::create_hard_link(outside, fixture.path / "diagnostics" / "events.jsonl");
   CHECK(!wfg::IsOk(storage.AppendEvent("{\"event\":true}", 1, 2)));
   CHECK(StorageFixture::Read(outside) == "private sentinel");
+  // The temporary name is unpredictable per write, so a link planted at the old fixed name can
+  // no longer be the write target at all -- the attack is gone by construction rather than by
+  // refusal. FILE_CREATE still refuses any name that already exists, and the destination is
+  // still validated as a regular single-link file, so the sentinel stays private either way.
   std::filesystem::create_hard_link(outside, fixture.path / "diagnostics" / "last-run.json.tmp");
-  CHECK(!wfg::IsOk(storage.WriteSummaryAtomically("{\"run\":2}")));
+  CHECK(wfg::IsOk(storage.WriteSummaryAtomically("{\"run\":2}")));
+  CHECK(StorageFixture::Read(outside) == "private sentinel");
+  // Planting at the destination itself must still refuse, and must not write through the link.
+  std::filesystem::remove(fixture.path / "diagnostics" / "last-run.json");
+  std::filesystem::create_hard_link(outside, fixture.path / "diagnostics" / "last-run.json");
+  CHECK(!wfg::IsOk(storage.WriteSummaryAtomically("{\"run\":3}")));
   CHECK(StorageFixture::Read(outside) == "private sentinel");
 }
 
@@ -569,7 +599,9 @@ TEST("diagnostics.storage_refuses_symlink_file_escape") {
     std::cout << "SKIP file symlink creation: " << error.message() << '\n';
     return;
   }
-  std::filesystem::create_symlink(outside, fixture.path / "diagnostics" / "last-run.json.tmp");
+  // Same reasoning as the hard-link case: pin the symlink at the destination, which is the name
+  // the launcher still opens and still validates.
+  std::filesystem::create_symlink(outside, fixture.path / "diagnostics" / "last-run.json");
   wfg::FileLogStorage storage(fixture.path / "diagnostics");
   CHECK(!wfg::IsOk(storage.AppendEvent("event", 1, 2)));
   CHECK(!wfg::IsOk(storage.WriteSummaryAtomically("{\"run\":2}")));
