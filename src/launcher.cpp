@@ -52,17 +52,18 @@ Status FailureStatus(const Error& error) {
   }
 }
 Error Timeout(Stage stage){return {ErrorCode::TimedOut,stage,"launcher_deadline"};}
-// Each qualification pass re-verifies every loaded system module from scratch: Authenticode plus
-// catalog enumeration, and a backing-image byte-compare of the executable section and export
-// directory against live memory. Measured on this host at 6.9 ms per module warm and 17.8 ms
-// cold, so a target with 50-80 modules mapped costs roughly 0.5-1.5 s per pass. Retrying on
-// every debug event until the 60 s deadline therefore spends the entire budget re-verifying
-// identical modules and reports an opaque TimedOut. Twelve passes keeps the worst case within a
-// few seconds while still spanning far more loader events than a snap window needs. Replacing
-// this with per-module evidence cached on file identity, base and SizeOfImage would raise the
-// ceiling, but that caches a trust decision and belongs in its own reviewed change.
-constexpr int MaxQualificationPasses=12;
-Error QualificationBudget(Stage stage){return {ErrorCode::TimedOut,stage,"dependencies_qualification_budget"};}
+// Per-pass qualification cost, measured on this host: Authenticode plus catalog verification
+// is 17.8 ms per module cold and 6.85 ms warm, so a target with 50-80 modules mapped costs
+// roughly 0.5-1.5 s per pass before VerifyBackingImage's SEC_IMAGE map, relocation parse and
+// byte-compare. That cost repeats on every retry because nothing is cached.
+//
+// A pass-count cap was tried and REVERTED on live evidence. Counting every loop iteration
+// refused at 12.6 s with the interposer never loaded; counting only qualified passes still
+// refused at 30.8 s during import binding. Real startups on this build took 8.8-55.9 s, so any
+// small cap refuses a game that is merely still loading. The 60 s work deadline is the bound.
+// The real fix is per-module evidence cached on file identity, base and SizeOfImage, which
+// makes each retry cheap instead of capping how many may run; it caches a trust decision and
+// belongs in its own reviewed change.
 std::string HashText(const Hash256& hash){constexpr char digits[]="0123456789abcdef";std::string text;text.reserve(64);for(auto b:hash){const auto v=std::to_integer<unsigned>(b);text+=digits[v>>4];text+=digits[v&15];}return text;}
 void InventoryFacts(DiagnosticRecord& record,const RuntimeInventory& inventory) {
   record.game_package={inventory.package_name,Availability::Observed,"package_manifest",""};
@@ -278,7 +279,6 @@ RunResult RunLauncher(ILaunchEnvironment& env,std::stop_token external) {
     }
     event(stage,EventCode::StageCompleted,"debug_attach_completed");
     bool attach_ready{};
-    int qualification_passes{};
     for(;;) {
       stage=Stage::dependencies;
       if(expired()){refuse(Timeout(stage));return finish();}
@@ -296,16 +296,8 @@ RunResult RunLauncher(ILaunchEnvironment& env,std::stop_token external) {
       event(stage,EventCode::Initialization,"dependencies_entered");
       const auto inventory=env.Inventory(*owned,*memory);
       if(expired()){refuse(Timeout(stage));return finish();}
-      // Charge the budget only for passes that actually qualified. CompleteStartupInventory
-      // refuses startup_modules_missing BEFORE inspect() runs, so such a pass costs a module
-      // path scan and the two path-only conflict guards -- none of the Authenticode, catalog
-      // enumeration or backing-image comparison the budget exists to bound. A real target
-      // produces many of those events before Streamline is loaded, so charging them refused
-      // long before the game could possibly be ready.
-      if(IsOk(inventory)||Failure(inventory).operation.view()!="startup_modules_missing") ++qualification_passes;
       if(!IsOk(inventory)) {
         if(Failure(inventory).code==ErrorCode::ModuleNotReady) {
-          if(qualification_passes>MaxQualificationPasses){refuse(QualificationBudget(stage));return finish();}
           const auto continued=session->Continue(stop,stop.continuation());
           if(!IsOk(continued)){refuse(Failure(continued));return finish();}
           continue;
@@ -320,7 +312,6 @@ RunResult RunLauncher(ILaunchEnvironment& env,std::stop_token external) {
       if(!IsOk(validated)) {
         if(Failure(validated).code==ErrorCode::ModuleNotReady&&Failure(validated).operation.view()=="import_binding_not_ready") {
           if(expired()){refuse(Timeout(stage));return finish();}
-          if(qualification_passes>MaxQualificationPasses){refuse(QualificationBudget(stage));return finish();}
           const auto continued=session->Continue(stop,stop.continuation());
           if(!IsOk(continued)){refuse(Failure(continued));return finish();}
           continue;
