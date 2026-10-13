@@ -1,0 +1,61 @@
+{
+  "schema": 1,
+  "version": "0.1.0-preview.1",
+  "artifact_sha256": "f23bc377c77893635788735048b1f7053833e6de638057866f6f41f873806477",
+  "binary_sha256": "e4a1558d1a752fe1d94743a47137871a3a604a072680bc1362aa99ba013e1a39",
+  "source_commit": "4dc2688b9de8e6b63f2444973354c7c30ee56b00",
+  "input_digest": "d5dc3ae8f177845c15041ddbb692cb38c23609119cc22a8a7f2dd68beefa825d",
+  "build_id": "d5dc3ae8f177845c15041ddbb692cb38c23609119cc22a8a7f2dd68beefa825d",
+  "tag": "",
+  "publication_ready": false,
+  "environment": {
+    "windows": "10.0.26200",
+    "gpu": "RTX 5070 Ti and AMD Radeon Graphics enumerated; selected game adapter not yet observed",
+    "driver": "NVIDIA Windows driver 32.0.16.1742; AMD 32.0.21045.11001",
+    "game_package": "CDPROJEKTSA.Witcher3GOTY 5.0.4.0 x64",
+    "method": "Actual candidate ZIP acceptance; exact clean native Release build; all live rows initially Pending"
+  },
+  "known_limits": [
+    "Windows Defender removed the installed executable as Behavior:Win32/DefenseEvasion.A!ml after the first routing run; no security restore, exclusion or bypass authorized",
+    "One routing run observed Applied and independent native-to-interposer transitions; five fresh startup reliability and gameplay FG remain incomplete",
+    "SDK diagnostic layout unavailable; routing alone cannot prove interpolation",
+    "Typed-console success, mid-wait cancellation and full long-path module inventory unverified",
+    "Repeated trust qualification remains a startup performance risk",
+    "Other hardware, drivers, stores and mod managers remain Untested",
+    "Black-screen resolution is a separate user report, not artifact-bound acceptance"
+  ],
+  "cases": {
+    "fresh_install": {"status": "Passed", "evidence": "Exact candidate ZIP extracted to a separate utility folder; installed EXE SHA matches tested build; actual help/version/default-config checks pass without activation"},
+    "upgrade_config": {"status": "Passed", "evidence": "Same-candidate new-folder rehearsal preserved validated utility configuration and backup byte-for-byte; no earlier published release exists"},
+    "gameplay_fg": {"status": "Inconclusive", "evidence": "First native run reported Applied with no failure in 44425 ms; independently observed all four native-to-interposer transitions and debugger absent. Defender removed the installed EXE; gameplay, modes, transitions and five-start reliability cannot be claimed"},
+    "guard_refusal": {"status": "Pending", "evidence": "Must identify exact safe artifact guard case; preserve protected files"},
+    "uninstall_restore": {"status": "Pending", "evidence": "Owned utility removal and ordinary Xbox restart/native imports required"}
+  },
+  "detailed_cases": {
+    "five_fresh_startups": "Incomplete: one routing attempt, remaining attempts blocked by Defender removal",
+    "fg_off": "Pending",
+    "fg_standard": "Pending",
+    "fg_maximum": "Pending",
+    "fg_dynamic": "Pending",
+    "renderer_reset": "Pending",
+    "load_transition": "Pending",
+    "window_transition": "Pending",
+    "ordinary_xbox_restart": "Pending"
+  },
+  "routing_attempts": [
+    {
+      "id": "start-1",
+      "launcher_outcome": "Applied",
+      "launcher_failure": null,
+      "elapsed_ms": 44425,
+      "completed_utc": "2026-10-13T03:47:40Z",
+      "independent_import_transitions": 4,
+      "qualified_samples": 910,
+      "detached_interposer_samples_per_slot": 359,
+      "normal_owned_exit_observed": true,
+      "gameplay_acceptance": "Not tested",
+      "controller_outcome": "Stopped: registered WindowsApps versus physical Xbox path string mismatch; same executable file identity later independently confirmed",
+      "security_outcome": "Defender removed installed EXE after routing; continuation needs an explicit security decision"
+    }
+  ]
+}
