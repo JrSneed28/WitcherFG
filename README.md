@@ -4,7 +4,7 @@ WitcherFG is a portable Windows x64 launcher that attempts guarded, temporary St
 
 <!-- BEGIN WFG STATUS -->
 **Status: unpublished preview, 0.1.0-preview.1.** A candidate can be packaged locally. Exact-candidate gameplay/install/upgrade/uninstall acceptance is Pending. No stable release is available.
-Release: unpublished. Support: unpublished.
+Release: unpublished. Support: https://github.com/JrSneed28/WitcherFG/issues.
 <!-- END WFG STATUS -->
 
 The earlier local diagnostic probe restored FG/MFG on an RTX 5070 Ti. That observation does not verify this launcher or a release ZIP. `Applied` and `RoutingAlreadyPresent` describe import routing; they do not prove gameplay frame generation.
@@ -37,7 +37,7 @@ Use [troubleshooting](docs/troubleshooting.md) for stable codes and manual black
 .\WitcherFG.exe --collect-support
 ```
 
-Review the archive before sharing. Nothing is uploaded automatically. Ordinary reports should include build ID, game/package version, environment, mode, mods, code/stage and reproduction steps; [the bug-form source](.github/ISSUE_TEMPLATE/bug_report.yml) lists the fields. Public issue hosting and private security reporting are unavailable until configured. Read [SECURITY.md](SECURITY.md) before handling a vulnerability.
+Review the archive before sharing. Nothing is uploaded automatically. [Report an ordinary bug](https://github.com/JrSneed28/WitcherFG/issues/new/choose) with build ID, game/package version, environment, mode, mods, code/stage and reproduction steps. Use [Discussions](https://github.com/JrSneed28/WitcherFG/discussions) for questions and compatibility reports. Read [SECURITY.md](SECURITY.md) to report a vulnerability privately.
 
 ## Developer and player references
 

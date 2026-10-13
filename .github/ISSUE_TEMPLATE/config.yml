@@ -1,2 +1,8 @@
 blank_issues_enabled: false
-# No contact_links until actual public/private destinations are verified.
+contact_links:
+  - name: Questions and compatibility discussions
+    url: https://github.com/JrSneed28/WitcherFG/discussions
+    about: Ask questions and discuss compatibility here.
+  - name: Report a security vulnerability privately
+    url: https://github.com/JrSneed28/WitcherFG/security/advisories/new
+    about: Keep vulnerabilities and sensitive diagnostics out of public issues.

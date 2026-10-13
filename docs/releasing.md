@@ -1,6 +1,6 @@
 # Release status and acceptance
 
-`release/project.toml` is the current canonical version/channel/schema metadata. The version is `0.1.0-preview.1`, channel `preview`, diagnostic schema 1. Publication URLs are empty: **unpublished**. No stable release or verified private contact is available.
+`release/project.toml` is the current canonical version/channel/schema metadata. The version is `0.1.0-preview.1`, channel `preview`, diagnostic schema 1. The release URL remains empty: **unpublished**. The support URL points to [GitHub Issues](https://github.com/JrSneed28/WitcherFG/issues), and [private security reporting](../SECURITY.md) is enabled. No stable release is available.
 
 ## Source ZIP and player ZIP
 
@@ -21,7 +21,7 @@ The ZIP contains only `WitcherFG.exe`, `README.txt`, `VERSION.txt`, `FrameGenFix
 
 The adjacent `.zip.sha256` and `.manifest.json` record the exact archive/binary SHA256, build identity, binary source commit, documentation commit and toolchain. `SHA256SUMS` hashes every payload except itself. Generated outputs remain local. Optional symbols are not emitted by this tool; test targets, runtime/parser/NVIDIA DLLs, dumps and game symbols never enter the player archive.
 
-Windows workflows configure compilation, native lifecycle/unit/collector checks, documentation/configuration checks, checksum-verified redacted Gitleaks 8.24.3 scanning and candidate artifacts. They use reviewed full Action commit pins and `windows-2025`. Its current official inventory includes VS2022 x64, CMake and Python; the actual runner agent/toolchain versions must be recorded in executed job logs. Hosted CI has not been run for this repository. PR jobs receive read-only permissions and no publication credentials; no workflow activates the installed game or publishes a release.
+Windows workflows configure compilation, native lifecycle/unit/collector checks, documentation/configuration checks, checksum-verified redacted Gitleaks 8.24.3 scanning and candidate artifacts. They use reviewed full Action commit pins and `windows-2025`. Its current official inventory includes VS2022 x64, CMake and Python; the actual runner agent/toolchain versions must be recorded in executed job logs. Check [GitHub Actions](https://github.com/JrSneed28/WitcherFG/actions) for hosted run results. PR jobs receive read-only permissions and no publication credentials; no workflow activates the installed game or publishes a release.
 
 ## Required acceptance before publication
 

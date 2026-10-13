@@ -3,6 +3,7 @@
 /artifacts/
 /docs/superpowers/
 /docs/bug-reports/
+/handoffs/
 
 # Generated build, release, and local diagnostic output
 /build/
