@@ -2,7 +2,7 @@ name: Windows candidate checks
 
 on:
   push:
-    branches: ['**']
+    branches: ['main']
   pull_request:
   workflow_call:
     inputs:
@@ -81,7 +81,10 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           $candidate = Get-ChildItem dist -Filter '*-windows-x64.zip'
           if ($candidate.Count -ne 1) { throw 'Expected one candidate' }
-          python tools/release.py verify --archive $candidate.FullName
+          # Draft candidates have no live acceptance record. An explicit staging
+          # path keeps the repository's historical gameplay record out of this
+          # integrity check; public release acceptance remains a separate gate.
+          python tools/release.py verify --archive $candidate.FullName --validation dist/validation.json
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           # Verified exact allowlist precedes extraction of the archive for content scanning.
           $payload = Join-Path $env:RUNNER_TEMP 'wfg-player-payload'

@@ -12,10 +12,10 @@ The standard-library release tool creates an unpublished preview candidate. Run 
 python tools/release.py render --check
 python -m unittest discover -s tests -p release_tests.py -v
 python tools/release.py package --build-dir build/native/Release --out-dir dist
-python tools/release.py verify --archive dist/WitcherFG-0.1.0-preview.1-windows-x64.zip
+python tools/release.py verify --archive dist/WitcherFG-0.1.0-preview.1-windows-x64.zip --validation dist/validation.json
 ```
 
-For the tracked VS17 preset, substitute `build/windows-x64/Release` for the build directory. `python tools/release.py render` explicitly updates the managed README status, compatibility table and BBCode; commit those source changes before building a candidate. `render --check` reports drift without writing files. Dirty, source-archive, Debug, malformed, stale or conflicting identities refuse packaging. The executable's actual `--version`, generated identity, canonical metadata and recomputed code/build inputs must agree.
+For the tracked VS17 preset, substitute `build/windows-x64/Release` for the build directory. The draft verification command selects `dist/validation.json`; when that staging record is absent, verification establishes candidate integrity and reports live acceptance Pending. The repository's historical `release/validation.json` describes a different artifact and is not draft acceptance. Before public binary publication, supply an exact-artifact record explicitly with `--validation release/validation.json`; every required acceptance case must pass. `python tools/release.py render` explicitly updates the managed README status, compatibility table and BBCode; commit those source changes before building a candidate. `render --check` reports drift without writing files. Dirty, source-archive, Debug, malformed, stale or conflicting identities refuse packaging. The executable's actual `--version`, generated identity, canonical metadata and recomputed code/build inputs must agree.
 
 The ZIP contains only `WitcherFG.exe`, `README.txt`, `VERSION.txt`, `FrameGenFix.toml`, `CHANGELOG.txt`, `THIRD_PARTY_NOTICES.txt`, `TROUBLESHOOTING.txt`, `UNINSTALL.txt`, `LICENSE`, `licenses/tomlplusplus-LICENSE.txt` and `SHA256SUMS`. TXT files use UTF-8 without a BOM and CRLF. Sorted ZIP-STORE entries use fixed attributes and the binary source commit's UTC timestamp, rounded down to ZIP's two-second precision. Identical package inputs produce identical bytes; recompilation across different toolchains is not promised identical.
 
