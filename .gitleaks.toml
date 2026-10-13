@@ -1,0 +1,8 @@
+title = "WitcherFG secret scanning"
+
+[extend]
+useDefault = true
+
+# No directory-wide fixture exclusions. Add an exception only after a measured
+# false positive, scoped to the exact synthetic fixture path and matching value.
+# Scanner output must redact secrets; invoke gitleaks with its redaction option.

@@ -1,0 +1,11 @@
+[[dependency]]
+name = "toml++"
+version = "3.4.0"
+source = "https://github.com/marzer/tomlplusplus"
+tag = "v3.4.0"
+tag_commit = "30172438cee64926dc41fdd9c11fb3ba5b2ba9de"
+artifact = "toml.hpp"
+sha256 = "6b5172ad4dd6519aec67b919181fa7a38a2234131e5b2afa232dfe444819783e"
+license = "MIT"
+license_file = "tomlplusplus/LICENSE"
+license_sha256 = "529bc3900a9571e49db285b0df432397e70b881cc3bf48de6667ae74ff4b06d8"

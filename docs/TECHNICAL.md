@@ -1,0 +1,82 @@
+# WitcherFG technical behavior
+
+WitcherFG attempts a temporary startup intervention for a single registered Xbox build. It uses the game's existing interposer and redirects four creation imports while the fresh owned target is stopped. It does not implement interpolation itself.
+
+## Data flow and interfaces
+
+```mermaid
+flowchart TD
+    CLI[CLI and safe configuration] --> Coordinator[RunLauncher coordinator and deadline guard]
+    Coordinator --> Package[Current-user package discovery and registered activation]
+    Package --> Pin[Fresh process identity and retained handle]
+    Pin --> Debug[Single-thread debug session]
+    Debug --> Guards[Dependency trust, PE/import and factory guards]
+    Guards --> Transaction[Journal, four writes and protection verification]
+    Transaction --> Safety[Verified commit or rollback; otherwise owned abort]
+    Safety --> Detach[Detach after verified safety]
+    Detach --> Diagnostics[Bounded diagnostics and optional read-only observation]
+    CLI --> Collector[Explicit local sanitized support collector]
+```
+
+`ILaunchEnvironment` supplies configuration, clock/guard, package/activation, process pin, memory, debugger, inventory, compatibility, observation, diagnostics and collector interfaces. `IMemory`/`IWritableMemory` separate inspection from writes. `IDebugBackend` owns native debug operations; `DebugSession` records safety/detach/termination evidence. `IRunGuard` bounds returned results and final output; unsafe terminal helper exit occurs before result formatting or timestamps.
+
+## Manual installation hint
+
+`--game-path <folder-or-witcher3.exe>` is an ephemeral UTF-8 command-line hint; the native `wmain` preserves Unicode by converting UTF-16 with strict Windows conversion APIs. Configuration keeps it outside `EffectiveConfig`, so diagnostic/support serialization never includes it. Launch and read-only diagnosis accept it; help, version and collection refuse combinations before discovery.
+
+Resolution retains Windows handles for the registered directory, selected hint and matching ancestor while checking volume/file identity and canonical path equality. The registered manifest and helper configuration determine the executable; a metadata-matching copy does not establish registration. The executable must remain canonically inside the registered root, and a folder hint must contain that target. Registration rechecks reuse the validated executable hint and revalidate the current manifest and canonical executable. Memory capability checks independently inspect the pinned process before rediscovery; fresh creation time, session, user, package and executable checks remain mandatory.
+
+Console entry requires a certified recoverable pathname failure after supported registration and AUMID validation. Default registered resolution must fail, then a retry through the same handle-validated canonical root must resolve the unchanged mandatory documents and executable. File/path-not-found labels alone never enable prompting: genuinely absent, malformed or mismatched assets refuse. Manual resolution uses that canonical root, so an ordinary registered folder hint can recover long-path failures without requiring extended-path syntax. Real console handles are required for both input and output; redirected streams return retry syntax without reading. Console input polls cancellation and the existing overall deadline. Empty input/Escape refuses. No path selection persists, grants mutation authority or changes registered Explorer activation, remote fingerprint/import/trust/factory validation, privilege level, ACLs or game files.
+
+## Compiled build record and exact mappings
+
+| Guard | Required value |
+| --- | --- |
+| Package | `CDPROJEKTSA.Witcher3GOTY`, version `5.0.4.0` |
+| Machine / PE identity | AMD64 `0x8664`, timestamp `0x6AC55CE6`, SizeOfImage `0x658F000` |
+| Interposer | Version `2.14.1`, length `652928`, NVIDIA-valid signature and backing image matching the loaded module |
+| Interposer SHA256 | `8c87c9499461da561edd529aa9bf7831d67d7b94ebb1c1a5ed54ef4934e1ea4c` |
+| Fingerprint at RVA `0x1CB0384`, 32 bytes | `bea2f23fae85c0d5ae5a517bb573945525addd04bb52ce4ae239b7da944b7c09` |
+| Fingerprint at RVA `0x1CB061D`, 32 bytes | `88f7cb6bdd8c6d3285de7ab6688c00d98d10d189e2906136aa8432b5afe3e736` |
+| Factory guard | Manager pointer RVA `0x5A75F30`, member offset `0x302F568`; must be readable and null |
+
+| Import | Native module | IAT RVA | Import selector | Replacement |
+| --- | --- | --- | --- | --- |
+| `D3D12CreateDevice` | `d3d12.dll` | `0x2B52450` | **Ordinal `101`** | Matching export in verified `sl.interposer.dll` |
+| `CreateDXGIFactory1` | `dxgi.dll` | `0x2B524D0` | Name | Matching export in verified `sl.interposer.dll` |
+| `CreateDXGIFactory2` | `dxgi.dll` | `0x2B524D8` | Name | Matching export in verified `sl.interposer.dll` |
+| `CreateDXGIFactory` | `dxgi.dll` | `0x2B524E0` | Name | Matching export in verified `sl.interposer.dll` |
+
+The four mappings span **two** import descriptors: the single `d3d12.dll` entry and the three
+`dxgi.dll` entries. The Windows loader snaps descriptors one at a time, so a state in which one
+descriptor is snapped and the other still holds its Import Name Table lookup tokens is an
+ordinary transient, and the launcher retries it rather than refusing.
+
+The import selector is part of the record, not a presentation detail. `D3D12CreateDevice` is
+imported **by ordinal**, which was measured from the live game's IAT (its typed INT token is
+`0x8000000000000065` — the ordinal flag or'd with 101). That entry therefore takes a different
+code path: an ordinal lookup, a refusal with `ambiguous_import_selector` if a *named*
+`D3D12CreateDevice` import is also present, and then `BindExportOrdinal` against the verified
+native module. A new compatibility record that measured only the four names and four RVAs would
+silently lose the ordinal binding on the import whose provenance guard is strictest, so record
+the selector form alongside the RVA.
+
+The source record is in [compatibility.cpp](../src/compatibility.cpp). Unknown executables, mixed/unexpected import routing, unresolved trust or conflicting local DLLs refuse before writes. A raw signed-game hash and game ACL changes are not required. The four-import intervention was sufficient in the local probe; the minimum necessary subset is not established.
+
+## Ownership, mutation and deadlines
+
+Registered activation uses the current user's validated package/AUMID. The observer starts before activation; existing sessions or multiple candidates refuse. Creation time, session, user, package and executable location identify the target. The retained process object prevents following a reused PID. All debugger operations occur on one thread for that target.
+
+Inspection requests debugger exit policy FALSE. Before mutation the policy must become TRUE. The transaction journals original pointers/protections, validates memory and checks all four writes/read-backs/protection restorations before resuming. Verified commit or verified rollback allows policy FALSE and detach. Unverified restoration aborts only the fresh owned startup. Returned `StartupAborted` requires independently observed target exit; terminal helper death alone does not provide that evidence.
+
+Mutation uses bounded preallocated deferred event records. No diagnostic/file/dependency work or growing C++ allocation is allowed during the unsafe interval. Unsafe session state goes straight to terminal helper exit. Native fixture tests independently observe target survival/death and sentinel preservation; their synthetic PE/dependency data cannot validate Witcher/NVIDIA compatibility.
+
+Discovery has a monotonic 30-second deadline; total work through final reporting has 60 seconds plus at most two seconds cancellation cleanup. Post-detach observation has its own bounded duration. Registered activation/attach can lose the startup race; the factory guard still refuses. See [normal/forced exit boundaries](diagnostics.md) and [native fixture evidence](validation/windows-fixture-results.md).
+
+## Configuration, diagnostics and restrictions
+
+Schema 1 precedence is defaults → valid executable-relative TOML → verbosity override. File access captures fixed physical volumes, pins non-reparse directories, requires regular single-link files and uses same-session `Local\` mutexes. Existing retained mutex objects refuse, even abandoned ones. This does not promise cross-session mutual exclusion. [Configuration](configuration.md) records all defaults/ranges and storage costs.
+
+The production SDK catalog is empty. The read-only provider can capture environment/dependencies/validated imports but cannot manufacture SDK activity or rejection meanings. FG and MFG, configured and active HAGS, and selected versus enumerated adapters remain distinct. [Diagnostics](diagnostics.md) defines availability and support collection limits.
+
+There are no persistent game-file edits, service, automatic elevation, driver-profile changes, global logging-registry changes, remote SDK calls, product menu automation or telemetry. The SDK/game retain adapter selection and presentation lifecycle. For background integration documentation, see NVIDIA's [Streamline programming guide](https://github.com/NVIDIA-RTX/Streamline/blob/main/docs/ProgrammingGuide.md) and [manual hooking guide](https://github.com/NVIDIA-RTX/Streamline/blob/main/docs/ProgrammingGuideManualHooking.md).

@@ -1,0 +1,73 @@
+name: Bug report
+description: Reproducible ordinary launcher or gameplay problem; no private security reports.
+title: "[Bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Hosting is unpublished. This is the form source for a future public repository.
+        Do not post vulnerabilities or private identifiers here. Private reporting is currently unavailable; retain those reports locally.
+        A support bundle is optional. Review its extracted JSON before public attachment; never attach raw logs, saves, dumps or credentials.
+  - type: textarea
+    id: build
+    attributes:
+      label: Launcher version and build ID
+      description: Include version output, commit/input digest and player ZIP SHA256 if available.
+    validations:
+      required: true
+  - type: textarea
+    id: game
+    attributes:
+      label: Game and package identity
+      description: Store, menu version, package version and known executable identity; omit personal installation paths.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Windows build, GPU model, driver, resolution/window mode, selected-adapter availability, configured versus active HAGS. No hardware serial numbers.
+    validations:
+      required: true
+  - type: textarea
+    id: mode
+    attributes:
+      label: Renderer and requested mode
+      description: Direct3D path, DLSS/Reflex settings, FG versus MFG mode/count. Distinguish requested from observed values.
+    validations:
+      required: true
+  - type: textarea
+    id: mods
+    attributes:
+      label: Other mods and manager versions
+      description: List names/versions and loader DLLs, or explicitly say none.
+    validations:
+      required: true
+  - type: textarea
+    id: error
+    attributes:
+      label: Status, code, stage and operation
+      description: Include console exit/status and safe native/vendor error information, or say no code. Helper death alone does not prove target exit.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Exact reproduction
+      description: Ordered steps, frequency and whether ordinary Xbox startup behaves differently.
+    validations:
+      required: true
+  - type: textarea
+    id: result
+    attributes:
+      label: Observed and expected result
+      description: Describe rendering/motion and evidence scope. FPS ratios do not establish generated-frame activity.
+    validations:
+      required: true
+  - type: textarea
+    id: sanitized_bundle
+    attributes:
+      label: Optional reviewed sanitized support bundle
+      description: Attach only after reviewing the ZIP JSON. Omit personal identifiers and unrelated files.
+    validations:
+      required: false

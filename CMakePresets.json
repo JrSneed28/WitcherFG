@@ -1,0 +1,38 @@
+{
+  "version": 6,
+  "configurePresets": [
+    {
+      "name": "windows-x64",
+      "displayName": "Qualified Windows x64 configuration",
+      "description": "The configuration release candidates are qualified with. Visual Studio 18 2026 targeting x64, warnings as errors. CMAKE_BUILD_TYPE is deliberately absent: this is a multi-config generator, so the configuration is selected at build and test time instead.",
+      "generator": "Visual Studio 18 2026",
+      "architecture": "x64",
+      "binaryDir": "${sourceDir}/build/windows-x64",
+      "cacheVariables": {
+        "CMAKE_COMPILE_WARNING_AS_ERROR": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "windows-x64",
+      "configurePreset": "windows-x64",
+      "configuration": "Release"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "windows-x64",
+      "displayName": "Full gate set",
+      "description": "Every registered test. Release qualification runs this preset and nothing narrower: a hand-written selection previously omitted six of the nineteen gates, including the diagnostics, local storage and support-bundle gates, so regressions in them could not fail a candidate.",
+      "configurePreset": "windows-x64",
+      "configuration": "Release",
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "noTestsAction": "error"
+      }
+    }
+  ]
+}

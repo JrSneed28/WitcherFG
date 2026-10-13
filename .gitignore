@@ -16,6 +16,7 @@ __pycache__/
 
 # Local configuration; the documented config/FrameGenFix.toml stays tracked
 /FrameGenFix.toml
+/CMakeUserPresets.json
 
 # AI/agent instructions and local tool state
 AGENTS*.md

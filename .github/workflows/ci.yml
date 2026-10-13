@@ -1,0 +1,103 @@
+name: Windows candidate checks
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_call:
+    inputs:
+      create_candidate:
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-2025
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1; Node24, runner >=2.327.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0; Node24, runner >=2.327.1
+        with:
+          python-version: '3.12.10'
+          architecture: x64
+      - name: Record toolchain and runner image
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # The Actions Runner version is also recorded by GitHub's job setup log.
+          Write-Output "ImageOS=$env:ImageOS ImageVersion=$env:ImageVersion RUNNER_ARCH=$env:RUNNER_ARCH"
+          python --version
+          cmake --version
+          & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -version '[17.0,18.0)' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationVersion
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Configure, build and test native Release
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cmake --preset windows-x64
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cmake --build --preset windows-x64 --parallel 2
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          ctest --test-dir build/windows-x64 -C Release --no-tests=error --output-on-failure
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          & .\build\windows-x64\Release\wfg_tests.exe
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $env:WFG_TEST_RUNNER = (Resolve-Path .\build\windows-x64\Release\wfg_tests.exe).Path
+          $env:WFG_LAUNCHER = (Resolve-Path .\build\windows-x64\Release\WitcherFG.exe).Path
+          $env:WFG_BUILD_IDENTITY = (Resolve-Path .\build\windows-x64\generated\Release\wfg\build_info.json).Path
+          python -m unittest discover -s tests -p documentation_tests.py -v
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python tools/release.py render --check
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Checksum-verify Gitleaks and scan staged/history inputs
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $scanRoot = Join-Path $env:RUNNER_TEMP 'wfg-gitleaks-8.24.3'
+          New-Item -ItemType Directory -Path $scanRoot | Out-Null
+          $download = Join-Path $scanRoot 'gitleaks.zip'
+          Invoke-WebRequest 'https://github.com/gitleaks/gitleaks/releases/download/v8.24.3/gitleaks_8.24.3_windows_x64.zip' -OutFile $download
+          if ((Get-FileHash $download -Algorithm SHA256).Hash.ToLowerInvariant() -ne '3f1a35578631dbfe633cc5b49e6c906e55ff14a4bfd7336a10fb27fe33b6dcd2') { throw 'Gitleaks checksum mismatch' }
+          Expand-Archive $download -DestinationPath $scanRoot
+          $scanner = Join-Path $scanRoot 'gitleaks.exe'
+          & $scanner version
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          & $scanner git . --staged --redact=100 --no-banner --config .gitleaks.toml
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          & $scanner git . --redact=100 --no-banner --config .gitleaks.toml
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Package and verify candidate
+        if: inputs.create_candidate == true
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python tools/release.py package --build-dir build/windows-x64/Release --out-dir dist
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $candidate = Get-ChildItem dist -Filter '*-windows-x64.zip'
+          if ($candidate.Count -ne 1) { throw 'Expected one candidate' }
+          python tools/release.py verify --archive $candidate.FullName
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          # Verified exact allowlist precedes extraction of the archive for content scanning.
+          $payload = Join-Path $env:RUNNER_TEMP 'wfg-player-payload'
+          Expand-Archive $candidate.FullName -DestinationPath $payload
+          $scanner = Join-Path $env:RUNNER_TEMP 'wfg-gitleaks-8.24.3\gitleaks.exe'
+          & $scanner dir $payload --redact=100 --no-banner --config .gitleaks.toml
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Store candidate bytes and external manifest
+        if: inputs.create_candidate == true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2; Node24
+        with:
+          name: WitcherFG-unpublished-candidate
+          path: |
+            dist/*-windows-x64.zip
+            dist/*.zip.sha256
+            dist/*.manifest.json
+          if-no-files-found: error
+          include-hidden-files: false
+          retention-days: 14

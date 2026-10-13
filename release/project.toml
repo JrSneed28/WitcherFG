@@ -1,0 +1,6 @@
+version = "0.1.0-preview.1"
+# Packaging produces an unpublished candidate. Live acceptance is external.
+channel = "preview"
+diagnostic_schema = 1
+support_url = ""
+release_url = ""
