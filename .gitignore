@@ -9,6 +9,7 @@
 /dist/
 /diagnostics/
 /support-bundles/
+/.worktrees/
 __pycache__/
 *.pyc
 .vs/
