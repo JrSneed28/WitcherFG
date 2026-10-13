@@ -396,3 +396,20 @@ TEST("debug.watchdog_already_requested_token_cancels_promptly") {
   {std::lock_guard lock(backend.mutex_);CHECK(backend.deadlines[1]<before+std::chrono::seconds(3));}
   watchdog.Disarm();CHECK(backend.exits==0);
 }
+
+TEST("debug.normal_exit_then_successful_attach_resets_target_safety") {
+  Fixture fixture; REQUIRE_OK(fixture.session.Attach(fixture.owned));
+  fixture.backend.events.push_back(Event(DebugEventKind::ProcessExited));
+  REQUIRE_ERROR(fixture.session.WaitStopped(fixture.deadline()), ErrorCode::NoMatchingProcess);
+  CHECK(fixture.session.Safety() == DebugSafety::Exited);
+  fixture.backend.denied = true;
+  REQUIRE_ERROR(fixture.session.Attach(fixture.owned), ErrorCode::DebugFailure);
+  CHECK(fixture.session.Safety() == DebugSafety::Exited);
+  fixture.backend.denied = false;
+  REQUIRE_OK(fixture.session.Attach(fixture.owned));
+  CHECK(fixture.session.Safety() == DebugSafety::AttachedSafe);
+  fixture.backend.events.push_back(Event());
+  auto stop = fixture.Stop();
+  REQUIRE_OK(fixture.session.Continue(stop, Continuation::Handled));
+  REQUIRE_OK(fixture.session.Detach());
+}

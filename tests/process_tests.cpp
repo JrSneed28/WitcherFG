@@ -722,3 +722,29 @@ TEST("process.missing_mandatory_assets_never_certify_or_read_manual_input") {
     CHECK(!wfg::process_detail::CanRequestManualGamePath(wfg::Failure(discovered)));
   }
 }
+
+TEST("process.disk_only_unclassified_proxy_refuses_before_missing_provider") {
+  PackageDocuments disk; SupportedRuntimeFixture f; unsigned inspections{};
+  const auto proxy = disk.root/L"dxgi.dll";
+  {std::ofstream file(proxy, std::ios::binary); file << "unclassified disk-only loader";}
+  const std::vector<std::string> names{"witcher3.exe", "d3d12.dll", "dxgi.dll"};
+  const auto clean = []() -> wfg::Result<wfg::Unit> {return wfg::Unit{};};
+  const auto inspect = [&]() -> wfg::Result<wfg::RuntimeInventory> {++inspections; return f.inventory;};
+  const std::vector<std::vector<std::string>> missing_providers{
+    names, {"witcher3.exe", "dxgi.dll", "sl.interposer.dll"},
+    {"witcher3.exe", "d3d12.dll", "sl.interposer.dll"}, {}};
+  for (const auto& missing_names : missing_providers) {
+    const auto refused = wfg::process_detail::CompleteStartupInventory(missing_names, disk.root, nullptr, clean, inspect);
+    REQUIRE_ERROR(refused, wfg::ErrorCode::DllConflict);
+    CHECK(wfg::Failure(refused).operation.view() == "application_local_loader");
+  }
+  CHECK(inspections == 0);
+  std::ifstream preserved(proxy, std::ios::binary);
+  std::string text((std::istreambuf_iterator<char>(preserved)), {});
+  CHECK(text == "unclassified disk-only loader");
+  preserved.close();
+  std::filesystem::remove(proxy);
+  const auto missing = wfg::process_detail::CompleteStartupInventory(names, disk.root, nullptr, clean, inspect);
+  REQUIRE_ERROR(missing, wfg::ErrorCode::ModuleNotReady);
+  CHECK(inspections == 0);
+}

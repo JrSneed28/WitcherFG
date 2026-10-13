@@ -94,8 +94,13 @@ EnvironmentSnapshot ObserveEnvironment(const ObservedProcess* process);
 
 namespace process_detail {
 // conflicts runs on every pass, before the presence gate, so a loader conflict is refused by
-// name instead of retrying silently to the deadline; it must stay cheap enough to repeat.
+// name instead of retrying silently to the deadline. Qualification remains deadline-bound.
 Result<RuntimeInventory> CompleteStartupInventory(std::span<const std::string> module_names,
+  const std::function<Result<Unit>()>& conflicts,
+  const std::function<Result<RuntimeInventory>()>& inspect);
+// Read-only disk policy seam; a null package grants no bundled-helper exception.
+Result<RuntimeInventory> CompleteStartupInventory(std::span<const std::string> module_names,
+  const std::filesystem::path& local_directory, const PackageIdentity* package,
   const std::function<Result<Unit>()>& conflicts,
   const std::function<Result<RuntimeInventory>()>& inspect);
 // Read-only package-document resolution; does not confer process or write authority.

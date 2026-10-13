@@ -1403,6 +1403,83 @@ public:
 private:
   std::filesystem::directory_iterator iterator_;
 };
+struct LoadedDependency { std::string basename; Pin file; std::size_t dependency_index; };
+// Both the pre-presence proxy guard and the full inventory use the same authenticated
+// on-disk policy, including registered-package correspondence for the bundled helper.
+Result<Unit> InspectLocalFiles(const std::filesystem::path& local_directory, const PackageIdentity* package,
+  RuntimeInventory& inventory, std::span<const LoadedDependency> loaded_dependencies,
+  std::vector<Pin>& qualified_content_pins, bool proxies_only) {
+  std::error_code filesystem_error;
+  std::filesystem::directory_iterator files(local_directory, filesystem_error);
+  if (filesystem_error) return Fail(ErrorCode::AccessDenied, "local_loader_enumeration", Stage::dependencies, static_cast<DWORD>(filesystem_error.value()));
+  LocalDirectory directory(std::move(files));
+  const auto entries = process_detail::EnumerateLocalFiles(directory);
+  if (!IsOk(entries)) return Failure(entries);
+  for (const auto& entry : Value(entries)) {
+    if (!Equal(entry.extension().wstring(), L".dll") || (proxies_only && !ProxyName(entry.filename().wstring()))) continue;
+    const auto basename = Safe(entry.filename().wstring());
+    if (basename.empty()) return Fail(ErrorCode::DllConflict, "local_loader_basename", Stage::dependencies);
+    const auto file = OpenFile(entry.wstring());
+    if (!IsOk(file)) return Failure(file);
+    // The exact package's original Microsoft x86 debug helper is benign data
+    // for this AMD64 game. Unknown dbghelp/proxy files still take the guard below.
+    if (Equal(entry.filename().wstring(), L"dbghelp.dll") && package && QualifiedBundledDebugHelper(Value(file).get(), *package, &qualified_content_pins)) continue;
+    const auto loaded = std::find_if(loaded_dependencies.begin(), loaded_dependencies.end(), [&](const LoadedDependency& identity) { return identity.basename == basename && SameFile(identity.file.get(), Value(file).get()); });
+    if (loaded != loaded_dependencies.end()) {
+      const auto& dependency = inventory.dependencies[loaded->dependency_index];
+      const bool official = dependency.signer.value == DependencySigner::Nvidia && dependency.role.value.has_value();
+      if (official || ProxyName(entry.filename().wstring())) inventory.application_local_loaders.push_back({basename, dependency.version.value.value_or(""), dependency.signer.value.has_value(), official});
+      continue;
+    }
+    const auto evidence = Evidence(Value(file).get(), entry.wstring(), true);
+    if (IsOk(evidence)) {
+      auto mapping = Hold(CreateFileMappingW(Value(file).get(), nullptr, PAGE_READONLY | SEC_IMAGE_NO_EXECUTE, 0, 0, nullptr));
+      const auto* view = mapping ? MapViewOfFile(mapping.get(), FILE_MAP_READ, 0, 0, 0) : nullptr;
+      if (!view) return Fail(ErrorCode::DllConflict, "local_plugin_image", Stage::dependencies);
+      struct Unmap { const void* view; ~Unmap() { UnmapViewOfFile(view); } } unmap{view};
+      auto handle = Duplicate(GetCurrentProcess(), ReadRights);
+      if (!IsOk(handle)) return Failure(handle);
+      ReadMemory local(Value(handle));
+      const auto image = InspectPe(local, reinterpret_cast<Address>(view));
+      if (!IsOk(image)) return Failure(image);
+      auto role = process_detail::IdentifyDependencyRole(local, Value(image), Value(evidence), basename);
+      const bool official = role.value.has_value();
+      inventory.dependencies.push_back(Dependency(basename, Value(evidence), std::move(role), "application_local_file"));
+      if (official || ProxyName(entry.filename().wstring())) inventory.application_local_loaders.push_back({basename, Value(evidence).version, true, official});
+    } else {
+      if (Failure(evidence).code == ErrorCode::AccessDenied) return Failure(evidence);
+      DependencyIdentity unknown;
+      unknown.basename = basename;
+      unknown.availability = Availability::NotObserved;
+      unknown.source = "application_local_file_unverified";
+      unknown.role.source = "authenticated_file_exports";
+      unknown.role.reason = "nvidia_file_identity_unverified";
+      inventory.dependencies.push_back(std::move(unknown));
+      if (ProxyName(entry.filename().wstring())) inventory.application_local_loaders.push_back({basename, FileVersion(entry.wstring()), false, false});
+    }
+  }
+  return Unit{};
+}
+}  // namespace
+Result<RuntimeInventory> process_detail::CompleteStartupInventory(std::span<const std::string> module_names,
+  const std::filesystem::path& local_directory, const PackageIdentity* package,
+  const std::function<Result<Unit>()>& conflicts,
+  const std::function<Result<RuntimeInventory>()>& inspect) {
+  // Keep exact-package exception pins alive through full inspection. Trust qualification
+  // still repeats under the launcher's monotonic deadline; no cache or pass cap is implied.
+  std::vector<Pin> qualified_content_pins;
+  return CompleteStartupInventory(module_names, [&]() -> Result<Unit> {
+    const auto loaded_conflicts = conflicts();
+    if (!IsOk(loaded_conflicts)) return Failure(loaded_conflicts);
+    RuntimeInventory disk;
+    const auto local_files = InspectLocalFiles(local_directory, package, disk, {}, qualified_content_pins, true);
+    if (!IsOk(local_files)) return Failure(local_files);
+    const auto classification = ClassifyLoaderConflicts(disk, SupportedBuild());
+    if (!IsOk(classification)) return Failure(classification);
+    return Unit{};
+  }, inspect);
+}
+namespace {
 Result<RuntimeInventory> Inventory(HANDLE process, std::uint32_t pid, std::uint64_t creation, const IMemory& memory) {
   const auto identity = VerifiedIdentityFactory::Revalidate(process, pid, creation);
   if (!IsOk(identity)) return Failure(identity);
@@ -1414,7 +1491,6 @@ Result<RuntimeInventory> Inventory(HANDLE process, std::uint32_t pid, std::uint6
   std::vector<HMODULE> modules(1024);
   DWORD needed{};
   if (!EnumProcessModulesEx(process, modules.data(), static_cast<DWORD>(modules.size() * sizeof(HMODULE)), &needed, LIST_MODULES_64BIT) || needed > modules.size() * sizeof(HMODULE) || needed % sizeof(HMODULE) != 0) return Fail(ErrorCode::AccessDenied, "module_enumeration", Stage::dependencies, GetLastError());
-  if (needed == 0) return Fail(ErrorCode::ModuleNotReady, "startup_modules_missing", Stage::dependencies);
   modules.resize(needed / sizeof(HMODULE));
   std::vector<std::wstring> module_paths;
   std::vector<std::string> module_names;
@@ -1436,7 +1512,7 @@ Result<RuntimeInventory> Inventory(HANDLE process, std::uint32_t pid, std::uint6
   if (!IsOk(system_final)) return Failure(system_final);
   const auto system_directory = std::filesystem::path(Value(system_final)).parent_path().wstring();
   const auto local_directory = std::filesystem::path(Value(identity).executable).parent_path();
-  return process_detail::CompleteStartupInventory(module_names,
+  return process_detail::CompleteStartupInventory(module_names, local_directory, &Value(package),
     [&]() -> Result<Unit> {
       // Path-only guards over the modules already loaded. These are the two checks that do not
       // need sl.interposer.dll to be present, and they name the conflict that keeps it from
@@ -1460,7 +1536,6 @@ Result<RuntimeInventory> Inventory(HANDLE process, std::uint32_t pid, std::uint6
       return Unit{};
     },
     [&]() -> Result<RuntimeInventory> {
-  struct LoadedDependency { std::string basename; Pin file; std::size_t dependency_index; };
   std::vector<LoadedDependency> loaded_dependencies;
   std::vector<Pin> qualified_content_pins;
   bool have_executable{}, have_interposer{};
@@ -1531,55 +1606,8 @@ Result<RuntimeInventory> Inventory(HANDLE process, std::uint32_t pid, std::uint6
       }
     }
   }
-  std::error_code filesystem_error;
-  std::filesystem::directory_iterator files(local_directory, filesystem_error);
-  if (filesystem_error) return Fail(ErrorCode::AccessDenied, "local_loader_enumeration", Stage::dependencies, static_cast<DWORD>(filesystem_error.value()));
-  LocalDirectory directory(std::move(files));
-  const auto entries = process_detail::EnumerateLocalFiles(directory);
-  if (!IsOk(entries)) return Failure(entries);
-  for (const auto& entry : Value(entries)) {
-    if (!Equal(entry.extension().wstring(), L".dll")) continue;
-    const auto basename = Safe(entry.filename().wstring());
-    if (basename.empty()) return Fail(ErrorCode::DllConflict, "local_loader_basename", Stage::dependencies);
-    const auto file = OpenFile(entry.wstring());
-    if (!IsOk(file)) return Failure(file);
-    // The exact package's original Microsoft x86 debug helper is benign data
-    // for this AMD64 game. Unknown dbghelp/proxy files still take the guard below.
-    if(Equal(entry.filename().wstring(),L"dbghelp.dll")&&QualifiedBundledDebugHelper(Value(file).get(),Value(package),&qualified_content_pins))continue;
-    const auto loaded = std::find_if(loaded_dependencies.begin(), loaded_dependencies.end(), [&](const LoadedDependency& identity) { return identity.basename == basename && SameFile(identity.file.get(), Value(file).get()); });
-    if (loaded != loaded_dependencies.end()) {
-      const auto& dependency = inventory.dependencies[loaded->dependency_index];
-      const bool official = dependency.signer.value == DependencySigner::Nvidia && dependency.role.value.has_value();
-      if (official || ProxyName(entry.filename().wstring())) inventory.application_local_loaders.push_back({basename, dependency.version.value.value_or(""), dependency.signer.value.has_value(), official});
-      continue;
-    }
-    const auto evidence = Evidence(Value(file).get(), entry.wstring(), true);
-    if (IsOk(evidence)) {
-      auto mapping = Hold(CreateFileMappingW(Value(file).get(), nullptr, PAGE_READONLY | SEC_IMAGE_NO_EXECUTE, 0, 0, nullptr));
-      const auto* view = mapping ? MapViewOfFile(mapping.get(), FILE_MAP_READ, 0, 0, 0) : nullptr;
-      if (!view) return Fail(ErrorCode::DllConflict, "local_plugin_image", Stage::dependencies);
-      struct Unmap { const void* view; ~Unmap() { UnmapViewOfFile(view); } } unmap{view};
-      auto handle = Duplicate(GetCurrentProcess(), ReadRights);
-      if (!IsOk(handle)) return Failure(handle);
-      ReadMemory local(Value(handle));
-      const auto image = InspectPe(local, reinterpret_cast<Address>(view));
-      if (!IsOk(image)) return Failure(image);
-      auto role = process_detail::IdentifyDependencyRole(local, Value(image), Value(evidence), basename);
-      const bool official = role.value.has_value();
-      inventory.dependencies.push_back(Dependency(basename, Value(evidence), std::move(role), "application_local_file"));
-      if (official || ProxyName(entry.filename().wstring())) inventory.application_local_loaders.push_back({basename, Value(evidence).version, true, official});
-    } else {
-      if (Failure(evidence).code == ErrorCode::AccessDenied) return Failure(evidence);
-      DependencyIdentity unknown;
-      unknown.basename = basename;
-      unknown.availability = Availability::NotObserved;
-      unknown.source = "application_local_file_unverified";
-      unknown.role.source = "authenticated_file_exports";
-      unknown.role.reason = "nvidia_file_identity_unverified";
-      inventory.dependencies.push_back(std::move(unknown));
-      if (ProxyName(entry.filename().wstring())) inventory.application_local_loaders.push_back({basename, FileVersion(entry.wstring()), false, false});
-    }
-  }
+  const auto local_files = InspectLocalFiles(local_directory, &Value(package), inventory, loaded_dependencies, qualified_content_pins, false);
+  if (!IsOk(local_files)) return Failure(local_files);
   const auto final_identity = VerifiedIdentityFactory::Revalidate(process, pid, creation);
   if (!IsOk(final_identity)) return Failure(final_identity);
   const auto startup = process_detail::ValidateStartupInventory(inventory);

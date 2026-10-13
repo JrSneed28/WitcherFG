@@ -82,6 +82,7 @@ Result<Unit> DebugSession::Attach(const OwnedProcess& process) {
   auto attached = backend_.Attach(process);
   if (!IsOk(attached)) return Failure(attached);
   state_->attached = true;
+  state_->observed_exit = false;
   state_->pid = process.pid();
   state_->safe_policy = false;
   state_->process_created = false;
