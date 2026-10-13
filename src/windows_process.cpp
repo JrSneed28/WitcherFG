@@ -364,7 +364,7 @@ Result<std::wstring> process_detail::ResolveManualExecutableHint(const std::wstr
     if (candidate.get() != INVALID_HANDLE_VALUE && GetFileInformationByHandle(candidate.get(), &info) &&
         (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && info.dwVolumeSerialNumber == root_info.dwVolumeSerialNumber &&
         info.nFileIndexHigh == root_info.nFileIndexHigh && info.nFileIndexLow == root_info.nFileIndexLow && Equal(final_path(candidate.get()), canonical_root)) {
-      const auto target = ResolvePackageExecutable(ancestor.wstring(), registered);
+      const auto target = ResolvePackageExecutable(canonical_root, registered);
       if (!IsOk(target)) return Failure(target);
       const auto executable = CanonicalExecutable(Value(target));
       if (!IsOk(executable)) return Failure(executable);
@@ -381,12 +381,26 @@ Result<std::wstring> process_detail::ResolveManualExecutableHint(const std::wstr
     ancestor = parent;
   }
 }
-bool process_detail::CanRequestManualGamePath(const Error& error) {
+Result<std::wstring> process_detail::ResolveRegisteredExecutable(const std::wstring& root, const RegisteredPackageMetadata& registered, std::optional<std::wstring_view> hint) {
+  if (hint) return ResolveManualExecutableHint(root, registered, std::wstring(*hint));
+  const auto target=ResolvePackageExecutable(root,registered);
+  const auto discovered=IsOk(target)?CanonicalExecutable(Value(target)):Result<std::wstring>{Failure(target)};
+  if (IsOk(discovered)) return discovered;
+  const auto& error=Failure(discovered);
   const auto operation=error.operation.view();
-  return error.code==ErrorCode::AccessDenied &&
+  const bool pathname_failure=error.code==ErrorCode::AccessDenied &&
     ((operation=="executable_attributes" && error.stage==Stage::process_identity) ||
      (operation=="package_document" && error.stage==Stage::package_discovery)) &&
-    (error.native_code==2U || error.native_code==3U);
+    (error.native_code==2U || error.native_code==3U || error.native_code==206U);
+  // A file-not-found label is insufficient: a handle-bound canonical representation
+  // must resolve the real, unchanged registered documents and executable first.
+  if (pathname_failure && IsOk(ResolveManualExecutableHint(root,registered,root)))
+    return Fail(ErrorCode::LaunchFailed,"manual_game_path_recoverable",Stage::Discover,error.native_code.value_or(0U));
+  return error;
+}
+bool process_detail::CanRequestManualGamePath(const Error& error) {
+  return error.code==ErrorCode::LaunchFailed && error.stage==Stage::Discover &&
+    error.operation.view()=="manual_game_path_recoverable";
 }
 Result<std::wstring> process_detail::RequestManualGamePath(bool interactive, const std::function<Result<std::wstring>()>& read) {
   if (!interactive) return Fail(ErrorCode::LaunchFailed, "manual_game_path_required", Stage::Discover);
@@ -490,15 +504,13 @@ Result<PackageIdentity> DiscoverPackage(std::optional<std::wstring_view> game_pa
   if (GetLastError() != ERROR_NO_TOKEN) return Fail(ErrorCode::AccessDenied, "interactive_user_token", Stage::Discover);
   DWORD session{};
   if (!ProcessIdToSessionId(GetCurrentProcessId(), &session) || session == 0) return Fail(ErrorCode::AccessDenied, "interactive_session", Stage::Discover);
-  const auto executable = game_path ? process_detail::ResolveManualExecutableHint(Value(root), registered, std::wstring(*game_path)) : process_detail::ResolvePackageExecutable(Value(root), registered);
+  const auto executable = process_detail::ResolveRegisteredExecutable(Value(root), registered, game_path);
   if (!IsOk(executable)) return Failure(executable);
-  const auto canonical_executable = CanonicalExecutable(Value(executable));
-  if (!IsOk(canonical_executable)) return Failure(canonical_executable);
   auto state = std::make_shared<PackageIdentity::State>();
   state->session = session;
   state->full_name = Value(full_name);
   state->root = Value(root);
-  state->executable = Value(canonical_executable);
+  state->executable = Value(executable);
   state->user = Value(user);
   state->version = version;
   return PackageIdentity(std::move(state));

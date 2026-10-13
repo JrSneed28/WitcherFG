@@ -1,6 +1,7 @@
 #include "support.hpp"
 #include "fixtures/runtime_images.hpp"
 #include "fixtures/verified_identity.hpp"
+#include "fixtures/package_documents.hpp"
 #include "wfg/launcher.hpp"
 #include <cstdlib>
 #include <windows.h>
@@ -90,6 +91,7 @@ struct Fixture final : ILaunchEnvironment {
   CompatibilityRecord compatibility=runtime.SyntheticBuild();
   EffectiveConfig config=DefaultConfiguration();std::vector<std::string_view> args;
   std::optional<std::string> configured_path;
+  std::function<Result<PackageFacts>()> discovery;
   std::optional<Error> config_error,discover_error,inventory_error,collect_error,observe_error;
   EnvironmentSnapshot host;
   int configurations{},discoveries{},installed{},activated{},pins{},memory_opens{},inventories{},observations{},collections{};
@@ -104,7 +106,7 @@ struct Fixture final : ILaunchEnvironment {
   }
   ILogStorage& Diagnostics()override{return storage;}
   std::unique_ptr<IRunGuard> Guard(Deadline deadline,std::stop_source& cancel,std::stop_token)override{guards.push_back(deadline);active_cancel=&cancel;storage.cooperative=cancel.get_token();return std::make_unique<::Guard>(active_guard,static_cast<int>(guards.size()));}
-  Result<PackageFacts> Discover()override{++discoveries;if(discover_error)return *discover_error;return PackageFacts{compatibility.package_name,compatibility.package_version,compatibility.machine};}
+  Result<PackageFacts> Discover()override{++discoveries;if(discovery)return discovery();if(discover_error)return *discover_error;return PackageFacts{compatibility.package_name,compatibility.package_version,compatibility.machine};}
   EnvironmentSnapshot Environment()override{return host;}
   Result<Unit> InstallObserver(Deadline)override{++installed;CHECK(activated==0);return Unit{};}
   Result<Unit> Activate()override{++activated;CHECK(installed==1);return Unit{};}
@@ -388,4 +390,69 @@ TEST("launcher.manual_path_does_not_bypass_factory_import_or_trust_guards") {
   Fixture factory;factory.args={"--game-path","C:\\Game"};factory.runtime.SetFactory(factory.runtime.native_factory);Refusal(factory,Status::StartupTooLate);
   Fixture mixed;mixed.args={"--game-path","C:\\Game"};mixed.runtime.SetImportPointer("CreateDXGIFactory",mixed.runtime.InterposerExport("CreateDXGIFactory"));Refusal(mixed,Status::UnexpectedImports);
   Fixture trust;trust.args={"--game-path","C:\\Game"};trust.inventory_error=Fault(ErrorCode::UntrustedInterposer,Stage::dependencies);Refusal(trust,Status::UntrustedInterposer);
+}
+
+TEST("launcher.native_manual_console_pipe_refuses_without_waiting") {
+  HANDLE read{},write{};CHECK(CreatePipe(&read,&write,nullptr,0));
+  const auto original=GetStdHandle(STD_INPUT_HANDLE);CHECK(SetStdHandle(STD_INPUT_HANDLE,read));
+  const auto start=std::chrono::steady_clock::now();
+  const auto response=launcher_detail::ReadManualPath({}, {start+std::chrono::seconds(2)});
+  const auto elapsed=std::chrono::steady_clock::now()-start;
+  CHECK(SetStdHandle(STD_INPUT_HANDLE,original));CloseHandle(read);CloseHandle(write);
+  CHECK(!IsOk(response));CHECK(Failure(response).operation.view()=="manual_game_path_required");
+  CHECK(elapsed<std::chrono::seconds(1));
+}
+TEST("launcher.native_manual_console_child") {
+  std::array<wchar_t,2> child{};
+  if(GetEnvironmentVariableW(L"WFG_MANUAL_CONSOLE_CHILD",child.data(),static_cast<DWORD>(child.size()))!=1||child[0]!=L'1')return;
+  const auto input=GetStdHandle(STD_INPUT_HANDLE);DWORD mode{};CHECK(GetConsoleMode(input,&mode));
+  const auto send=[&](WORD key,wchar_t character){
+    CHECK(FlushConsoleInputBuffer(input));INPUT_RECORD event{};event.EventType=KEY_EVENT;
+    event.Event.KeyEvent.bKeyDown=TRUE;event.Event.KeyEvent.wRepeatCount=1;
+    event.Event.KeyEvent.wVirtualKeyCode=key;event.Event.KeyEvent.uChar.UnicodeChar=character;
+    DWORD written{};CHECK(WriteConsoleInputW(input,&event,1,&written));CHECK(written==1);
+  };
+  send(VK_RETURN,L'\r');
+  const auto empty=launcher_detail::ReadManualPath({}, {std::chrono::steady_clock::now()+std::chrono::seconds(2)});
+  CHECK(!IsOk(empty));CHECK(Failure(empty).operation.view()=="manual_game_path_cancelled");
+  send(VK_ESCAPE,L'\0');
+  const auto escape=launcher_detail::ReadManualPath({}, {std::chrono::steady_clock::now()+std::chrono::seconds(2)});
+  CHECK(!IsOk(escape));CHECK(Failure(escape).operation.view()=="manual_game_path_cancelled");
+  std::stop_source cancelled;cancelled.request_stop();
+  const auto cancel=launcher_detail::ReadManualPath(cancelled.get_token(),{std::chrono::steady_clock::now()+std::chrono::seconds(2)});
+  CHECK(!IsOk(cancel));CHECK(Failure(cancel).code==ErrorCode::TimedOut);
+  const auto expired=launcher_detail::ReadManualPath({}, {std::chrono::steady_clock::now()-std::chrono::seconds(1)});
+  CHECK(!IsOk(expired));CHECK(Failure(expired).code==ErrorCode::TimedOut);
+}
+TEST("launcher.native_manual_console_owned_child_cancels_and_honors_deadline") {
+  std::array<wchar_t,32768> exe{};const auto length=GetModuleFileNameW(nullptr,exe.data(),static_cast<DWORD>(exe.size()));CHECK(length>0&&length<exe.size());
+  std::wstring command=L"\""+std::wstring(exe.data(),length)+L"\" --filter launcher.native_manual_console_child";
+  STARTUPINFOW startup{};startup.cb=sizeof(startup);startup.dwFlags=STARTF_USESHOWWINDOW;startup.wShowWindow=SW_HIDE;
+  PROCESS_INFORMATION process{};CHECK(SetEnvironmentVariableW(L"WFG_MANUAL_CONSOLE_CHILD",L"1"));
+  const bool created=CreateProcessW(exe.data(),command.data(),nullptr,nullptr,FALSE,CREATE_NEW_CONSOLE,nullptr,nullptr,&startup,&process)!=FALSE;
+  CHECK(SetEnvironmentVariableW(L"WFG_MANUAL_CONSOLE_CHILD",nullptr));CHECK(created);
+  const auto wait=WaitForSingleObject(process.hProcess,10000);
+  DWORD code{};
+  if(wait!=WAIT_OBJECT_0){TerminateProcess(process.hProcess,99);WaitForSingleObject(process.hProcess,1000);}
+  CHECK(GetExitCodeProcess(process.hProcess,&code));CloseHandle(process.hThread);CloseHandle(process.hProcess);
+  CHECK(wait==WAIT_OBJECT_0);CHECK(code==0);
+}
+
+TEST("launcher.real_missing_package_assets_refuse_without_activation_or_retry_prompt") {
+  for(const auto asset : {L"AppxManifest.xml",L"MicrosoftGame.Config",L"bin\\Gaming.Desktop.x64\\witcher3.exe"}) {
+    test_fixture::PackageDocuments documents;REQUIRE_OK(documents.Resolve());
+    std::filesystem::create_directories(documents.root/L"bin"/L"Gaming.Desktop.x64");
+    {std::ofstream file(documents.root/L"bin"/L"Gaming.Desktop.x64"/L"witcher3.exe");file << "fixture";}
+    CHECK(std::filesystem::remove(documents.root/asset));
+    Fixture f;
+    f.discovery=[&]() -> Result<PackageFacts> {
+      const auto resolved=process_detail::ResolveRegisteredExecutable(documents.root.wstring(),documents.identity);
+      if(!IsOk(resolved))return Failure(resolved);
+      return PackageFacts{f.compatibility.package_name,f.compatibility.package_version,f.compatibility.machine};
+    };
+    const auto outcome=RunLauncher(f,{});
+    CHECK(outcome.failure.has_value());CHECK(!process_detail::CanRequestManualGamePath(*outcome.failure));
+    CHECK(outcome.next_action.find("--game-path")==std::string::npos);
+    CHECK(f.discoveries==1&&f.installed==0&&f.activated==0&&f.pins==0&&f.memory_opens==0&&f.backend.attaches==0&&f.memory.writes==0);
+  }
 }

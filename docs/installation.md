@@ -30,13 +30,13 @@ The launcher uses registered activation for the current user. Starting the game 
 
 ## When executable discovery fails
 
-If the registered package is supported but executable-location discovery fails, an interactive console can request a path. Enter the registered game root, executable's containing folder, or `witcher3.exe` without surrounding quotes; an empty line or Escape cancels. With redirected input/output, retry explicitly:
+A pathname limitation, such as a long Xbox installation folder name, can trigger a path prompt after the launcher confirms the registered installation’s required files are present and valid. A missing executable or required document, or malformed/mismatched metadata, refuses without prompting; verify or repair the installation through Xbox. Enter the registered game root, executable's containing folder, or `witcher3.exe` without surrounding quotes; an empty line or Escape cancels. With redirected input/output, retry explicitly:
 
 ```powershell
 .\WitcherFG.exe --game-path "D:\XboxGames\The Witcher 3\Content"
 ```
 
-Use the actual registered installation on your machine. The example is a placeholder. The selection is not saved and cannot repair an unregistered, unsupported or unrelated copy. The launcher still uses validated registered activation through Explorer; every process and routing guard remains mandatory. Read-only diagnosis also accepts the path. See [supported commands](configuration.md).
+Use the ordinary registered installation folder on your machine; extended Windows path syntax is not required. The example is a placeholder. The selection is not saved and cannot repair an unregistered, unsupported or unrelated copy. The launcher still uses validated registered activation through Explorer; every process and routing guard remains mandatory. Read-only diagnosis also accepts the path. See [supported commands](configuration.md).
 
 ## Upgrade while preserving configuration
 

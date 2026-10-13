@@ -108,6 +108,7 @@ struct RegisteredPackageMetadata {
 };
 Result<std::wstring> ResolvePackageExecutable(const std::wstring& root, const RegisteredPackageMetadata& registered);
 Result<std::wstring> ResolveManualExecutableHint(const std::wstring& root, const RegisteredPackageMetadata& registered, const std::wstring& hint);
+Result<std::wstring> ResolveRegisteredExecutable(const std::wstring& root, const RegisteredPackageMetadata& registered, std::optional<std::wstring_view> hint = {});
 bool CanRequestManualGamePath(const Error& error);
 Result<std::wstring> RequestManualGamePath(bool interactive, const std::function<Result<std::wstring>()>& read);
 #ifdef WFG_LIFECYCLE_TESTING

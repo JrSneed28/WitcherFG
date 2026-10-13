@@ -42,4 +42,7 @@ int ExitCode(Status) noexcept;
 // Shared native completion route; exposed for integration callers and tests.
 int RunLauncherToConsole(ILaunchEnvironment&, std::stop_token);
 int RunNativeLauncher(std::span<const std::string_view>, std::stop_token);
+namespace launcher_detail {
+Result<std::wstring> ReadManualPath(std::stop_token cancellation, Deadline deadline);
+}
 }

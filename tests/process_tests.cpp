@@ -3,6 +3,7 @@
 #include "fixtures/process_identity.hpp"
 #include "fixtures/verified_identity.hpp"
 #include "fixtures/runtime_images.hpp"
+#include "fixtures/package_documents.hpp"
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -36,27 +37,7 @@ std::unique_ptr<wfg::ProcessObserver> Observer(wfg::Result<std::unique_ptr<wfg::
 }
 
 namespace {
-struct PackageDocuments {
-  std::filesystem::path root;
-  wfg::process_detail::RegisteredPackageMetadata identity{L"CDPROJEKTSA.Witcher3GOTY", L"CN=Test Publisher", L"5.0.4.0", L"TEST", L"x64"};
-  std::string manifest = R"(<Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"><Identity Name="CDPROJEKTSA.Witcher3GOTY" Publisher="CN=Test Publisher" Version="5.0.4.0" ResourceId="TEST" ProcessorArchitecture="x64"/><Applications><Application Id="bin.Gaming.Desktop.x64.witcher3" Executable="GameLaunchHelper.exe" EntryPoint="Windows.FullTrustApplication"/></Applications></Package>)";
-  std::string config = R"(<Game configVersion="1"><Identity Name="CDPROJEKTSA.Witcher3GOTY" Publisher="CN=Test Publisher" Version="5.0.4.0" ResourceId="TEST"/><ExecutableList><Executable Name="bin\Gaming.Desktop.x64\witcher3.exe" TargetDeviceFamily="PC"/></ExecutableList></Game>)";
-  PackageDocuments() {
-    const auto nonce = std::chrono::steady_clock::now().time_since_epoch().count();
-    for (unsigned i=0;i<10;++i) {
-      root=std::filesystem::temp_directory_path()/("wfg-package-"+std::to_string(GetCurrentProcessId())+"-"+std::to_string(nonce)+"-"+std::to_string(i));
-      if(std::filesystem::create_directory(root))return;
-    }
-    throw std::runtime_error("package fixture directory");
-  }
-  ~PackageDocuments(){std::error_code error;std::filesystem::remove_all(root,error);}
-  static void Replace(std::string& text,std::string_view from,std::string_view to){const auto at=text.find(from);CHECK(at!=std::string::npos);text.replace(at,from.size(),to);}
-  wfg::Result<std::wstring> Resolve(bool write_config=true){
-    {std::ofstream file(root/L"AppxManifest.xml",std::ios::binary);file<<manifest;CHECK(file.good());}
-    if(write_config){std::ofstream file(root/L"MicrosoftGame.Config",std::ios::binary);file<<config;CHECK(file.good());}
-    return wfg::process_detail::ResolvePackageExecutable(root.wstring(),identity);
-  }
-};
+using PackageDocuments = test_fixture::PackageDocuments;
 }
 
 TEST("process.package_helper_resolves_exact_pc_game_target") {
@@ -681,14 +662,63 @@ TEST("process.manual_hint_unicode_root_and_missing_executable_are_checked_by_han
   CHECK(wfg::IsOk(wfg::process_detail::ResolveManualExecutableHint(f.root.wstring(), f.identity, f.root.wstring())));
 }
 
-TEST("process.manual_prompt_gate_only_accepts_resolvable_missing_executable_documents") {
+TEST("process.manual_prompt_gate_rejects_uncertified_error_labels") {
   using namespace wfg;
-  CHECK(process_detail::CanRequestManualGamePath({ErrorCode::AccessDenied,Stage::process_identity,"executable_attributes",2U}));
-  CHECK(process_detail::CanRequestManualGamePath({ErrorCode::AccessDenied,Stage::package_discovery,"package_document",3U}));
+  CHECK(!process_detail::CanRequestManualGamePath({ErrorCode::AccessDenied,Stage::process_identity,"executable_attributes",2U}));
+  CHECK(!process_detail::CanRequestManualGamePath({ErrorCode::AccessDenied,Stage::package_discovery,"package_document",3U}));
   for (const auto& error : {Error{ErrorCode::UnsupportedBuild,Stage::package_discovery,"manifest_identity",2U},
       Error{ErrorCode::AccessDenied,Stage::package_discovery,"package_document",5U},
       Error{ErrorCode::AccessDenied,Stage::package_discovery,"package_path",3U},
       Error{ErrorCode::AccessDenied,Stage::package_discovery,"package_not_registered",2U},
       Error{ErrorCode::IdentityChanged,Stage::process_identity,"executable_attributes",2U}})
     CHECK(!process_detail::CanRequestManualGamePath(error));
+}
+
+TEST("process.manual_extended_path_recovers_real_default_pathname_failure") {
+  PackageDocuments f;
+  const auto original=f.root;
+  CHECK(original.wstring().size()<242);
+  const auto padding=std::wstring(242-original.wstring().size()-1,L'x');
+  const auto plain=original/padding;
+  const auto extended=std::filesystem::path(L"\\\\?\\"+plain.wstring());
+  std::filesystem::create_directory(extended);
+  f.root=extended;
+  REQUIRE_OK(f.Resolve());
+  std::filesystem::create_directories(extended/L"bin"/L"Gaming.Desktop.x64");
+  {std::ofstream file(extended/L"bin"/L"Gaming.Desktop.x64"/L"witcher3.exe");file << "fixture";}
+  const auto automatic=wfg::process_detail::ResolveRegisteredExecutable(plain.wstring(),f.identity);
+  CHECK(!wfg::IsOk(automatic));
+  CHECK(wfg::Failure(automatic).operation.view()=="manual_game_path_recoverable");
+  CHECK(wfg::process_detail::CanRequestManualGamePath(wfg::Failure(automatic)));
+  for(const auto& hint : {plain,extended}) {
+    const auto manual=wfg::process_detail::ResolveRegisteredExecutable(plain.wstring(),f.identity,hint.wstring());
+    CHECK(wfg::IsOk(manual));
+  }
+  PackageDocuments::Replace(f.config,"Version=\"5.0.4.0\"","Version=\"5.0.5.0\"");
+  {std::ofstream file(extended/L"MicrosoftGame.Config");file << f.config;}
+  const auto mismatched=wfg::process_detail::ResolveRegisteredExecutable(plain.wstring(),f.identity);
+  CHECK(!wfg::IsOk(mismatched));CHECK(!wfg::process_detail::CanRequestManualGamePath(wfg::Failure(mismatched)));
+  CHECK(!wfg::IsOk(wfg::process_detail::ResolveRegisteredExecutable(plain.wstring(),f.identity,plain.wstring())));
+  PackageDocuments::Replace(f.config,"Version=\"5.0.5.0\"","Version=\"5.0.4.0\"");
+  REQUIRE_OK(f.Resolve());
+  CHECK(std::filesystem::remove(extended/L"bin"/L"Gaming.Desktop.x64"/L"witcher3.exe"));
+  const auto absent=wfg::process_detail::ResolveRegisteredExecutable(plain.wstring(),f.identity);
+  CHECK(!wfg::IsOk(absent));CHECK(!wfg::process_detail::CanRequestManualGamePath(wfg::Failure(absent)));
+  std::error_code error;std::filesystem::remove_all(extended,error);f.root=original;
+}
+
+TEST("process.missing_mandatory_assets_never_certify_or_read_manual_input") {
+  for (const auto asset : {L"AppxManifest.xml",L"MicrosoftGame.Config",L"bin\\Gaming.Desktop.x64\\witcher3.exe"}) {
+    PackageDocuments f; REQUIRE_OK(f.Resolve());
+    std::filesystem::create_directories(f.root/L"bin"/L"Gaming.Desktop.x64");
+    {std::ofstream file(f.root/L"bin"/L"Gaming.Desktop.x64"/L"witcher3.exe");file << "fixture";}
+    CHECK(std::filesystem::remove(f.root/asset));
+    const auto discovered=wfg::process_detail::ResolveRegisteredExecutable(f.root.wstring(),f.identity);
+    CHECK(!wfg::IsOk(discovered));
+    int reads{};
+    if(wfg::process_detail::CanRequestManualGamePath(wfg::Failure(discovered)))
+      static_cast<void>(wfg::process_detail::RequestManualGamePath(true,[&]() -> wfg::Result<std::wstring> {++reads;return f.root.wstring();}));
+    CHECK(reads==0);
+    CHECK(!wfg::process_detail::CanRequestManualGamePath(wfg::Failure(discovered)));
+  }
 }

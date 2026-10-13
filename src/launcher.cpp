@@ -389,7 +389,8 @@ public:
 private:
   DeadlineWatchdog watchdog_;
 };
-Result<std::wstring> ReadManualPath(std::stop_token cancellation, Deadline deadline) {
+}
+Result<std::wstring> launcher_detail::ReadManualPath(std::stop_token cancellation, Deadline deadline) {
   const auto input=GetStdHandle(STD_INPUT_HANDLE), output=GetStdHandle(STD_OUTPUT_HANDLE);
   DWORD input_mode{},output_mode{};
   const bool interactive=GetConsoleMode(input,&input_mode)&&GetConsoleMode(output,&output_mode);
@@ -420,6 +421,7 @@ Result<std::wstring> ReadManualPath(std::stop_token cancellation, Deadline deadl
     return Error{ErrorCode::TimedOut,Stage::package_discovery,"manual_game_path_cancelled"};
   });
 }
+namespace {
 class NativeEnvironment final : public ILaunchEnvironment {
 public:
   explicit NativeEnvironment(std::span<const std::string_view> args):args_(args){}
@@ -444,7 +446,7 @@ public:
     auto found=DiscoverPackage(hint_?std::optional<std::wstring_view>(*hint_):std::nullopt);
     if(!hint_&&!IsOk(found)) {
       if(process_detail::CanRequestManualGamePath(Failure(found))) {
-        const auto manual=ReadManualPath(cancellation_,deadline_);
+        const auto manual=launcher_detail::ReadManualPath(cancellation_,deadline_);
         if(!IsOk(manual))return Failure(manual);
         hint_=Value(manual);found=DiscoverPackage(*hint_);
       }
