@@ -103,6 +103,14 @@ Result<RuntimeInventory> CompleteStartupInventory(std::span<const std::string> m
   const std::filesystem::path& local_directory, const PackageIdentity* package,
   const std::function<Result<Unit>()>& conflicts,
   const std::function<Result<RuntimeInventory>()>& inspect);
+// Read-only handoff shared by owned and observed inventory. It grants no capability.
+template<class T>
+Result<T> RefreshInventoryPackage(const Result<Candidate>& identity,
+  const std::function<Result<T>(std::optional<std::wstring_view>)>& discover) {
+  if (!IsOk(identity)) return Failure(identity);
+  return discover(std::wstring_view(Value(identity).executable));
+}
+Result<std::wstring> ResolveProcessImagePath(const std::wstring& path);
 // Read-only package-document resolution; does not confer process or write authority.
 struct RegisteredPackageMetadata {
   std::wstring name;

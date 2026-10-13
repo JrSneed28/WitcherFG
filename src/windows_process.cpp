@@ -104,7 +104,7 @@ Result<std::wstring> Executable(HANDLE process) {
   DWORD size = static_cast<DWORD>(path.size());
   if (!QueryFullProcessImageNameW(process, 0, path.data(), &size) || size == 0 || size >= MaxPath) return Fail(ErrorCode::AccessDenied, "executable_path", Stage::process_identity, GetLastError());
   path.resize(size);
-  return CanonicalExecutable(path);
+  return process_detail::ResolveProcessImagePath(path);
 }
 Result<Candidate> InspectCandidate(HANDLE process) {
   Candidate result;
@@ -334,6 +334,24 @@ struct PackageIdentity::State {
   std::uint32_t session{};
   std::weak_ptr<IProcessBackend> observer;
 };
+Result<std::wstring> process_detail::ResolveProcessImagePath(const std::wstring& path) {
+  const auto ordinary=CanonicalExecutable(path);
+  if(IsOk(ordinary)||path.size()<MAX_PATH||path.starts_with(L"\\\\?\\"))return ordinary;
+  const auto& error=Failure(ordinary);
+  if(error.code!=ErrorCode::AccessDenied||error.operation.view()!="executable_attributes"||
+      !(error.native_code==2U||error.native_code==3U||error.native_code==206U))return ordinary;
+  std::wstring absolute(MaxPath,L'\0');
+  const auto length=GetFullPathNameW(path.c_str(),static_cast<DWORD>(absolute.size()),absolute.data(),nullptr);
+  if(!length||length>=absolute.size())return ordinary;
+  absolute.resize(length);
+  std::wstring extended;
+  if(absolute.size()>=3&&absolute[1]==L':'&&absolute[2]==L'\\')extended=L"\\\\?\\"+absolute;
+  else if(absolute.starts_with(L"\\\\")&&!absolute.starts_with(L"\\\\.\\"))extended=L"\\\\?\\UNC\\"+absolute.substr(2);
+  else return ordinary;
+  // This only normalizes an OS image spelling. The final value still comes from
+  // the file handle and must pass the unchanged package/process equality guards.
+  return CanonicalExecutable(extended);
+}
 Result<std::wstring> process_detail::ResolvePackageExecutable(const std::wstring& root, const RegisteredPackageMetadata& registered) {
   return ManifestExecutable(root, registered);
 }
@@ -1483,7 +1501,7 @@ namespace {
 Result<RuntimeInventory> Inventory(HANDLE process, std::uint32_t pid, std::uint64_t creation, const IMemory& memory) {
   const auto identity = VerifiedIdentityFactory::Revalidate(process, pid, creation);
   if (!IsOk(identity)) return Failure(identity);
-  const auto package = DiscoverPackage();
+  const auto package = process_detail::RefreshInventoryPackage<PackageIdentity>(identity, [](std::optional<std::wstring_view> hint) { return DiscoverPackage(hint); });
   if (!IsOk(package)) return Failure(package);
   RuntimeInventory inventory;
   inventory.package_name = Value(package).name();

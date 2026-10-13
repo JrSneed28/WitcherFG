@@ -748,3 +748,54 @@ TEST("process.disk_only_unclassified_proxy_refuses_before_missing_provider") {
   REQUIRE_ERROR(missing, wfg::ErrorCode::ModuleNotReady);
   CHECK(inspections == 0);
 }
+
+TEST("process.pinned_long_image_normalization_retains_handle_backed_registered_equality") {
+  test_fixture::LongPathPinnedPackage f;
+  const auto expected=wfg::process_detail::ResolveRegisteredExecutable(f.plain.wstring(),f.documents.identity,f.plain.wstring());
+  CHECK(wfg::IsOk(expected));
+  const auto actual=wfg::process_detail::ResolveProcessImagePath(f.raw_image);
+  CHECK(wfg::IsOk(actual));CHECK(wfg::Value(actual)==wfg::Value(expected));
+}
+namespace {
+void RecoveredInventoryRefresh(bool owned) {
+  test_fixture::LongPathPinnedPackage f;
+  const auto automatic=wfg::process_detail::ResolveRegisteredExecutable(f.plain.wstring(),f.documents.identity);
+  CHECK(!wfg::IsOk(automatic));CHECK(wfg::Failure(automatic).operation.view()=="manual_game_path_recoverable");
+  const auto canonical=wfg::process_detail::ResolveRegisteredExecutable(f.plain.wstring(),f.documents.identity,f.plain.wstring());
+  CHECK(wfg::IsOk(canonical));
+  const auto pinned=wfg::process_detail::ResolveProcessImagePath(f.raw_image);CHECK(wfg::IsOk(pinned));
+  CHECK(wfg::Value(pinned)==wfg::Value(canonical));
+  const auto association=wfg::process_detail::ResolveRegisteredExecutable(f.plain.wstring(),f.documents.identity,wfg::Value(pinned));
+  CHECK(wfg::IsOk(association));CHECK(wfg::Value(association)==wfg::Value(pinned));
+  const auto selected=f.Selected(owned,wfg::Value(pinned));CHECK(wfg::IsOk(selected));
+  int lookups{};
+  const auto refreshed=wfg::process_detail::RefreshInventoryPackage<std::wstring>(selected,[&](std::optional<std::wstring_view> hint) -> wfg::Result<std::wstring> {
+    ++lookups;return wfg::process_detail::ResolveRegisteredExecutable(f.plain.wstring(),f.documents.identity,hint);
+  });
+  if(!wfg::IsOk(refreshed))throw std::runtime_error("inventory refresh failed: "+std::string(wfg::Failure(refreshed).operation.view()));
+  CHECK(wfg::Value(refreshed)==wfg::Value(canonical));CHECK(lookups==1);
+}
+}
+TEST("process.recovered_owned_launch_inventory_retains_independently_selected_executable") {RecoveredInventoryRefresh(true);}
+TEST("process.recovered_readonly_inventory_retains_independently_selected_executable") {RecoveredInventoryRefresh(false);}
+TEST("process.inventory_refresh_rejects_failed_identity_unrelated_hint_and_changed_documents") {
+  test_fixture::LongPathPinnedPackage f;
+  const auto canonical=wfg::process_detail::ResolveRegisteredExecutable(f.plain.wstring(),f.documents.identity,f.plain.wstring());CHECK(wfg::IsOk(canonical));
+  auto selected=f.Selected(true,wfg::Value(canonical));CHECK(wfg::IsOk(selected));
+  int lookups{};
+  const auto lookup=[&](std::optional<std::wstring_view> hint) -> wfg::Result<std::wstring> {
+    ++lookups;return wfg::process_detail::ResolveRegisteredExecutable(f.plain.wstring(),f.documents.identity,hint);
+  };
+  auto changed_identity=wfg::Value(selected);++changed_identity.creation_time;
+  const wfg::LaunchIdentity expected{0,1,L"fixture-user",L"fixture-package",wfg::Value(canonical),true};
+  const auto failed=wfg::SelectCandidate(std::span(&changed_identity,1),expected);
+  CHECK(!wfg::IsOk(failed));CHECK(wfg::Failure(failed).operation.view()=="pinned_identity");
+  const auto refused=wfg::process_detail::RefreshInventoryPackage<std::wstring>(failed,lookup);CHECK(!wfg::IsOk(refused));CHECK(lookups==0);
+  PackageDocuments unrelated;REQUIRE_OK(unrelated.Resolve());std::filesystem::create_directories(unrelated.root/L"bin"/L"Gaming.Desktop.x64");
+  {std::ofstream file(unrelated.root/L"bin"/L"Gaming.Desktop.x64"/L"witcher3.exe");file << "fixture";}
+  auto altered=wfg::Value(selected);altered.executable=(unrelated.root/L"bin"/L"Gaming.Desktop.x64"/L"witcher3.exe").wstring();
+  const auto foreign=wfg::process_detail::RefreshInventoryPackage<std::wstring>(wfg::Result<wfg::Candidate>{altered},lookup);CHECK(!wfg::IsOk(foreign));
+  PackageDocuments::Replace(f.documents.config,"Version=\"5.0.4.0\"","Version=\"5.0.5.0\"");
+  {std::ofstream file(f.extended/L"MicrosoftGame.Config");file << f.documents.config;}
+  const auto changed=wfg::process_detail::RefreshInventoryPackage<std::wstring>(selected,lookup);CHECK(!wfg::IsOk(changed));
+}
