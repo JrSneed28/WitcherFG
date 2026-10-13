@@ -13,9 +13,15 @@ Run these from the executable's folder in PowerShell:
 | `.\WitcherFG.exe --version` | Show version, build configuration, source commit and input digest |
 | `.\WitcherFG.exe --diagnose` | Read an eligible existing registered process; no activation or debugger attach |
 | `.\WitcherFG.exe --collect-support` | Create a local sanitized support ZIP; no game activation or patching |
+| `.\WitcherFG.exe --game-path "D:\XboxGames\The Witcher 3\Content"` | Supply an ephemeral installation-location hint for a guarded launch |
+| `.\WitcherFG.exe --diagnose --game-path "D:\XboxGames\The Witcher 3\Content\bin\Gaming.Desktop.x64\witcher3.exe"` | Use the hint for read-only diagnosis |
 | `.\WitcherFG.exe --log-level error` | Override verbosity; `info` and `debug` are also allowed |
 
 Choose at most one explicit mode. Unknown options, duplicate modes/verbosity, missing verbosity values and invalid values refuse with `ConfigurationInvalid`. The verbosity override can accompany a mode; it changes only logging.
+
+The path may name `witcher3.exe`, its containing folder, `bin`, or the registered game root. Windows Unicode paths are supported. The supplied location must match the current user's registered installation by Windows file handles and package documents. Copies, unrelated folders, missing targets, ambiguous registrations and mismatched package identities refuse. A hint grants no permission to skip any guard or start an executable directly.
+
+The path option works only for launch and read-only diagnosis. Duplicates, missing/empty/oversized values, invalid UTF-8 and combinations with help, version or support collection refuse before discovery. It is never written to TOML, diagnostics or support archives; provide it again on a later run. A real console may offer entry after a recoverable executable-location failure. Redirected input/output refuses immediately and prints the CLI retry syntax. Empty input, Escape, cancellation or the overall deadline refuses without activation.
 
 ## Schema 1 settings
 

@@ -337,6 +337,65 @@ struct PackageIdentity::State {
 Result<std::wstring> process_detail::ResolvePackageExecutable(const std::wstring& root, const RegisteredPackageMetadata& registered) {
   return ManifestExecutable(root, registered);
 }
+Result<std::wstring> process_detail::ResolveManualExecutableHint(const std::wstring& root, const RegisteredPackageMetadata& registered, const std::wstring& hint) {
+  const auto refused = [] { return Fail(ErrorCode::UnsupportedBuild, "manual_game_path_unrelated", Stage::Discover); };
+  if (hint.empty() || hint.size() >= MaxPath || hint.find(L'\0') != hint.npos || !std::filesystem::path(hint).is_absolute()) return refused();
+  auto registered_root = Hold(CreateFileW(root.c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr));
+  auto selected = Hold(CreateFileW(hint.c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr));
+  BY_HANDLE_FILE_INFORMATION root_info{}, hint_info{};
+  if (registered_root.get() == INVALID_HANDLE_VALUE || selected.get() == INVALID_HANDLE_VALUE ||
+      !GetFileInformationByHandle(registered_root.get(), &root_info) || !GetFileInformationByHandle(selected.get(), &hint_info) ||
+      !(root_info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) return refused();
+  const auto final_path = [](HANDLE handle) -> std::wstring {
+    std::wstring value(MaxPath, L'\0');
+    const auto length = GetFinalPathNameByHandleW(handle, value.data(), static_cast<DWORD>(value.size()), FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+    if (!length || length >= value.size()) return {};
+    value.resize(length); return value;
+  };
+  const auto canonical_root = final_path(registered_root.get());
+  const auto canonical_hint = final_path(selected.get());
+  if (canonical_root.empty() || canonical_hint.empty()) return refused();
+  const bool directory = (hint_info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+  if (!directory && !Equal(std::filesystem::path(canonical_hint).filename().wstring(), L"witcher3.exe")) return refused();
+  auto ancestor = directory ? std::filesystem::path(hint) : std::filesystem::path(hint).parent_path();
+  for (;;) {
+    auto candidate = Hold(CreateFileW(ancestor.c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr));
+    BY_HANDLE_FILE_INFORMATION info{};
+    if (candidate.get() != INVALID_HANDLE_VALUE && GetFileInformationByHandle(candidate.get(), &info) &&
+        (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && info.dwVolumeSerialNumber == root_info.dwVolumeSerialNumber &&
+        info.nFileIndexHigh == root_info.nFileIndexHigh && info.nFileIndexLow == root_info.nFileIndexLow && Equal(final_path(candidate.get()), canonical_root)) {
+      const auto target = ResolvePackageExecutable(ancestor.wstring(), registered);
+      if (!IsOk(target)) return Failure(target);
+      const auto executable = CanonicalExecutable(Value(target));
+      if (!IsOk(executable)) return Failure(executable);
+      const auto& canonical = Value(executable);
+      const auto inside = [](std::wstring_view child, std::wstring_view parent) {
+        return child.size() > parent.size() && child[parent.size()] == L'\\' && Equal(child.substr(0, parent.size()), parent);
+      };
+      if (!inside(canonical, canonical_root)) return refused();
+      if (directory ? !(Equal(canonical_hint, canonical_root) || inside(canonical, canonical_hint)) : !Equal(canonical_hint, canonical)) return refused();
+      return canonical;
+    }
+    const auto parent = ancestor.parent_path();
+    if (parent.empty() || parent == ancestor) return refused();
+    ancestor = parent;
+  }
+}
+bool process_detail::CanRequestManualGamePath(const Error& error) {
+  const auto operation=error.operation.view();
+  return error.code==ErrorCode::AccessDenied &&
+    ((operation=="executable_attributes" && error.stage==Stage::process_identity) ||
+     (operation=="package_document" && error.stage==Stage::package_discovery)) &&
+    (error.native_code==2U || error.native_code==3U);
+}
+Result<std::wstring> process_detail::RequestManualGamePath(bool interactive, const std::function<Result<std::wstring>()>& read) {
+  if (!interactive) return Fail(ErrorCode::LaunchFailed, "manual_game_path_required", Stage::Discover);
+  const auto value = read();
+  if (!IsOk(value)) return Failure(value);
+  if (Value(value).empty() || Value(value).size() >= MaxPath || Value(value).find(L'\0') != Value(value).npos)
+    return Fail(ErrorCode::LaunchFailed, "manual_game_path_cancelled", Stage::Discover);
+  return value;
+}
 std::string PackageIdentity::name() const { return Safe(PackageName); }
 std::string PackageIdentity::version() const { return Safe(state_->version); }
 std::string PackageIdentity::family() const { return Safe(Family); }
@@ -406,7 +465,7 @@ Result<Candidate> ProcessObserver::WaitForCandidate() {
   return Fail(ErrorCode::TimedOut, "discovery_deadline");
 }
 
-Result<PackageIdentity> DiscoverPackage() {
+Result<PackageIdentity> DiscoverPackage(std::optional<std::wstring_view> game_path) {
   const auto full_name = RegisteredFullName();
   if (!IsOk(full_name)) return Failure(full_name);
   UINT32 size{};
@@ -421,8 +480,6 @@ Result<PackageIdentity> DiscoverPackage() {
   if (!IsOk(application)) return Failure(application);
   const auto version = std::to_wstring(id->version.Major) + L"." + std::to_wstring(id->version.Minor) + L"." + std::to_wstring(id->version.Build) + L"." + std::to_wstring(id->version.Revision);
   const process_detail::RegisteredPackageMetadata registered{id->name, id->publisher, version, id->resourceId, L"x64"};
-  const auto executable = process_detail::ResolvePackageExecutable(Value(root), registered);
-  if (!IsOk(executable)) return Failure(executable);
   const auto user = User(GetCurrentProcess());
   if (!IsOk(user)) return Failure(user);
   HANDLE impersonation{};
@@ -431,11 +488,13 @@ Result<PackageIdentity> DiscoverPackage() {
     return Fail(ErrorCode::AccessDenied, "impersonated_user", Stage::Discover);
   }
   if (GetLastError() != ERROR_NO_TOKEN) return Fail(ErrorCode::AccessDenied, "interactive_user_token", Stage::Discover);
+  DWORD session{};
+  if (!ProcessIdToSessionId(GetCurrentProcessId(), &session) || session == 0) return Fail(ErrorCode::AccessDenied, "interactive_session", Stage::Discover);
+  const auto executable = game_path ? process_detail::ResolveManualExecutableHint(Value(root), registered, std::wstring(*game_path)) : process_detail::ResolvePackageExecutable(Value(root), registered);
+  if (!IsOk(executable)) return Failure(executable);
   const auto canonical_executable = CanonicalExecutable(Value(executable));
   if (!IsOk(canonical_executable)) return Failure(canonical_executable);
   auto state = std::make_shared<PackageIdentity::State>();
-  DWORD session{};
-  if (!ProcessIdToSessionId(GetCurrentProcessId(), &session) || session == 0) return Fail(ErrorCode::AccessDenied, "interactive_session", Stage::Discover);
   state->session = session;
   state->full_name = Value(full_name);
   state->root = Value(root);
@@ -452,7 +511,7 @@ public:
   void Sleep(std::chrono::milliseconds duration) override { std::this_thread::sleep_for(duration); }
   Result<Unit> Install() override { installed_ = true; return Unit{}; }
   Result<Unit> CheckRegistration() override {
-    const auto current = DiscoverPackage();
+    const auto current = DiscoverPackage(package_.state_->executable);
     if (!IsOk(current)) return Fail(ErrorCode::IdentityChanged, "registration_changed");
     const auto& state = *Value(current).state_;
     const auto& previous = *package_.state_;
@@ -547,11 +606,11 @@ public:
     return SelectCandidate(std::span(&Value(actual), 1), launch);
   }
   static Result<Candidate> Revalidate(HANDLE handle, std::uint32_t pid, std::uint64_t creation) {
-    const auto package = DiscoverPackage();
-    if (!IsOk(package)) return Failure(package);
-    NativeProcessBackend backend(Value(package));
     auto actual = InspectCandidate(handle);
     if (!IsOk(actual)) return Failure(actual);
+    const auto package = DiscoverPackage(Value(actual).executable);
+    if (!IsOk(package)) return Failure(package);
+    NativeProcessBackend backend(Value(package));
     if (Value(actual).pid != pid || Value(actual).creation_time != creation) return Fail(ErrorCode::IdentityChanged, "pinned_process_changed");
     return SelectCandidate(std::span(&Value(actual), 1), backend.Identity(false));
   }

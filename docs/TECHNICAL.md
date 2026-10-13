@@ -20,6 +20,14 @@ flowchart TD
 
 `ILaunchEnvironment` supplies configuration, clock/guard, package/activation, process pin, memory, debugger, inventory, compatibility, observation, diagnostics and collector interfaces. `IMemory`/`IWritableMemory` separate inspection from writes. `IDebugBackend` owns native debug operations; `DebugSession` records safety/detach/termination evidence. `IRunGuard` bounds returned results and final output; unsafe terminal helper exit occurs before result formatting or timestamps.
 
+## Manual installation hint
+
+`--game-path <folder-or-witcher3.exe>` is an ephemeral UTF-8 command-line hint; the native `wmain` preserves Unicode by converting UTF-16 with strict Windows conversion APIs. Configuration keeps it outside `EffectiveConfig`, so diagnostic/support serialization never includes it. Launch and read-only diagnosis accept it; help, version and collection refuse combinations before discovery.
+
+Resolution retains Windows handles for the registered directory, selected hint and matching ancestor while checking volume/file identity and canonical path equality. The registered manifest and helper configuration determine the executable; a metadata-matching copy does not establish registration. The executable must remain canonically inside the registered root, and a folder hint must contain that target. Registration rechecks reuse the validated executable hint and revalidate the current manifest and canonical executable. Memory capability checks independently inspect the pinned process before rediscovery; fresh creation time, session, user, package and executable checks remain mandatory.
+
+Only missing-file/path failures in executable or package-document discovery can offer console entry after supported registration and AUMID validation. Real console handles are required for both input and output; redirected streams return retry syntax without reading. Console input polls cancellation and the existing overall deadline. Empty input/Escape refuses. No path selection persists, grants mutation authority or changes registered Explorer activation, remote fingerprint/import/trust/factory validation, privilege level, ACLs or game files.
+
 ## Compiled build record and exact mappings
 
 | Guard | Required value |

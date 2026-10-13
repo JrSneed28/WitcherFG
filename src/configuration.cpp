@@ -4,6 +4,8 @@
 #include "../third_party/tomlplusplus/toml.hpp"
 
 #include <algorithm>
+#define NOMINMAX
+#include <windows.h>
 #include <array>
 #include <fstream>
 #include <string>
@@ -118,6 +120,14 @@ Result<CommandLine> ParseOptions(std::span<const std::string_view> arguments) {
       else if (argument == "--version") command_line.mode = Mode::Version;
       else if (argument == "--diagnose") command_line.mode = Mode::Diagnose;
       else command_line.mode = Mode::CollectSupport;
+    } else if (argument == "--game-path") {
+      if (command_line.game_path || index + 1 >= arguments.size()) return InvalidConfig("invalid_game_path_option");
+      const auto value = arguments[++index];
+      if (value.empty() || value.size() > 131068 || value.starts_with("--") || value.find('\0') != value.npos)
+        return InvalidConfig("invalid_game_path_value");
+      const auto characters = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.data(), static_cast<int>(value.size()), nullptr, 0);
+      if (characters <= 0 || characters >= 32768) return InvalidConfig("invalid_game_path_encoding_or_length");
+      command_line.game_path = std::string(value);
     } else if (argument == "--log-level") {
       if (log_level_seen || index + 1 >= arguments.size()) return InvalidConfig("invalid_log_level_option");
       log_level_seen = true;
@@ -130,6 +140,8 @@ Result<CommandLine> ParseOptions(std::span<const std::string_view> arguments) {
       return InvalidConfig("unknown_argument");
     }
   }
+  if (command_line.game_path && command_line.mode != Mode::Launch && command_line.mode != Mode::Diagnose)
+    return InvalidConfig("game_path_mode_conflict");
   return command_line;
 }
 

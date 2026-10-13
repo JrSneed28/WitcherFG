@@ -17,6 +17,7 @@ The canonical records are [compatibility.toml](compatibility.toml). A **Verified
 | Epic/GOG executables | Untested | Pending | Initial compiled Xbox eligibility does not authorize these stores/builds. |
 | Other NVIDIA driver versions | Untested | Pending | Not independently verified. |
 | Other upscaler/FG mods, Vortex, other mod managers | Untested | Pending | No named/versioned coexistence or manager test exists. |
+| Black-screen resolution reported 2026-10-12 | Reported | Pending | User reports black screen resolved. Historical probes retained; cause and native gameplay FG remain unverified. |
 <!-- END WFG COMPATIBILITY -->
 
 Probe evidence date: 2026-10-10. The local environment was Xbox menu 5.01/package 5.0.4.0, Direct3D 12, RTX 5070 Ti, NVIDIA 617.42, Windows 11 Pro build 26200 and 2560 × 1440. Window mode, selected-adapter runtime state and active HAGS are not independently established by this matrix. The original NVIDIA profile was retained.

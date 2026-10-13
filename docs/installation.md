@@ -28,6 +28,16 @@ The game executable `bin\Gaming.Desktop.x64\witcher3.exe` and its registered Xbo
 
 The launcher uses registered activation for the current user. Starting the game first can produce `AlreadyRunning`; a factory created before inspection produces `StartupTooLate`. Neither is a reason to change game permissions or run automatic elevation.
 
+## When executable discovery fails
+
+If the registered package is supported but executable-location discovery fails, an interactive console can request a path. Enter the registered game root, executable's containing folder, or `witcher3.exe` without surrounding quotes; an empty line or Escape cancels. With redirected input/output, retry explicitly:
+
+```powershell
+.\WitcherFG.exe --game-path "D:\XboxGames\The Witcher 3\Content"
+```
+
+Use the actual registered installation on your machine. The example is a placeholder. The selection is not saved and cannot repair an unregistered, unsupported or unrelated copy. The launcher still uses validated registered activation through Explorer; every process and routing guard remains mandatory. Read-only diagnosis also accepts the path. See [supported commands](configuration.md).
+
 ## Upgrade while preserving configuration
 
 1. Close the game and every utility instance.

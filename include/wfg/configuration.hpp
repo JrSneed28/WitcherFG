@@ -19,6 +19,7 @@ enum class ConfigOrigin { Default, File, CommandLine };
 struct CommandLine {
   Mode mode{Mode::Launch};
   std::optional<LogLevel> log_level;
+  std::optional<std::string> game_path;
 };
 
 struct EffectiveConfig {

@@ -56,7 +56,7 @@ private:
   std::shared_ptr<State> state_;
   friend class NativeProcessBackend;
   friend class VerifiedIdentityFactory;
-  friend Result<PackageIdentity> DiscoverPackage();
+  friend Result<PackageIdentity> DiscoverPackage(std::optional<std::wstring_view>);
   friend Result<Unit> ActivateRegistered(const PackageIdentity&);
   friend Result<ObservedProcess> OpenDiagnosticTarget(const PackageIdentity&);
   friend Result<std::unique_ptr<class ProcessObserver>> StartObserver(const PackageIdentity&, Deadline);
@@ -81,7 +81,7 @@ private:
 };
 
 Result<std::unique_ptr<ProcessObserver>> InstallProcessObserver(LaunchIdentity launch, IProcessBackend& backend, Deadline deadline);
-Result<PackageIdentity> DiscoverPackage();
+Result<PackageIdentity> DiscoverPackage(std::optional<std::wstring_view> game_path = {});
 Result<std::unique_ptr<ProcessObserver>> StartObserver(const PackageIdentity& package, Deadline deadline);
 Result<Unit> ActivateRegistered(const PackageIdentity& package);
 Result<RuntimeInventory> InventoryProcess(const OwnedProcess& process, const IMemory& memory);
@@ -107,6 +107,9 @@ struct RegisteredPackageMetadata {
   std::wstring architecture;
 };
 Result<std::wstring> ResolvePackageExecutable(const std::wstring& root, const RegisteredPackageMetadata& registered);
+Result<std::wstring> ResolveManualExecutableHint(const std::wstring& root, const RegisteredPackageMetadata& registered, const std::wstring& hint);
+bool CanRequestManualGamePath(const Error& error);
+Result<std::wstring> RequestManualGamePath(bool interactive, const std::function<Result<std::wstring>()>& read);
 #ifdef WFG_LIFECYCLE_TESTING
 // Disposable-child test core only. No package eligibility bypass in production.
 Result<std::unique_ptr<IWritableMemory>> OpenLifecycleMemory(const OwnedProcess&);

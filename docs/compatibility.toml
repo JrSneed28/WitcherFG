@@ -117,3 +117,13 @@ evidence_method = "None for native player release"
 evidence_date = ""
 game_identity = "Initial record: Xbox package 5.0.4.0 only"
 details = "No named/versioned coexistence or manager test exists."
+
+[[compatibility]]
+component = "Black-screen resolution reported 2026-10-12"
+status = "Reported"
+scope = "native_release"
+native_release_status = "Pending"
+evidence_method = "User report; no new native artifact gameplay acceptance"
+evidence_date = "2026-10-12"
+game_identity = "Xbox Witcher 3; exact native candidate acceptance remains Pending"
+details = "User reports black screen resolved. Historical probes retained; cause and native gameplay FG remain unverified."

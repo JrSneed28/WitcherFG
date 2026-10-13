@@ -89,6 +89,7 @@ struct Fixture final : ILaunchEnvironment {
   SupportedRuntimeFixture runtime;Backend backend;::Memory memory{runtime,backend};Storage storage;
   CompatibilityRecord compatibility=runtime.SyntheticBuild();
   EffectiveConfig config=DefaultConfiguration();std::vector<std::string_view> args;
+  std::optional<std::string> configured_path;
   std::optional<Error> config_error,discover_error,inventory_error,collect_error,observe_error;
   EnvironmentSnapshot host;
   int configurations{},discoveries{},installed{},activated{},pins{},memory_opens{},inventories{},observations{},collections{};
@@ -98,7 +99,7 @@ struct Fixture final : ILaunchEnvironment {
   std::span<const std::string_view> Arguments()const override{return args;}
   std::chrono::steady_clock::time_point Now()const override{return backend.now;}
   Result<EffectiveConfig> Configuration(const CommandLine& options)override{
-    ++configurations;if(config_error)return *config_error;auto effective=config;
+    configured_path=options.game_path;++configurations;if(config_error)return *config_error;auto effective=config;
     if(options.log_level){effective.log_level=*options.log_level;effective.origins["logging.level"]=ConfigOrigin::CommandLine;}return effective;
   }
   ILogStorage& Diagnostics()override{return storage;}
@@ -357,4 +358,34 @@ TEST("launcher.startup_handshake_unrelated_exception_is_not_swallowed") {
 TEST("launcher.startup_handshake_target_exit_never_inspects") {
   Fixture f;f.backend.events={{DebugEventKind::ProcessCreated,42,7},{DebugEventKind::ProcessExited,42,7}};
   const auto result=RunLauncher(f,{});CHECK(result.failure);CHECK(result.failure->code==ErrorCode::NoMatchingProcess);CHECK(f.inventories==0);CHECK(f.memory.writes==0&&f.memory.protects==0);
+}
+
+TEST("launcher.manual_path_refusal_never_activates_or_opens_memory_and_keeps_paths_private") {
+  Fixture f;
+  f.args={"--game-path","C:\\Users\\PrivatePlayer\\Game\\witcher3.exe"};
+  f.discover_error=Error{ErrorCode::UnsupportedBuild,Stage::package_discovery,"manual_game_path_unrelated"};
+  const auto result=RunLauncher(f,{});
+  CHECK(f.discoveries==1); CHECK(f.configured_path == f.args[1]);
+  CHECK(f.activated==0&&f.installed==0&&f.pins==0&&f.memory_opens==0&&f.backend.attaches==0&&f.memory.writes==0);
+  CHECK(result.failure.has_value());
+  CHECK(f.storage.summary.find("PrivatePlayer")==std::string::npos);
+  CHECK(f.storage.console.find("PrivatePlayer")==std::string::npos);
+}
+TEST("launcher.manual_path_diagnose_remains_read_only") {
+  Fixture f; f.args={"--diagnose","--game-path","C:\\Game"};
+  const auto result=RunLauncher(f,{});
+  CHECK(result.status==Status::ReadOnlyCompleted); CHECK(f.discoveries==1&&f.observations==1); CHECK(f.configured_path == f.args[2]);
+  CHECK(f.activated==0&&f.installed==0&&f.pins==0&&f.memory_opens==0&&f.backend.attaches==0&&f.memory.writes==0);
+}
+TEST("launcher.manual_path_requires_retry_syntax_without_activation") {
+  Fixture f; f.discover_error=Error{ErrorCode::LaunchFailed,Stage::package_discovery,"manual_game_path_required"};
+  const auto result=RunLauncher(f,{});
+  CHECK(result.next_action.find("WitcherFG.exe --game-path \"<folder-or-witcher3.exe>\"")!=std::string::npos);
+  CHECK(f.activated==0&&f.backend.attaches==0&&f.memory.writes==0);
+}
+
+TEST("launcher.manual_path_does_not_bypass_factory_import_or_trust_guards") {
+  Fixture factory;factory.args={"--game-path","C:\\Game"};factory.runtime.SetFactory(factory.runtime.native_factory);Refusal(factory,Status::StartupTooLate);
+  Fixture mixed;mixed.args={"--game-path","C:\\Game"};mixed.runtime.SetImportPointer("CreateDXGIFactory",mixed.runtime.InterposerExport("CreateDXGIFactory"));Refusal(mixed,Status::UnexpectedImports);
+  Fixture trust;trust.args={"--game-path","C:\\Game"};trust.inventory_error=Fault(ErrorCode::UntrustedInterposer,Stage::dependencies);Refusal(trust,Status::UntrustedInterposer);
 }

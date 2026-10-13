@@ -12,6 +12,7 @@ Use the final status, code, stage and operation together. The table below is the
 | Interposer cannot be trusted | `WFG-E-INTERPOSER_UNTRUSTED` | Signed/versioned/hash/backing-image evidence did not validate | Restore the installation through its supported repair path. Do not download a replacement DLL from an arbitrary source. |
 | Debugger access denied | `WFG-E-ATTACH_DENIED` | Windows refused required debugger access | Close the game and retry from the current user's session. Retain the native error; automatic elevation is not provided. |
 | Graphics startup already happened | `WFG-E-STARTUP_TOO_LATE` | Non-null graphics factory or unsafe layout prevented mutation | Close the game and start WitcherFG before a fresh session. The guard cannot be bypassed. |
+| Registered executable cannot be located | `WFG-E-LAUNCH_FAILED` | An installation hint may resolve a missing executable location; registration and package validation remain mandatory | In a real console, enter the supported installation path when prompted. Otherwise retry `WitcherFG.exe --game-path "D:\XboxGames\The Witcher 3\Content"`; add `--diagnose` for read-only diagnosis. Cancelled, unrelated or unverifiable selections refuse before activation. |
 | Launch/discovery/collector failure | `WFG-E-LAUNCH_FAILED` | See the recorded stage and operation; collector failures also use this general stable code | Check registered Xbox installation, current-user session, existing game and fixed local storage. Preserve the operation/native code and console result. |
 | Import write failed | `WFG-E-IAT_WRITE` | A stopped-process pointer write failed | Follow the reported rollback/abort result; do not retry while the game remains open. |
 | Import verification failed | `WFG-E-IAT_VERIFY` | Read-back did not confirm intended pointers | Follow the verified restoration/abort result and retain diagnostics. |
@@ -21,9 +22,11 @@ Use the final status, code, stage and operation together. The table below is the
 | Runtime observation unavailable | `WFG-W-OBSERVATION_UNAVAILABLE` | Current production SDK catalog is empty, or process/layout access is unavailable | Keep the field Unknown. Inventory/import facts may still exist; enabling Debug does not supply SDK offsets. |
 | Activity absent in a bounded observation | `WFG-W-FG_ACTIVITY_NOT_OBSERVED` | Requires valid activity fields; currently exercised by fixtures, not the empty production catalog | Record scope and observation window. Do not promote this warning into proof of general FG failure. |
 | Decoded SDK rejection | `WFG-E-FG_REJECTED` | Requires independently validated matching vendor status/code/reason; production layouts currently unavailable | Preserve the actual decoded evidence when supported; never guess a rejection from an unknown field. |
-| Black world after temporary routing | No dedicated code | Seen in the earlier diagnostic probe; exact cause remains unproven | Use the manual recovery below. Native candidate behavior remains Pending. |
+| Black world after temporary routing | No dedicated code | Historical diagnostic probes saw this symptom; the user now reports it resolved | Retain the historical recovery notes below. This report does not verify native candidate gameplay or FG. |
 
 ## Manual black-world recovery
+
+The user reported the black screen resolved on 2026-10-12. The resolution is a user report, separately labelled from native artifact gameplay acceptance; its cause and native FG remain unverified. Historical evidence is retained below.
 
 The earlier local Xbox diagnostic probe required a ray tracing reset before normal world rendering and smoother motion were confirmed. In that tested session:
 

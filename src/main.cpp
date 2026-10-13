@@ -26,10 +26,14 @@ int wmain(int argc,wchar_t** argv) {
   try {
     std::vector<std::string> storage;
     for(int i=1;i<argc;++i) {
+      const auto length = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, argv[i], -1, nullptr, 0, nullptr, nullptr);
       std::string argument;
-      for(const auto* p=argv[i];*p;++p) {
-        if(*p>127){argument="--invalid-nonascii-option";break;}
-        argument.push_back(static_cast<char>(*p));
+      if (length <= 0) argument = "--invalid-unicode-argument";
+      else {
+        argument.resize(static_cast<std::size_t>(length));
+        if (!WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, argv[i], -1, argument.data(), length, nullptr, nullptr))
+          argument = "--invalid-unicode-argument";
+        else argument.pop_back();
       }
       storage.push_back(std::move(argument));
     }

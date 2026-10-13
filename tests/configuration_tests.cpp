@@ -175,3 +175,26 @@ TEST("configuration.parses_only_supported_modes_and_log_level") {
   const std::vector<std::string_view> snapshot{"--config-snapshot", "selected.toml"};
   REQUIRE_ERROR(wfg::ParseOptions(snapshot), wfg::ErrorCode::ConfigurationInvalid);
 }
+
+TEST("configuration.manual_path_launch_and_diagnose_accept_utf8") {
+  for (const auto mode : {std::string_view{}, std::string_view{"--diagnose"}}) {
+    std::vector<std::string_view> args{"--game-path", "C:\\Games\\\xe7\x8c\xab\\witcher3.exe"};
+    if (!mode.empty()) args.push_back(mode);
+    const auto parsed = wfg::ParseOptions(args);
+    CHECK(wfg::IsOk(parsed));
+    if (wfg::IsOk(parsed)) CHECK(wfg::Value(parsed).game_path == args[1]);
+  }
+}
+TEST("configuration.manual_path_rejects_invalid_values_and_modes") {
+  const std::vector<std::vector<std::string_view>> invalid{
+    {"--game-path"}, {"--game-path", ""}, {"--game-path", "--diagnose"},
+    {"--game-path", "C:\\Game", "--game-path", "C:\\Other"},
+    {"--help", "--game-path", "C:\\Game"}, {"--game-path", "C:\\Game", "--version"},
+    {"--collect-support", "--game-path", "C:\\Game"}, {"--game-path", "\xc0\xaf"},
+    {"--game-path", "\xed\xa0\x80"}, {"--game-path", "\xf4\x90\x80\x80"},
+    {"--game-path", std::string_view{"C:\\Game\0secret", 14}}};
+  for (const auto& args : invalid) REQUIRE_ERROR(wfg::ParseOptions(args), wfg::ErrorCode::ConfigurationInvalid);
+  const std::string oversized(131069, 'x');
+  const std::vector<std::string_view> args{"--game-path", oversized};
+  REQUIRE_ERROR(wfg::ParseOptions(args), wfg::ErrorCode::ConfigurationInvalid);
+}

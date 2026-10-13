@@ -344,6 +344,17 @@ class NativeDocumentation(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, r"refused \(2\).*CONFIG_INVALID"):
                 read_config_snapshot(runner, config)
 
+    @unittest.skipUnless(os.environ.get("WFG_LAUNCHER"), "set WFG_LAUNCHER for Unicode entry-point integration")
+    def test_native_unicode_path_reaches_mode_validation_and_is_not_disclosed(self):
+        binary = os.environ["WFG_LAUNCHER"]
+        path = "C:\\Users\\PrivatePlayer\\\u732b\\witcher3.exe"
+        result = subprocess.run([binary, "--game-path", path, "--help"],
+                                capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("game_path_mode_conflict", result.stdout)
+        self.assertNotIn("PrivatePlayer", result.stdout + result.stderr)
+        self.assertNotIn("invalid-unicode", result.stdout + result.stderr)
+
     @unittest.skipUnless(os.environ.get("WFG_LAUNCHER"), "set WFG_LAUNCHER for actual native help/version")
     def test_documented_options_match_help_and_version_metadata(self):
         binary = os.environ["WFG_LAUNCHER"]

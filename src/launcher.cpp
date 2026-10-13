@@ -108,7 +108,7 @@ std::array<char,20> UtcStamp() {
   std::array<char,21> buffer{};std::strftime(buffer.data(),buffer.size(),"%Y-%m-%dT%H:%M:%SZ",&utc);
   std::array<char,20> result{};std::copy_n(buffer.begin(),20,result.begin());return result;
 }
-constexpr std::string_view Help="WitcherFG\nUsage: WitcherFG [--help | --version | --diagnose | --collect-support] [--log-level error|info|debug]\nNo arguments: launch the registered Xbox PC game and attempt guarded session routing.\n--diagnose: observe an existing registered game without activation or debugger attach.\n--collect-support: create a local sanitized support archive.\nRuntime observation is off by default; no telemetry or automatic elevation.\n";
+constexpr std::string_view Help="WitcherFG\nUsage: WitcherFG [--help | --version | --diagnose | --collect-support] [--log-level error|info|debug] [--game-path <folder-or-witcher3.exe>]\n--game-path: ephemeral registered-installation hint for launch or --diagnose only; never saved.\nNo arguments: launch the registered Xbox PC game and attempt guarded session routing.\n--diagnose: observe an existing registered game without activation or debugger attach.\n--collect-support: create a local sanitized support archive.\nRuntime observation is off by default; no telemetry or automatic elevation.\n";
 }
 
 int ExitCode(Status status) noexcept {
@@ -149,6 +149,7 @@ RunResult RunLauncher(ILaunchEnvironment& env,std::stop_token external) {
     result.diagnostic={error.code,error.stage,std::string(error.operation.view()),std::chrono::system_clock::now()};
     auto failure=ExplainFailure(error);failure.elapsed_ms=elapsed();result.next_action=failure.action;record.failure=std::move(failure);
     if(result.status==Status::AlreadyRunning)result.next_action="Close the existing game, then start a fresh session through WitcherFG.";
+    if(error.operation.view()=="manual_game_path_required")result.next_action="Retry: WitcherFG.exe --game-path \"<folder-or-witcher3.exe>\" (add --diagnose for read-only diagnosis).";
     if(result.status==Status::SupportFailed)result.next_action="Close other diagnostic writers and retry collection; retain the console result.";
     record.failure->action=result.next_action;
     record.outcome=ExitCode(result.status)==2?RunOutcome::Refused:RunOutcome::Failed;
@@ -388,21 +389,67 @@ public:
 private:
   DeadlineWatchdog watchdog_;
 };
+Result<std::wstring> ReadManualPath(std::stop_token cancellation, Deadline deadline) {
+  const auto input=GetStdHandle(STD_INPUT_HANDLE), output=GetStdHandle(STD_OUTPUT_HANDLE);
+  DWORD input_mode{},output_mode{};
+  const bool interactive=GetConsoleMode(input,&input_mode)&&GetConsoleMode(output,&output_mode);
+  return process_detail::RequestManualGamePath(interactive,[&]() -> Result<std::wstring> {
+    const std::wstring prompt=L"Registered executable discovery failed. Enter the game root, containing folder, or witcher3.exe path without quotes; Enter on an empty line or Escape cancels:\r\n";
+    DWORD written{};
+    if(!WriteConsoleW(output,prompt.data(),static_cast<DWORD>(prompt.size()),&written,nullptr))
+      return Error{ErrorCode::LaunchFailed,Stage::package_discovery,"manual_console_unavailable"};
+    std::wstring value;
+    while(!cancellation.stop_requested()&&std::chrono::steady_clock::now()<deadline.value) {
+      const auto ready=WaitForSingleObject(input,50);
+      if(ready==WAIT_TIMEOUT)continue;
+      if(ready!=WAIT_OBJECT_0)return Error{ErrorCode::LaunchFailed,Stage::package_discovery,"manual_console_unavailable"};
+      INPUT_RECORD event{};DWORD count{};
+      if(!ReadConsoleInputW(input,&event,1,&count)||count!=1)return Error{ErrorCode::LaunchFailed,Stage::package_discovery,"manual_console_unavailable"};
+      if(event.EventType!=KEY_EVENT||!event.Event.KeyEvent.bKeyDown)continue;
+      const auto& key=event.Event.KeyEvent;
+      if(key.wVirtualKeyCode==VK_ESCAPE)return Error{ErrorCode::LaunchFailed,Stage::package_discovery,"manual_game_path_cancelled"};
+      const auto character=key.uChar.UnicodeChar;
+      if(character==L'\r') {const std::wstring newline=L"\r\n";WriteConsoleW(output,newline.data(),2,&written,nullptr);return value;}
+      if(character==L'\b') {if(!value.empty()){value.pop_back();const std::wstring erase=L"\b \b";WriteConsoleW(output,erase.data(),3,&written,nullptr);}continue;}
+      if(character<32)continue;
+      for(WORD repeat=0;repeat<key.wRepeatCount;++repeat) {
+        if(value.size()>=32767)return Error{ErrorCode::ConfigurationInvalid,Stage::configuration,"invalid_game_path_value"};
+        value.push_back(character);WriteConsoleW(output,&character,1,&written,nullptr);
+      }
+    }
+    return Error{ErrorCode::TimedOut,Stage::package_discovery,"manual_game_path_cancelled"};
+  });
+}
 class NativeEnvironment final : public ILaunchEnvironment {
 public:
   explicit NativeEnvironment(std::span<const std::string_view> args):args_(args){}
   std::span<const std::string_view> Arguments()const override{return args_;}
   std::chrono::steady_clock::time_point Now()const override{return std::chrono::steady_clock::now();}
   Result<EffectiveConfig> Configuration(const CommandLine& options)override {
+    if(options.game_path) {
+      const auto length=MultiByteToWideChar(CP_UTF8,MB_ERR_INVALID_CHARS,options.game_path->data(),static_cast<int>(options.game_path->size()),nullptr,0);
+      if(length<=0)return Error{ErrorCode::ConfigurationInvalid,Stage::configuration,"invalid_game_path_encoding_or_length"};
+      hint_.emplace(static_cast<std::size_t>(length),L'\0');
+      if(!MultiByteToWideChar(CP_UTF8,MB_ERR_INVALID_CHARS,options.game_path->data(),static_cast<int>(options.game_path->size()),hint_->data(),length))
+        return Error{ErrorCode::ConfigurationInvalid,Stage::configuration,"invalid_game_path_encoding_or_length"};
+    }
     std::array<wchar_t,32768> path{};
     const auto length=GetModuleFileNameW(nullptr,path.data(),static_cast<DWORD>(path.size()));
     if(!length||length>=path.size())return Error{ErrorCode::ConfigurationInvalid,Stage::configuration,"executable_directory",GetLastError()};
     return LoadConfiguration(std::filesystem::path(std::wstring_view(path.data(),length)).parent_path(),options);
   }
   ILogStorage& Diagnostics()override{return sink_;}
-  std::unique_ptr<IRunGuard> Guard(Deadline limit,std::stop_source& cancel,std::stop_token external)override{return std::make_unique<NativeGuard>(limit,cancel,external);}
+  std::unique_ptr<IRunGuard> Guard(Deadline limit,std::stop_source& cancel,std::stop_token external)override{deadline_=limit;cancellation_=cancel.get_token();return std::make_unique<NativeGuard>(limit,cancel,external);}
   Result<PackageFacts> Discover()override {
-    auto found=DiscoverPackage();if(!IsOk(found))return Failure(found);
+    auto found=DiscoverPackage(hint_?std::optional<std::wstring_view>(*hint_):std::nullopt);
+    if(!hint_&&!IsOk(found)) {
+      if(process_detail::CanRequestManualGamePath(Failure(found))) {
+        const auto manual=ReadManualPath(cancellation_,deadline_);
+        if(!IsOk(manual))return Failure(manual);
+        hint_=Value(manual);found=DiscoverPackage(*hint_);
+      }
+    }
+    if(!IsOk(found))return Failure(found);
     package_.emplace(std::move(std::get<PackageIdentity>(found)));
     return PackageFacts{package_->name(),package_->version(),package_->architecture()};
   }
@@ -432,6 +479,9 @@ public:
   [[noreturn]] void ExitHelper()noexcept override {TerminateProcess(GetCurrentProcess(),3);std::_Exit(3);}
 private:
   std::span<const std::string_view> args_;
+  std::optional<std::wstring> hint_;
+  Deadline deadline_{};
+  std::stop_token cancellation_;
   NativeSink sink_;
   std::optional<PackageIdentity> package_;
   std::unique_ptr<ProcessObserver> observer_;
