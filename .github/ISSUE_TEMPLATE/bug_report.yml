@@ -5,8 +5,8 @@ body:
   - type: markdown
     attributes:
       value: |
-        Hosting is unpublished. This is the form source for a future public repository.
-        Do not post vulnerabilities or private identifiers here. Private reporting is currently unavailable; retain those reports locally.
+        This form is for ordinary reproducible bugs in the unpublished launcher preview.
+        Do not post vulnerabilities or private identifiers here. Use [private vulnerability reporting](https://github.com/JrSneed28/WitcherFG/security/advisories/new) for security issues.
         A support bundle is optional. Review its extracted JSON before public attachment; never attach raw logs, saves, dumps or credentials.
   - type: textarea
     id: build

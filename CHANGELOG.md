@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Published the MIT-licensed launcher source on GitHub with Windows CI, protected `main`, contribution templates, and dependency-update checks.
+- Enabled public Issues and Discussions plus private vulnerability reporting. Player downloads and exact-candidate gameplay acceptance remain Pending.
+
 ## 0.1.0-preview.1 — unpublished, 2026-10-10
 
 - Added the native Windows x64 launcher with current-user registered Xbox activation, retained process identity, strict build/dependency/factory guards and temporary four-import routing.
