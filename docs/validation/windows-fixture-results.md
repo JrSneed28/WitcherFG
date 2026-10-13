@@ -8,9 +8,9 @@ The earlier full-suite baseline passed 18/18 CTest gates, 214/214 main-runner te
 
 > **Scope note added 2026-10-12. The case rows below are not current evidence for HEAD.**
 >
-> Everything in this document is scoped to source base `e54eeca` with `dirty=true`. HEAD is
-> **10 commits** ahead of that base (`git rev-list --count e54eeca..36479d8`), and the Task 13
-> fix wave adds further changes on top. The document's own re-run rule at the end of this file
+> The original fixture results and case table are scoped to source base `e54eeca` with
+> `dirty=true`. Source `36479d8` was **10 commits** ahead of that base
+> (`git rev-list --count e54eeca..36479d8`), and the Task 13 fix wave added further changes. The document's own re-run rule at the end of this file
 > requires a re-run after "lifecycle, rights, transaction, watchdog, output-lifetime, or
 > **fixture** changes", and that rule has been triggered:
 >
@@ -30,8 +30,8 @@ The earlier full-suite baseline passed 18/18 CTest gates, 214/214 main-runner te
 >   not be cited as the identity of any current build.
 > - The **27 case rows** are not re-established at HEAD. They were produced case-by-case by the
 >   fixture harness at `e54eeca`; no case-by-case re-run exists for HEAD.
-> - The counts in the paragraphs above are also superseded: HEAD registers **19** CTest gates,
->   not 18, and the main runner reports **248** cases, not 214.
+> - The counts in the paragraphs above are historical. Current aggregate evidence and
+>   configuration-specific counts are recorded in the dated requalification below.
 > - What *is* re-established at HEAD is the lifecycle gate **in aggregate only**. The retained
 >   candidate log records `Start 18: wfg_lifecycle` passing in 21.00 s
 >   (`build/task13-startup-native/candidate.log:158-163`), and the Task 13 fix wave re-ran the
@@ -40,6 +40,40 @@ The earlier full-suite baseline passed 18/18 CTest gates, 214/214 main-runner te
 >   per-case detail is absent from both logs.
 >
 > Treat the rows below as historical until a fresh case-by-case run replaces them.
+
+
+## Native requalification — 2026-10-12
+
+After the disk-loader readiness and ordinary-exit reattach fixes, clean source
+`7b92b5fd6dd614f26941e586dda97257cdc657ae` passed the complete registered native
+Windows x64 MSVC gate set in both Release and Debug: **19/19 CTest gates**, zero
+failures and zero skips. The covering process group passed **59/59**, debug **35/35**,
+native debug-boundary **15/15**, transaction **26/26**, and lifecycle **18/18** in each
+configuration. These lifecycle results are group aggregates; the dated case rows
+below remain historical.
+
+The separate native `documentation_tests.py` suite actually ran with each
+configuration's runner, launcher and generated build identity: **22/22**, zero
+failures and zero skips in each configuration. `tools/release.py render --check`
+also passed in both configurations. Compiler command logs for all 13 repository
+targets in each configuration retain `/WX`; the CMake compiler-identification
+probe is separate from those target builds.
+
+Retained generated identities have `dirty=false` and `archive=false`. Their input
+digests are:
+
+- Release: `3427fe593d7f43fa82978c2b6a13eb955eca405a0b1f7f8bcec33cdaabd53cc0`
+- Debug: `69798181fff6c7a4f413b7a3c207431e3f0e0f248fb1aefcbf6dfcfbd2abb8c4`
+
+The build and tests used a Windows-local source copy and the qualified Visual
+Studio 18 2026 x64 generator. Complete CTest output, each configuration's
+`LastTest.log`, separate documentation output, compiler command logs and generated
+identities are retained locally. This validation note follows the tested code
+commit and does not change binary inputs. Earlier missing per-finding RED logs
+remain missing; this wave retains its own causal process/debug RED and GREEN.
+Repeated trust qualification remains a deferred performance risk under the
+monotonic startup deadline. These fixture and documentation results establish
+no gameplay frame-generation or release acceptance.
 
 
 ## Contents
